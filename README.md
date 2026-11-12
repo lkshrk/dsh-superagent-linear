@@ -47,7 +47,7 @@ In the Policy, list the Linear user ids who may originate work under **Eval → 
 - **Stop.** A prompt with Linear's stop signal becomes a Trigger whose text starts with "Stop requested in Linear."
 - **Replies.** An acknowledgement or a notice is a `thought`, a reply a `response`, both in the session. Each activity's id is fixed by the message id, so a retry never posts twice; a session Linear no longer has drops the message.
 - **Pull requests.** When a ticket that started on Linear follows a GitHub pull request, its link is added to the session's external URLs (`agentSessionUpdate`, `addedExternalUrls`). Its merge ends the ticket through the GitHub Source as usual.
-- **Execution environment.** `DSH_SUPERAGENT_LINEAR_ISSUE` (such as `WEB-12`) and `DSH_SUPERAGENT_LINEAR_ISSUE_URL`. A PR body with `Fixes WEB-12` lets Linear's GitHub integration close the Issue too.
+- **Execution environment.** `DSH_SUPERAGENT_LINEAR_ISSUE` (such as `ENG-12`) and `DSH_SUPERAGENT_LINEAR_ISSUE_URL`. A PR body with `Fixes ENG-12` lets Linear's GitHub integration close the Issue too.
 
 Not implemented: webhooks, thread context for assessments, and more than one repository.
 

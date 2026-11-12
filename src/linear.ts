@@ -96,7 +96,7 @@ export function linearKind(client: LinearClient): SourceKind<LinearConfig> {
     fields: [
       { key: 'clientIdFile', type: 'text', label: { zh: '应用 client id 文件', en: 'App client id file' } },
       { key: 'clientSecretFile', type: 'text', label: { zh: '应用 client secret 文件', en: 'App client secret file' } },
-      { key: 'teams', type: 'rows', label: { zh: '接收的团队', en: 'Teams' }, hint: { zh: '团队 key（例如 WEB）或 id 填一个即可', en: 'A team key, such as WEB, or its id' }, columns: [
+      { key: 'teams', type: 'rows', label: { zh: '接收的团队', en: 'Teams' }, hint: { zh: '团队 key（例如 ENG）或 id 填一个即可', en: 'A team key, such as ENG, or its id' }, columns: [
         { key: 'key', type: 'text', label: { zh: '团队 key', en: 'Team key' }, optional: true },
         { key: 'id', type: 'text', label: { zh: '团队 id', en: 'Team id' }, optional: true },
         { key: 'repository', type: 'text', label: { zh: '仓库', en: 'Repository' }, pattern: REPOSITORY.source.slice(1, -1) }] },
@@ -126,7 +126,7 @@ export function linearKind(client: LinearClient): SourceKind<LinearConfig> {
     },
     environment: {
       variables: [
-        { key: 'DSH_SUPERAGENT_LINEAR_ISSUE', description: { zh: '接下工单的 Linear Issue 标识，例如 WEB-12；工单不是从 Linear 来的时为空', en: 'Identifier of the Linear Issue that started the ticket, such as WEB-12; empty when the ticket did not start on Linear' } },
+        { key: 'DSH_SUPERAGENT_LINEAR_ISSUE', description: { zh: '接下工单的 Linear Issue 标识，例如 ENG-12；工单不是从 Linear 来的时为空', en: 'Identifier of the Linear Issue that started the ticket, such as ENG-12; empty when the ticket did not start on Linear' } },
         { key: 'DSH_SUPERAGENT_LINEAR_ISSUE_URL', description: { zh: '那个 Linear Issue 的链接', en: 'Link to that Linear Issue' } },
       ],
       values: ({ trigger }) => trigger?.source === SOURCE
