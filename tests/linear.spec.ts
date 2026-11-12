@@ -1,0 +1,231 @@
+/** The Linear Source against a stubbed Linear: token, translation, polling, replies and the tickets' pull requests. */
+import { mkdtempSync, rmSync, writeFileSync } from 'node:fs'
+import { tmpdir } from 'node:os'
+import { join } from 'node:path'
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
+import { LinearClient, SCOPE, stableUuid, type Prompt, type Session } from '../src/linear-api.ts'
+import { KEYS, LinearConfigSchema, linearKind, pollLinear, promptTrigger, sendLinear, sessionTrigger, type LinearConfig } from '../src/linear.ts'
+import { apply } from '../src/index.ts'
+import type { OutboundMessage, SourceContext, Ticket, Trigger } from '../src/types.ts'
+
+const VIEWER = 'app-user', OWNER = 'owner-1', TEAM = 'team-web', OTHER_TEAM = 'team-ops'
+let dir: string
+beforeEach(() => {
+  dir = mkdtempSync(join(tmpdir(), 'linear-'))
+  writeFileSync(join(dir, 'client-id'), 'client\n'); writeFileSync(join(dir, 'client-secret'), 'secret\n')
+})
+afterEach(() => { rmSync(dir, { recursive: true, force: true }) })
+
+const config = (overrides: Partial<LinearConfig> = {}): LinearConfig => LinearConfigSchema.parse({
+  clientIdFile: join(dir, 'client-id'), clientSecretFile: join(dir, 'client-secret'),
+  teams: [{ id: TEAM, key: 'WEB', repository: 'acme/widgets' }, { id: OTHER_TEAM, key: 'OPS', repository: 'acme/other' }], ...overrides })
+const issue = (team = TEAM, n = 1) => ({ id: `issue-${n}`, identifier: `WEB-${n}`, title: 'Fix the footer', description: 'It overlaps.', url: `https://linear.app/x/issue/WEB-${n}`, team: { id: team, key: 'WEB' } })
+const session = (id: string, at: string, fields: Partial<Session> = {}): Session => ({ id, createdAt: at, url: `https://linear.app/x/session/${id}`,
+  creator: { id: OWNER, name: 'Owner' }, appUser: { id: VIEWER }, comment: null, issue: issue(), ...fields })
+const prompt = (id: string, at: string, fields: Partial<Prompt> = {}): Prompt => ({ id, createdAt: at, signal: null, content: { body: 'Also the header' },
+  user: { id: OWNER, name: 'Owner' }, agentSession: { id: 's1', issue: issue() }, ...fields })
+
+/** A stand-in Linear: the token endpoint and GraphQL by the operation each request names. */
+function linear(handlers: Record<string, (variables: Record<string, unknown>) => unknown> = {}) {
+  const calls: { url: string; init: RequestInit; query?: string; variables?: Record<string, unknown> }[] = []
+  let token = 0
+  const valid = new Set<string>()
+  const fetcher = vi.fn(async (url: string | URL | Request, init: RequestInit = {}) => {
+    const target = String(url)
+    if (target.endsWith('/oauth/token')) {
+      calls.push({ url: target, init })
+      const value = `token-${++token}`
+      valid.add(value)
+      return Response.json({ access_token: value, expires_in: 30 * 86_400 })
+    }
+    const { query, variables } = JSON.parse(String(init.body)) as { query: string; variables: Record<string, unknown> }
+    calls.push({ url: target, init, query, variables })
+    const bearer = String((init.headers as Record<string, string>).authorization).slice('Bearer '.length)
+    if (!valid.has(bearer)) return Response.json({ errors: [{ message: 'Authentication required', extensions: { code: 'AUTHENTICATION_ERROR' } }] }, { status: 401 })
+    const operation = Object.keys(handlers).find(name => query.includes(name))
+    if (query.includes('viewer') && !operation) return Response.json({ data: { viewer: { id: VIEWER } } })
+    if (!operation) return Response.json({ errors: [{ message: `unexpected ${query.slice(0, 40)}` }] })
+    try { return Response.json({ data: handlers[operation]!(variables) }) }
+    catch (error) { return Response.json({ errors: [{ message: String((error as Error).message), extensions: { code: (error as { code?: string }).code } }] }) }
+  })
+  const client = new LinearClient(() => config(), () => config(), fetcher as typeof fetch)
+  return { client, fetcher, calls, revoke: () => valid.clear() }
+}
+const page = (nodes: unknown[]) => ({ nodes, pageInfo: { hasNextPage: false, endCursor: null } })
+
+/** A SourceContext over plain maps, as dsh-superagent's would behave for this Source. */
+function context(fields: { tickets?: Ticket[]; triggers?: Trigger[]; threads?: Record<string, Record<string, unknown>> } = {}) {
+  const state = new Map<string, unknown>()
+  const received: Trigger[] = []
+  const triggers = new Map((fields.triggers ?? []).map(trigger => [trigger.id, trigger]))
+  const receive = vi.fn(async (trigger: Trigger) => { received.push(trigger); triggers.set(trigger.id, trigger); return 'stored' })
+  const ctx: SourceContext = {
+    deployment: { repository: 'acme/widgets' }, ready: Promise.resolve(), configured: () => true,
+    config: <C>() => config() as unknown as C, receive,
+    state: { get: <V>(key: string) => state.get(key) as V | undefined, set: (key, value) => { if (value === undefined) state.delete(key); else state.set(key, value) } },
+    threads: { get: key => fields.threads?.[key] ? { meta: fields.threads[key]! } : undefined, describe: vi.fn() },
+    tickets: { get: id => fields.tickets?.find(ticket => ticket.id === id), open: () => fields.tickets ?? [] },
+    triggers: { get: id => triggers.get(id) },
+    report: vi.fn(),
+  }
+  return { ctx, state, received, receive }
+}
+const signal = () => new AbortController().signal
+
+describe('token', () => {
+  it('asks for an app token with the exact scope string, reuses it, and mints a new one once Linear refuses it', async () => {
+    const stub = linear()
+    await stub.client.viewer()
+    await stub.client.request('query { viewer { id } }', {})
+    const tokens = stub.calls.filter(call => call.url.endsWith('/oauth/token'))
+    expect(tokens).toHaveLength(1)
+    expect(tokens[0]!.init.body).toBe('grant_type=client_credentials&scope=read,write,app:assignable,app:mentionable')
+    expect(SCOPE).toBe('read,write,app:assignable,app:mentionable')
+    expect((tokens[0]!.init.headers as Record<string, string>).authorization).toBe(`Basic ${Buffer.from('client:secret').toString('base64')}`)
+    stub.revoke()
+    await stub.client.request('query { viewer { id } }', {})
+    expect(stub.calls.filter(call => call.url.endsWith('/oauth/token'))).toHaveLength(2)
+  })
+})
+
+describe('translation', () => {
+  it('turns a person\'s session and prompt into Triggers with stable ids, the Issue as Thread, and the session as Channel', () => {
+    const trigger = sessionTrigger(session('s1', '2026-11-12T10:00:00.000Z'), VIEWER)!
+    expect(trigger).toMatchObject({ id: 'linear:session:s1', source: 'linear', threads: [{ source: 'linear', id: 'issue:issue-1' }],
+      actor: { source: 'linear', id: OWNER }, human: true, addressed: 'direct', text: 'WEB-1: Fix the footer\n\nIt overlaps.',
+      channel: { source: 'linear', thread: 'linear:issue:issue-1', address: { session: 's1', issue: 'issue-1', team: TEAM, identifier: 'WEB-1' } },
+      meta: { team: TEAM, identifier: 'WEB-1', session: 's1', kind: 'session' } })
+    expect(sessionTrigger(session('s1', '2026-11-12T10:00:00.000Z', { comment: { id: 'c1', body: '@daedalus please fix' } }), VIEWER)!.text)
+      .toBe('@daedalus please fix\n\n(WEB-1: Fix the footer)')
+    expect(promptTrigger(prompt('a1', '2026-11-12T10:01:00.000Z'), VIEWER)).toMatchObject({ id: 'linear:prompt:a1', text: 'Also the header',
+      threads: [{ id: 'issue:issue-1' }], meta: { session: 's1', activity: 'a1', kind: 'prompt' } })
+  })
+  it('makes a stop signal explicit, and drops what the app itself wrote', () => {
+    expect(promptTrigger(prompt('a2', '2026-11-12T10:02:00.000Z', { signal: 'stop', content: { body: '' } }), VIEWER))
+      .toMatchObject({ text: 'Stop requested in Linear.', meta: { signal: 'stop' } })
+    expect(sessionTrigger(session('s2', '2026-11-12T10:00:00.000Z', { creator: { id: VIEWER } }), VIEWER)).toBeUndefined()
+    expect(promptTrigger(prompt('a3', '2026-11-12T10:00:00.000Z', { user: { id: VIEWER } }), VIEWER)).toBeUndefined()
+    expect(sessionTrigger(session('s3', '2026-11-12T10:00:00.000Z', { issue: null }), VIEWER)).toBeUndefined()
+  })
+  it('listens to the listed teams only, and offers sessions-only admission rows', () => {
+    const kind = linearKind(linear().client)
+    expect(kind.scope!({ meta: { team: TEAM } }, config())).toEqual({ listened: true, observed: false, row: TEAM })
+    expect(kind.scope!({ meta: { team: 'elsewhere' } }, config())).toEqual({ listened: false, reason: 'team_not_listed' })
+    expect(kind.policy!.rows!(config())[0]).toMatchObject({ id: TEAM, cells: { listedUnaddressed: false, unlistedAddressed: true, unlistedUnaddressed: false } })
+    expect(kind.find!('see WEB-12 and OPS-3')).toEqual({ threads: [], terms: ['WEB-12', 'OPS-3'] })
+  })
+})
+
+describe('polling', () => {
+  const T0 = '2026-11-12T10:00:00.000Z'
+  function sources(sessions: Session[], prompts: Prompt[] = []) {
+    const activities: Record<string, unknown>[] = []
+    const stub = linear({
+      agentSessions: () => ({ agentSessions: page(sessions) }),
+      agentActivities: () => ({ agentActivities: page(prompts) }),
+      agentActivityCreate: variables => { activities.push((variables as { input: Record<string, unknown> }).input); return { agentActivityCreate: { success: true } } },
+    })
+    return { ...stub, activities }
+  }
+  it('starts from now, then takes in new sessions and prompts once, answers a new session at once, and leaves a misrouted team out', async () => {
+    const stub = sources([session('s1', '2026-11-12T10:01:00.000Z'), session('s2', '2026-11-12T10:02:00.000Z', { issue: issue(OTHER_TEAM, 2) }),
+      session('s3', '2026-11-12T10:03:00.000Z', { issue: issue('elsewhere', 3) })], [prompt('a1', '2026-11-12T10:04:00.000Z')])
+    const h = context()
+    expect(await pollLinear(h.ctx, stub.client, config(), signal())).toMatchObject({ sessions: 0, prompts: 0 })
+    expect(h.received).toEqual([])
+    h.state.set(KEYS.sessions, T0); h.state.set(KEYS.prompts, T0)
+    const round = await pollLinear(h.ctx, stub.client, config(), signal())
+    // OPS is listed with another repository than the GitHub Source's; an unlisted team goes to receive, whose scope files it as filtered.
+    expect(h.received.map(trigger => trigger.id)).toEqual(['linear:session:s1', 'linear:session:s3', 'linear:prompt:a1'])
+    expect(round.skipped).toEqual(['OPS'])
+    expect(stub.activities).toEqual([{ id: stableUuid('seen:s1'), agentSessionId: 's1', content: { type: 'thought', body: 'Received; looking into it.' }, ephemeral: true }])
+    expect(h.state.get(KEYS.sessions)).toBe('2026-11-12T10:02:55.000Z')
+    expect(h.state.get(KEYS.prompts)).toBe('2026-11-12T10:03:55.000Z')
+    await pollLinear(h.ctx, stub.client, config(), signal())
+    expect(stub.activities).toHaveLength(1)
+  })
+  it('keeps the cursor when a session was not taken in, and reads it again next round', async () => {
+    const stub = sources([session('s1', '2026-11-12T10:01:00.000Z'), session('s2', '2026-11-12T10:02:00.000Z')])
+    const h = context()
+    h.state.set(KEYS.sessions, T0); h.state.set(KEYS.prompts, T0)
+    h.receive.mockImplementationOnce(async () => { throw new Error('store busy') })
+    await expect(pollLinear(h.ctx, stub.client, config(), signal())).rejects.toThrow('not taken in')
+    expect(h.state.get(KEYS.sessions)).toBe(T0)
+    await pollLinear(h.ctx, stub.client, config(), signal())
+    expect(h.received.map(trigger => trigger.id)).toEqual(['linear:session:s2', 'linear:session:s1', 'linear:session:s2'])
+    expect(h.state.get(KEYS.sessions)).toBe('2026-11-12T10:01:55.000Z')
+  })
+  it('stops between items when its signal aborts', async () => {
+    const stub = sources([session('s1', '2026-11-12T10:01:00.000Z')])
+    const h = context()
+    h.state.set(KEYS.sessions, T0); h.state.set(KEYS.prompts, T0)
+    const controller = new AbortController()
+    h.receive.mockImplementationOnce(async () => { controller.abort(); throw new Error('aborted') })
+    await expect(pollLinear(h.ctx, stub.client, config(), controller.signal)).rejects.toThrow()
+    expect(h.state.get(KEYS.sessions)).toBe(T0)
+  })
+  it('links the ticket\'s pull request into the session once, and completes the Issue once that pull request merged', async () => {
+    const updates: unknown[] = [], states: unknown[] = []
+    const stub = linear({
+      agentSessions: () => ({ agentSessions: page([]) }), agentActivities: () => ({ agentActivities: page([]) }),
+      agentSessionUpdate: variables => { updates.push(variables); return { agentSessionUpdate: { success: true } } },
+      'issue(id': () => ({ issue: { state: { type: 'started' }, team: { states: { nodes: [{ id: 'done-2', type: 'completed', position: 5 }, { id: 'done-1', type: 'completed', position: 2 }] } } } }),
+      issueUpdate: variables => { states.push(variables); return { issueUpdate: { success: true } } },
+    })
+    const origin = sessionTrigger(session('s1', T0), VIEWER)!
+    const ticket: Ticket = { id: 't1', origin: { triggerId: origin.id, triggerIds: [origin.id] }, follows: [{ thread: 'github:54', own: true }] }
+    const h = context({ tickets: [ticket], triggers: [origin], threads: { 'github:54': { url: 'https://github.com/acme/widgets/pull/54' } } })
+    h.state.set(KEYS.sessions, T0); h.state.set(KEYS.prompts, T0)
+    await pollLinear(h.ctx, stub.client, config(), signal())
+    await pollLinear(h.ctx, stub.client, config(), signal())
+    expect(updates).toEqual([{ id: 's1', input: { addedExternalUrls: [{ label: 'Pull request #54', url: 'https://github.com/acme/widgets/pull/54' }] } }])
+    expect(states).toEqual([])
+    ticket.follows = [{ thread: 'github:54', own: true, closed: { at: T0, outcome: 'merged' } }]
+    await pollLinear(h.ctx, stub.client, config(), signal())
+    await pollLinear(h.ctx, stub.client, config(), signal())
+    expect(states).toEqual([{ id: 'issue-1', state: 'done-1' }])
+  })
+})
+
+describe('replies', () => {
+  const message = (kind: OutboundMessage['kind']): OutboundMessage => ({ id: 'reply-1', kind, text: 'Done: see the PR',
+    channel: { source: 'linear', thread: 'linear:issue:issue-1', address: { session: 's1', issue: 'issue-1', team: TEAM } } })
+  it('sends an acknowledgement as a thought and a reply as a response, with an id fixed by the message', async () => {
+    const inputs: Record<string, unknown>[] = []
+    const stub = linear({ agentActivityCreate: variables => { inputs.push((variables as { input: Record<string, unknown> }).input); return { agentActivityCreate: { success: true } } } })
+    expect(await sendLinear(stub.client, message('acknowledgement'))).toBe('sent')
+    expect(await sendLinear(stub.client, message('reply'))).toBe('sent')
+    expect(inputs.map(input => (input.content as { type: string }).type)).toEqual(['thought', 'response'])
+    expect(inputs[0]!.id).toBe(stableUuid('message:reply-1'))
+    expect(inputs[0]!.id).toBe(inputs[1]!.id)
+    expect(String(inputs[0]!.id)).toMatch(/^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/)
+  })
+  it('counts a create Linear stored before failing as sent, retries any other failure, and drops a deleted session', async () => {
+    let stored = false
+    const stub = linear({
+      agentActivityCreate: () => { stored = true; throw new Error('Conflict: id already in use') },
+      'agentActivity(id': () => ({ agentActivity: stored ? { id: 'x' } : null }),
+    })
+    expect(await sendLinear(stub.client, message('reply'))).toBe('sent')
+    const lost = linear({ agentActivityCreate: () => { throw new Error('Internal error') }, 'agentActivity(id': () => ({ agentActivity: null }) })
+    await expect(sendLinear(lost.client, message('reply'))).rejects.toThrow('Internal error')
+    const gone = linear({ agentActivityCreate: () => { throw Object.assign(new Error('Entity not found: AgentSession'), { code: 'INVALID_INPUT' }) } })
+    expect(await sendLinear(gone.client, message('reply'))).toBe('gone')
+  })
+})
+
+describe('plugin', () => {
+  it('registers the kind with the orchestrator, and its disposer unregisters it and stops the loop', async () => {
+    const effects: (() => unknown)[] = []
+    const unregister = vi.fn()
+    const register = vi.fn(() => unregister)
+    const h = context()
+    const ctx = { orchestrator: { sources: { register }, context: () => ({ ...h.ctx, configured: () => false }) },
+      effect: (execute: () => (() => unknown) | void) => { const dispose = execute(); if (dispose) effects.push(dispose) } }
+    apply(ctx)
+    expect(register).toHaveBeenCalledWith(expect.objectContaining({ kind: 'linear', health: ['linear'] }))
+    for (const dispose of effects) await dispose()
+    expect(unregister).toHaveBeenCalled()
+    expect(h.ctx.report).toHaveBeenCalledWith('linear', { state: 'paused', detail: 'Waiting for the deployment check' })
+  })
+})

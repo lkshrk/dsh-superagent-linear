@@ -1,0 +1,5 @@
+# dsh-superagent-linear bundle layer: the Linear Source plugin, off until a profile enables it and configures its credentials.
+- insert:
+    - id: dsh-superagent-linear
+      name: dsh-superagent-linear
+      disabled: true
