@@ -4,7 +4,7 @@ import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import { LinearClient, MINT_INTERVAL_MS, SCOPE, stableUuid, type Prompt, type Session } from '../src/linear-api.ts'
-import { KEYS, LinearConfigSchema, linearKind, pollLinear, promptTrigger, sendLinear, sessionTrigger, type LinearConfig } from '../src/linear.ts'
+import { KEYS, LinearConfigSchema, linearKind, pollLinear, promptTrigger, sendLinear, sessionTrigger, watchLinear, type LinearConfig } from '../src/linear.ts'
 import { apply } from '../src/index.ts'
 import type { OutboundMessage, SourceContext, Ticket, Trigger } from '../src/types.ts'
 
@@ -48,6 +48,7 @@ function linear(handlers: Record<string, (variables: Record<string, unknown>) =>
     const operation = Object.keys(handlers).find(name => query.includes(name))
     if (query.includes('viewer') && !operation) return Response.json({ data: { viewer: { id: VIEWER } } })
     if (query.includes('teams(') && !operation) return Response.json({ data: { teams: page(Object.entries(KEYS_OF).map(([id, key]) => ({ id, key }))) } })
+    if (query.includes('teams(') && operation === 'teams(') return Response.json({ errors: [{ message: 'Internal error' }] })
     if (!operation) return Response.json({ errors: [{ message: `unexpected ${query.slice(0, 40)}` }] })
     try { return Response.json({ data: handlers[operation]!(variables) }) }
     catch (error) { return Response.json({ errors: [{ message: String((error as Error).message), extensions: { code: (error as { code?: string }).code } }] }) }
@@ -141,6 +142,8 @@ describe('translation', () => {
     const off = config({ teams: [{ id: '', key: 'WEB', repository: 'acme/widgets', enabled: false }] })
     expect(kind.scope!({ meta: { team: TEAM, teamKey: 'WEB' } }, off)).toMatchObject({ listened: false })
     expect(kind.policy!.rows!(config()).map(row => row.id)).toEqual(['WEB', 'OPS'])
+    expect(kind.policy!.rows!(config({ teams: [{ id: '', key: 'WEB', repository: 'acme/widgets', enabled: false },
+      { id: '', key: 'OPS', repository: 'acme/widgets', enabled: true }] })).map(row => row.id)).toEqual(['OPS'])
     expect(kind.policy!.rows!(config())[0]).toMatchObject({ cells: { listedUnaddressed: false, unlistedAddressed: true, unlistedUnaddressed: false } })
     expect(() => LinearConfigSchema.parse({ teams: [{ repository: 'acme/widgets' }] })).toThrow('A team id or key')
     expect(kind.find!('see WEB-12 and OPS-3')).toEqual({ threads: [], terms: ['WEB-12', 'OPS-3'] })
@@ -276,6 +279,30 @@ it('reports configured teams Linear does not know', async () => {
     { id: 'gone-id', key: 'WEB', repository: 'acme/widgets', enabled: true }] }), signal())
   // An entry with an id is checked by its id, whatever team holds its key now.
   expect(round.unknown).toEqual(['NOPE', 'missing-id', 'WEB'])
+})
+
+/** The health one `watchLinear` round reports, with `config` as the Source's configuration. */
+async function healthOf(stub: ReturnType<typeof linear>, value: LinearConfig) {
+  const h = context()
+  h.ctx.config = <C>() => value as unknown as C
+  h.state.set(KEYS.sessions, '2026-11-12T10:00:00.000Z'); h.state.set(KEYS.prompts, '2026-11-12T10:00:00.000Z')
+  const controller = new AbortController()
+  vi.mocked(h.ctx.report).mockImplementation(() => { controller.abort() })
+  await watchLinear(h.ctx, stub.client, controller.signal)
+  return { health: vi.mocked(h.ctx.report).mock.calls.at(-1)![1], received: h.received }
+}
+it('makes a configured team Linear does not know a health error', async () => {
+  const stub = linear({ agentSessions: () => ({ agentSessions: page([]) }), agentActivities: () => ({ agentActivities: page([]) }) })
+  const { health } = await healthOf(stub, config({ teams: [{ id: '', key: 'WEB', repository: 'acme/widgets', enabled: true },
+    { id: '', key: 'NOPE', repository: 'acme/widgets', enabled: true }] }))
+  expect(health).toMatchObject({ state: 'error', detail: expect.stringContaining('teams NOPE not found in Linear') })
+})
+it('keeps taking sessions in when the team list cannot be read, and says the teams are unverified', async () => {
+  const stub = linear({ 'teams(': () => ({}), agentSessions: () => ({ agentSessions: page([session('s1', '2026-11-12T10:01:00.000Z')]) }),
+    agentActivities: () => ({ agentActivities: page([]) }), agentActivityCreate: () => ({ agentActivityCreate: { success: true } }) })
+  const { health, received } = await healthOf(stub, config({ teams: [{ id: '', key: 'WEB', repository: 'acme/widgets', enabled: true }] }))
+  expect(received.map(trigger => trigger.id)).toEqual(['linear:session:s1'])
+  expect(health).toMatchObject({ state: 'ready', detail: expect.stringContaining('teams unverified') })
 })
 
 describe('replies', () => {

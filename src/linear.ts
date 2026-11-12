@@ -138,7 +138,7 @@ export function linearKind(client: LinearClient): SourceKind<LinearConfig> {
   }
 }
 
-export interface Round { sessions: number; prompts: number; unreadable: number; skipped: string[]; unknown: string[]; misrouted: string[] }
+export interface Round { sessions: number; prompts: number; unreadable: number; skipped: string[]; unknown: string[]; misrouted: string[]; unverified: boolean }
 
 /**
  * One polling round: new sessions, then new prompts, then the pull requests and merges of tickets that started on Linear.
@@ -148,14 +148,15 @@ export async function pollLinear(ctx: SourceContext, client: LinearClient, confi
   const repository = ctx.deployment.repository
   const enabled = config.teams.filter(team => team.enabled)
   const skipped = enabled.filter(team => team.repository !== repository).map(teamName)
-  const known = await client.teams(signal)
-  const unknown = enabled.filter(team => !known.some(item => sameTeam(team, item.id, item.key))).map(teamName)
+  // Intake does not need the team list; without it the teams are only left unverified.
+  const known = await client.teams(signal).catch((error: unknown) => { if (signal.aborted) throw error; return undefined })
+  const unknown = known ? enabled.filter(team => !known.some(item => sameTeam(team, item.id, item.key))).map(teamName) : []
   // A listed team whose repository is not the GitHub Source's is left out; an unlisted one goes to receive, whose scope filters it.
   const misrouted = (trigger: Trigger) => { const team = teamOf(config, trigger.meta); return team !== undefined && team.repository !== repository }
   const served = (trigger: Trigger) => teamOf(config, trigger.meta)?.repository === repository
   const viewer = await client.viewer(signal)
   const now = new Date().toISOString()
-  const round: Round = { sessions: 0, prompts: 0, unreadable: 0, skipped, unknown, misrouted: [] }
+  const round: Round = { sessions: 0, prompts: 0, unreadable: 0, skipped, unknown, misrouted: [], unverified: !known }
   const sessionsSince = ctx.state.get<string>(KEYS.sessions)
   const promptsSince = ctx.state.get<string>(KEYS.prompts)
   // A first round starts from now: sessions from before the Source was switched on are not work for it.
@@ -265,7 +266,7 @@ export async function watchLinear(ctx: SourceContext, client: LinearClient, sign
         const round = await pollLinear(ctx, client, config, signal)
         failures = 0
         const skipped = round.skipped.length ? `; teams ${round.skipped.join(', ')} skipped: their repository is not the GitHub Source's` : ''
-        const unknown = round.unknown.length ? `; teams ${round.unknown.join(', ')} not found in Linear` : ''
+        const unknown = round.unknown.length ? `; teams ${round.unknown.join(', ')} not found in Linear` : round.unverified ? '; teams unverified: Linear\'s team list was not readable' : ''
         const misrouted = round.misrouted.length ? `; left out ${round.misrouted.slice(0, 10).join(', ')}${round.misrouted.length > 10 ? ' and more' : ''}` : ''
         ctx.report(HEALTH, { state: round.skipped.length || round.unknown.length ? 'error' : 'ready', at,
           detail: `${round.sessions} sessions, ${round.prompts} prompts, ${round.unreadable} unreadable${skipped}${misrouted}${unknown}` })
