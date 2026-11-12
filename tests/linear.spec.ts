@@ -116,6 +116,11 @@ describe('translation', () => {
     expect(kind.scope!({ meta: { team: 'elsewhere', teamKey: 'ELSE' } }, config())).toEqual({ listened: false, reason: 'team_not_listed' })
     const byId = config({ teams: [{ id: TEAM, key: '', repository: 'acme/widgets', enabled: true }] })
     expect(kind.scope!({ meta: { team: TEAM, teamKey: 'WEB' } }, byId)).toEqual({ listened: true, observed: false, row: TEAM })
+    // An entry with an id follows that team only, even when another team now carries its key.
+    const pinned = config({ teams: [{ id: TEAM, key: 'WEB', repository: 'acme/widgets', enabled: true }] })
+    expect(kind.scope!({ meta: { team: TEAM, teamKey: 'RENAMED' } }, pinned)).toEqual({ listened: true, observed: false, row: 'WEB' })
+    expect(kind.scope!({ meta: { team: OTHER_TEAM, teamKey: 'WEB' } }, pinned)).toMatchObject({ listened: false })
+    expect(kind.channel!.allowed!({ team: OTHER_TEAM, teamKey: 'WEB' }, pinned)).toBe(false)
     const off = config({ teams: [{ id: '', key: 'WEB', repository: 'acme/widgets', enabled: false }] })
     expect(kind.scope!({ meta: { team: TEAM, teamKey: 'WEB' } }, off)).toMatchObject({ listened: false })
     expect(kind.policy!.rows!(config()).map(row => row.id)).toEqual(['WEB', 'OPS'])
@@ -202,8 +207,10 @@ it('reports configured teams Linear does not know', async () => {
   const h = context()
   h.state.set(KEYS.sessions, '2026-11-12T10:00:00.000Z'); h.state.set(KEYS.prompts, '2026-11-12T10:00:00.000Z')
   const round = await pollLinear(h.ctx, stub.client, config({ teams: [{ id: '', key: 'WEB', repository: 'acme/widgets', enabled: true },
-    { id: '', key: 'NOPE', repository: 'acme/widgets', enabled: true }, { id: 'missing-id', key: '', repository: 'acme/widgets', enabled: true }] }), signal())
-  expect(round.unknown).toEqual(['NOPE', 'missing-id'])
+    { id: '', key: 'NOPE', repository: 'acme/widgets', enabled: true }, { id: 'missing-id', key: '', repository: 'acme/widgets', enabled: true },
+    { id: 'gone-id', key: 'WEB', repository: 'acme/widgets', enabled: true }] }), signal())
+  // An entry with an id is checked by its id, whatever team holds its key now.
+  expect(round.unknown).toEqual(['NOPE', 'missing-id', 'WEB'])
 })
 
 describe('replies', () => {

@@ -22,10 +22,12 @@ type TeamConfig = LinearConfig['teams'][number]
 
 /** A configured team's row in the admission table and its name in health: its key, or its id when it names no key. */
 export const teamName = (team: TeamConfig) => team.key || team.id
-/** The enabled configured team a Trigger's Issue belongs to, matched by id or, case-insensitively, by key. */
+/** Whether a team entry names Linear team `id` with `key`: by id when the entry has one, as a key can move to another team, else by key ignoring case. */
+export const sameTeam = (team: TeamConfig, id: unknown, key: unknown) =>
+  team.id !== '' ? team.id === id : team.key.toUpperCase() === String(key ?? '').toUpperCase()
+/** The enabled configured team a Trigger's Issue belongs to. */
 export function teamOf(config: LinearConfig, meta: Record<string, unknown>): TeamConfig | undefined {
-  return config.teams.find(team => team.enabled && ((team.id !== '' && team.id === meta.team)
-    || (team.key !== '' && team.key.toUpperCase() === String(meta.teamKey ?? '').toUpperCase())))
+  return config.teams.find(team => team.enabled && sameTeam(team, meta.team, meta.teamKey))
 }
 
 export const KEYS = {
@@ -147,8 +149,7 @@ export async function pollLinear(ctx: SourceContext, client: LinearClient, confi
   const enabled = config.teams.filter(team => team.enabled)
   const skipped = enabled.filter(team => team.repository !== repository).map(teamName)
   const known = await client.teams(signal)
-  const unknown = enabled.filter(team => !known.some(item => (team.id !== '' && item.id === team.id)
-    || (team.key !== '' && item.key.toUpperCase() === team.key.toUpperCase()))).map(teamName)
+  const unknown = enabled.filter(team => !known.some(item => sameTeam(team, item.id, item.key))).map(teamName)
   // A listed team whose repository is not the GitHub Source's is left out; an unlisted one goes to receive, whose scope filters it.
   const misrouted = (trigger: Trigger) => { const team = teamOf(config, trigger.meta); return team !== undefined && team.repository !== repository }
   const served = (trigger: Trigger) => teamOf(config, trigger.meta)?.repository === repository
