@@ -14,8 +14,6 @@ export const LinearConfigSchema = z.object({
     enabled: z.boolean().default(true) }).strict().refine(team => team.id !== '' || team.key !== '', 'A team id or key')).default([]),
   pollSeconds: z.number().int().min(5).max(600).default(10),
   completeOnMerge: z.boolean().default(true),
-  apiUrl: z.url().default('https://api.linear.app/graphql'),
-  tokenUrl: z.url().default('https://api.linear.app/oauth/token'),
 }).strict()
 export type LinearConfig = z.infer<typeof LinearConfigSchema>
 type TeamConfig = LinearConfig['teams'][number]
@@ -39,8 +37,9 @@ export const KEYS = {
   followed: 'linear-followed-tickets',
 }
 const threadOf = (issue: string) => `issue:${issue}`
-/** Steps a timestamp cursor back five seconds, for writes Linear records late; Trigger ids make the overlap harmless. */
-const cursorAt = (at: string) => new Date(Date.parse(at) - 5000).toISOString()
+/** The next cursor: five seconds before the newest item read, for writes Linear records late, and never behind the current one. */
+const cursorAfter = (since: string, newest: string | undefined) =>
+  newest === undefined ? since : new Date(Math.max(Date.parse(since), Date.parse(newest) - 5000)).toISOString()
 
 type Issue = NonNullable<Session['issue']>
 function channel(issue: Issue, session: string, url: string) {
@@ -95,6 +94,7 @@ export function linearKind(client: LinearClient): SourceKind<LinearConfig> {
     title: { zh: 'Linear', en: 'Linear' },
     description: { zh: '接收 Linear 智能体应用在下列团队里的会话：把 Issue 指派给它或 @ 它。', en: 'Receives the Linear agent app\'s sessions on these teams: an Issue delegated to it, or a mention of it.' },
     schema: LinearConfigSchema,
+    accountFields: ['clientIdFile', 'clientSecretFile'],
     fields: [
       { key: 'clientIdFile', type: 'text', label: { zh: '应用 client id 文件', en: 'App client id file' } },
       { key: 'clientSecretFile', type: 'text', label: { zh: '应用 client secret 文件', en: 'App client secret file' } },
@@ -138,7 +138,7 @@ export function linearKind(client: LinearClient): SourceKind<LinearConfig> {
   }
 }
 
-export interface Round { sessions: number; prompts: number; unreadable: number; skipped: string[]; unknown: string[] }
+export interface Round { sessions: number; prompts: number; unreadable: number; skipped: string[]; unknown: string[]; misrouted: string[] }
 
 /**
  * One polling round: new sessions, then new prompts, then the pull requests and merges of tickets that started on Linear.
@@ -155,7 +155,7 @@ export async function pollLinear(ctx: SourceContext, client: LinearClient, confi
   const served = (trigger: Trigger) => teamOf(config, trigger.meta)?.repository === repository
   const viewer = await client.viewer(signal)
   const now = new Date().toISOString()
-  const round: Round = { sessions: 0, prompts: 0, unreadable: 0, skipped, unknown }
+  const round: Round = { sessions: 0, prompts: 0, unreadable: 0, skipped, unknown, misrouted: [] }
   const sessionsSince = ctx.state.get<string>(KEYS.sessions)
   const promptsSince = ctx.state.get<string>(KEYS.prompts)
   // A first round starts from now: sessions from before the Source was switched on are not work for it.
@@ -171,11 +171,12 @@ export async function pollLinear(ctx: SourceContext, client: LinearClient, confi
   for (const session of sessions.items) {
     if (signal.aborted) throw new Error('The Linear Source stopped during the read')
     const trigger = sessionTrigger(session, viewer)
-    if (!trigger || misrouted(trigger)) continue
+    if (!trigger) continue
+    if (misrouted(trigger)) { round.misrouted.push(String(trigger.meta.identifier)); continue }
     try {
       // Linear marks a session unresponsive when nothing answers within seconds; an evaluation takes longer.
       if (served(trigger) && !ctx.state.get(KEYS.seen(session.id))) {
-        await client.activity(session.id, stableUuid(`seen:${session.id}`), { type: 'thought', body: 'Received; looking into it.' }, true, signal)
+        await client.activity(session.id, stableUuid(`seen:${session.id}`), { type: 'thought', body: 'Received.' }, true, signal)
           .catch((error: unknown) => { if (!(error instanceof LinearError && error.gone)) throw error })
         ctx.state.set(KEYS.seen(session.id), true)
       }
@@ -187,7 +188,7 @@ export async function pollLinear(ctx: SourceContext, client: LinearClient, confi
       failed = true
     }
   }
-  if (!failed) ctx.state.set(KEYS.sessions, cursorAt(sessions.items.at(-1)?.createdAt ?? sessionsSince))
+  if (!failed) ctx.state.set(KEYS.sessions, cursorAfter(sessionsSince, sessions.items.at(-1)?.createdAt))
   const sessionsFailed = failed
 
   const prompts = await client.prompts(promptsSince, signal)
@@ -196,7 +197,8 @@ export async function pollLinear(ctx: SourceContext, client: LinearClient, confi
   for (const prompt of prompts.items) {
     if (signal.aborted) throw new Error('The Linear Source stopped during the read')
     const trigger = promptTrigger(prompt, viewer)
-    if (!trigger || misrouted(trigger)) continue
+    if (!trigger) continue
+    if (misrouted(trigger)) { round.misrouted.push(String(trigger.meta.identifier)); continue }
     try {
       await ctx.receive(trigger)
       round.prompts++
@@ -205,7 +207,7 @@ export async function pollLinear(ctx: SourceContext, client: LinearClient, confi
       failed = true
     }
   }
-  if (!failed) ctx.state.set(KEYS.prompts, cursorAt(prompts.items.at(-1)?.createdAt ?? promptsSince))
+  if (!failed) ctx.state.set(KEYS.prompts, cursorAfter(promptsSince, prompts.items.at(-1)?.createdAt))
 
   await followTickets(ctx, client, config, signal)
   if (failed || sessionsFailed) throw new Error('A Linear session or prompt was not taken in; the next round reads it again')
@@ -216,12 +218,15 @@ function describe(ctx: SourceContext, trigger: Trigger): void {
   ctx.threads.describe(`${SOURCE}:${trigger.threads[0]!.id}`, { label: String(trigger.meta.identifier), ...trigger.url ? { url: trigger.url } : {} })
 }
 
-/** Links each pull request a Linear ticket follows into its session, and completes the Issue once the ticket's own pull request merged. */
+/**
+ * Links each pull request a ticket that started on Linear follows into its session, and completes the Issue once the ticket's own
+ * pull request merged. An ended ticket gets one last look, then is dropped, unless completing its Issue still has to be retried.
+ */
 async function followTickets(ctx: SourceContext, client: LinearClient, config: LinearConfig, signal: AbortSignal): Promise<void> {
-  const followed = new Set(ctx.state.get<string[]>(KEYS.followed) ?? [])
-  for (const ticket of ctx.tickets.open()) if (ctx.triggers.get(ticket.origin.triggerId)?.source === SOURCE) followed.add(ticket.id)
+  const open = new Set(ctx.tickets.open().filter(ticket => ctx.triggers.get(ticket.origin.triggerId)?.source === SOURCE).map(ticket => ticket.id))
+  const followed = new Set([...ctx.state.get<string[]>(KEYS.followed) ?? [], ...open])
   for (const id of [...followed]) {
-    if (signal.aborted) return
+    if (signal.aborted) break
     const ticket = ctx.tickets.get(id)
     const origin = ticket && ctx.triggers.get(ticket.origin.triggerId)
     if (!ticket || !origin) { followed.delete(id); continue }
@@ -235,10 +240,11 @@ async function followTickets(ctx: SourceContext, client: LinearClient, config: L
       }
     }
     const merged = (ticket.follows ?? []).some(follow => follow.own && follow.closed?.outcome === 'merged')
+    let pending = false
     if (merged && config.completeOnMerge && !ctx.state.get(KEYS.completed(id))) {
-      await client.complete(issue, signal).then(() => { ctx.state.set(KEYS.completed(id), true) }, () => { /* Retried on the next round. */ })
+      await client.complete(issue, signal).then(() => { ctx.state.set(KEYS.completed(id), true) }, () => { pending = true })
     }
-    if (merged && (!config.completeOnMerge || ctx.state.get(KEYS.completed(id)))) followed.delete(id)
+    if (!open.has(id) && !pending) followed.delete(id)
   }
   ctx.state.set(KEYS.followed, [...followed])
 }
@@ -260,11 +266,14 @@ export async function watchLinear(ctx: SourceContext, client: LinearClient, sign
         failures = 0
         const skipped = round.skipped.length ? `; teams ${round.skipped.join(', ')} skipped: their repository is not the GitHub Source's` : ''
         const unknown = round.unknown.length ? `; teams ${round.unknown.join(', ')} not found in Linear` : ''
+        const misrouted = round.misrouted.length ? `; left out ${round.misrouted.slice(0, 10).join(', ')}${round.misrouted.length > 10 ? ' and more' : ''}` : ''
         ctx.report(HEALTH, { state: round.skipped.length || round.unknown.length ? 'error' : 'ready', at,
-          detail: `${round.sessions} sessions, ${round.prompts} prompts, ${round.unreadable} unreadable${skipped}${unknown}` })
+          detail: `${round.sessions} sessions, ${round.prompts} prompts, ${round.unreadable} unreadable${skipped}${misrouted}${unknown}` })
       } catch (error) {
         failures++
-        if (!signal.aborted && failures >= 3) ctx.report(HEALTH, { state: 'error', at, detail: `${failures} failed polls in a row; last: ${String(error)}` })
+        // A refused token or a rate limit needs no three rounds to show: no request can succeed until it passes.
+        const blocked = error instanceof LinearError && error.throttled
+        if (!signal.aborted && (blocked || failures >= 3)) ctx.report(HEALTH, { state: 'error', at, detail: `${failures} failed polls in a row; last: ${String(error)}` })
       }
     }
     await delay((config?.pollSeconds ?? 10) * 1000, undefined, { signal }).catch(() => {})

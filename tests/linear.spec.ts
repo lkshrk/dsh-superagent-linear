@@ -3,7 +3,7 @@ import { mkdtempSync, rmSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
-import { LinearClient, SCOPE, stableUuid, type Prompt, type Session } from '../src/linear-api.ts'
+import { LinearClient, MINT_INTERVAL_MS, SCOPE, stableUuid, type Prompt, type Session } from '../src/linear-api.ts'
 import { KEYS, LinearConfigSchema, linearKind, pollLinear, promptTrigger, sendLinear, sessionTrigger, type LinearConfig } from '../src/linear.ts'
 import { apply } from '../src/index.ts'
 import type { OutboundMessage, SourceContext, Ticket, Trigger } from '../src/types.ts'
@@ -30,7 +30,7 @@ const prompt = (id: string, at: string, fields: Partial<Prompt> = {}): Prompt =>
 /** A stand-in Linear: the token endpoint and GraphQL by the operation each request names. */
 function linear(handlers: Record<string, (variables: Record<string, unknown>) => unknown> = {}) {
   const calls: { url: string; init: RequestInit; query?: string; variables?: Record<string, unknown> }[] = []
-  let token = 0
+  let token = 0, limited = 0
   const valid = new Set<string>()
   const fetcher = vi.fn(async (url: string | URL | Request, init: RequestInit = {}) => {
     const target = String(url)
@@ -42,6 +42,7 @@ function linear(handlers: Record<string, (variables: Record<string, unknown>) =>
     }
     const { query, variables } = JSON.parse(String(init.body)) as { query: string; variables: Record<string, unknown> }
     calls.push({ url: target, init, query, variables })
+    if (limited) return Response.json({ errors: [{ message: 'Rate limit exceeded', extensions: { code: 'RATELIMITED' } }] }, { status: 400, headers: { 'x-ratelimit-requests-reset': String(limited) } })
     const bearer = String((init.headers as Record<string, string>).authorization).slice('Bearer '.length)
     if (!valid.has(bearer)) return Response.json({ errors: [{ message: 'Authentication required', extensions: { code: 'AUTHENTICATION_ERROR' } }] }, { status: 401 })
     const operation = Object.keys(handlers).find(name => query.includes(name))
@@ -51,8 +52,8 @@ function linear(handlers: Record<string, (variables: Record<string, unknown>) =>
     try { return Response.json({ data: handlers[operation]!(variables) }) }
     catch (error) { return Response.json({ errors: [{ message: String((error as Error).message), extensions: { code: (error as { code?: string }).code } }] }) }
   })
-  const client = new LinearClient(() => config(), () => config(), fetcher as typeof fetch)
-  return { client, fetcher, calls, revoke: () => valid.clear() }
+  const client = new LinearClient(() => config(), { tokenUrl: 'https://linear.test/oauth/token', apiUrl: 'https://linear.test/graphql' }, fetcher as typeof fetch)
+  return { client, fetcher, calls, revoke: () => valid.clear(), limit: (reset: number) => { limited = reset } }
 }
 const page = (nodes: unknown[]) => ({ nodes, pageInfo: { hasNextPage: false, endCursor: null } })
 
@@ -85,9 +86,25 @@ describe('token', () => {
     expect(tokens[0]!.init.body).toBe('grant_type=client_credentials&scope=read,write,app:assignable,app:mentionable')
     expect(SCOPE).toBe('read,write,app:assignable,app:mentionable')
     expect((tokens[0]!.init.headers as Record<string, string>).authorization).toBe(`Basic ${Buffer.from('client:secret').toString('base64')}`)
+    // A token Linear refuses right after it was minted is not replaced at once: Linear evicts an app's oldest tokens past 1,000.
     stub.revoke()
+    await expect(stub.client.request('query { viewer { id } }', {})).rejects.toMatchObject({ codes: ['MINT_THROTTLED'] })
+    await expect(stub.client.request('query { viewer { id } }', {})).rejects.toMatchObject({ codes: ['MINT_THROTTLED'] })
+    expect(stub.calls.filter(call => call.url.endsWith('/oauth/token'))).toHaveLength(1)
+    const now = Date.now()
+    vi.spyOn(Date, 'now').mockReturnValue(now + MINT_INTERVAL_MS + 1000)
     await stub.client.request('query { viewer { id } }', {})
     expect(stub.calls.filter(call => call.url.endsWith('/oauth/token'))).toHaveLength(2)
+    vi.restoreAllMocks()
+  })
+  it('holds every request until a rate limit resets', async () => {
+    const stub = linear()
+    await stub.client.viewer()
+    stub.limit(Date.now() + 120_000)
+    await expect(stub.client.request('query { viewer { id } }', {})).rejects.toMatchObject({ codes: ['RATELIMITED'] })
+    const sent = stub.fetcher.mock.calls.length
+    await expect(stub.client.request('query { viewer { id } }', {})).rejects.toMatchObject({ codes: ['RATELIMITED'] })
+    expect(stub.fetcher.mock.calls.length).toBe(sent)
   })
 })
 
@@ -127,6 +144,8 @@ describe('translation', () => {
     expect(kind.policy!.rows!(config())[0]).toMatchObject({ cells: { listedUnaddressed: false, unlistedAddressed: true, unlistedUnaddressed: false } })
     expect(() => LinearConfigSchema.parse({ teams: [{ repository: 'acme/widgets' }] })).toThrow('A team id or key')
     expect(kind.find!('see WEB-12 and OPS-3')).toEqual({ threads: [], terms: ['WEB-12', 'OPS-3'] })
+    expect(kind.accountFields).toEqual(['clientIdFile', 'clientSecretFile'])
+    expect(LinearConfigSchema.safeParse({ apiUrl: 'https://evil.example/graphql' }).success).toBe(false)
   })
 })
 
@@ -152,12 +171,33 @@ describe('polling', () => {
     // OPS is listed with another repository than the GitHub Source's; an unlisted team goes to receive, whose scope files it as filtered.
     expect(h.received.map(trigger => trigger.id)).toEqual(['linear:session:s1', 'linear:session:s3', 'linear:prompt:a1'])
     expect(round.skipped).toEqual(['OPS'])
+    expect(round.misrouted).toEqual(['OPS-2'])
     expect(round.unknown).toEqual([])
-    expect(stub.activities).toEqual([{ id: stableUuid('seen:s1'), agentSessionId: 's1', content: { type: 'thought', body: 'Received; looking into it.' }, ephemeral: true }])
+    expect(stub.activities).toEqual([{ id: stableUuid('seen:s1'), agentSessionId: 's1', content: { type: 'thought', body: 'Received.' }, ephemeral: true }])
     expect(h.state.get(KEYS.sessions)).toBe('2026-11-12T10:02:55.000Z')
     expect(h.state.get(KEYS.prompts)).toBe('2026-11-12T10:03:55.000Z')
     await pollLinear(h.ctx, stub.client, config(), signal())
     expect(stub.activities).toHaveLength(1)
+  })
+  it('keeps its cursors where they are after a round with nothing new', async () => {
+    const stub = sources([])
+    const h = context()
+    h.state.set(KEYS.sessions, T0); h.state.set(KEYS.prompts, T0)
+    for (let i = 0; i < 3; i++) await pollLinear(h.ctx, stub.client, config(), signal())
+    expect([h.state.get(KEYS.sessions), h.state.get(KEYS.prompts)]).toEqual([T0, T0])
+  })
+  it('finds every session after the cursor whichever way Linear orders the pages', async () => {
+    const old = (n: number) => session(`old-${n}`, `2026-11-12T09:5${n}:00.000Z`)
+    const fresh = (n: number) => session(`new-${n}`, `2026-11-12T10:0${n}:00.000Z`)
+    for (const pages of [[[fresh(2), fresh(1)], [old(2), old(1)]], [[old(1), old(2)], [fresh(1), fresh(2)]]]) {
+      let at = 0
+      const stub = linear({ agentSessions: () => ({ agentSessions: { nodes: pages[at]!, pageInfo: { hasNextPage: at++ < pages.length - 1, endCursor: `c${at}` } } }),
+        agentActivities: () => ({ agentActivities: page([]) }), agentActivityCreate: () => ({ agentActivityCreate: { success: true } }) })
+      const h = context()
+      h.state.set(KEYS.sessions, T0); h.state.set(KEYS.prompts, T0)
+      await pollLinear(h.ctx, stub.client, config(), signal())
+      expect(h.received.map(trigger => trigger.id)).toEqual(['linear:session:new-1', 'linear:session:new-2'])
+    }
   })
   it('keeps the cursor when a session was not taken in, and reads it again next round', async () => {
     const stub = sources([session('s1', '2026-11-12T10:01:00.000Z'), session('s2', '2026-11-12T10:02:00.000Z')])
@@ -199,6 +239,31 @@ describe('polling', () => {
     await pollLinear(h.ctx, stub.client, config(), signal())
     await pollLinear(h.ctx, stub.client, config(), signal())
     expect(states).toEqual([{ id: 'issue-1', state: 'done-1' }])
+  })
+  it('completes nothing for another ticket\'s merged pull request or with completeOnMerge off, and forgets ended tickets', async () => {
+    const states: unknown[] = []
+    const stub = linear({
+      agentSessions: () => ({ agentSessions: page([]) }), agentActivities: () => ({ agentActivities: page([]) }),
+      agentSessionUpdate: () => ({ agentSessionUpdate: { success: true } }),
+      'issue(id': () => ({ issue: { state: { type: 'started' }, team: { states: { nodes: [{ id: 'done', type: 'completed', position: 1 }] } } } }),
+      issueUpdate: variables => { states.push(variables); return { issueUpdate: { success: true } } },
+    })
+    const origin = sessionTrigger(session('s1', T0), VIEWER)!
+    const merged = { at: T0, outcome: 'merged' as const }
+    const followed: Ticket = { id: 't1', origin: { triggerId: origin.id, triggerIds: [origin.id] }, follows: [{ thread: 'github:7', own: false, closed: merged }] }
+    const own: Ticket = { id: 't2', origin: { triggerId: origin.id, triggerIds: [origin.id] }, follows: [{ thread: 'github:8', own: true, closed: merged }] }
+    const tickets = [followed, own]
+    const h = context({ tickets, triggers: [origin] })
+    h.state.set(KEYS.sessions, T0); h.state.set(KEYS.prompts, T0)
+    await pollLinear(h.ctx, stub.client, config({ completeOnMerge: false }), signal())
+    expect(states).toEqual([])
+    expect(h.state.get(KEYS.followed)).toEqual(['t1', 't2'])
+    // Both tickets end: one last look, then neither is followed any longer.
+    const open = vi.spyOn(h.ctx.tickets, 'open').mockReturnValue([])
+    await pollLinear(h.ctx, stub.client, config(), signal())
+    expect(states).toEqual([{ id: 'issue-1', state: 'done' }])
+    expect(h.state.get(KEYS.followed)).toEqual([])
+    open.mockRestore()
   })
 })
 

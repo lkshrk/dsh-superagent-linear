@@ -18,7 +18,7 @@ export function apply(ctx: PluginContext): void {
     if (!current) throw new Error('The Linear Source is off')
     return current
   }
-  const client = new LinearClient(() => config(), () => config())
+  const client = new LinearClient(() => config())
   const kind = linearKind(client)
   ctx.effect(() => orchestrator.sources.register(kind), 'linear: source kind')
   ctx.effect(() => {

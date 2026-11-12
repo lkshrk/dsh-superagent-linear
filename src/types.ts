@@ -50,6 +50,7 @@ export interface SourceKind<C extends Record<string, unknown>> {
   title: Localized
   description: Localized
   schema: z.ZodType<C>
+  accountFields?: readonly string[]
   fields: FieldSpec[]
   health: string[]
   scope?(input: { meta: Record<string, unknown> }, config: C): ScopeResult

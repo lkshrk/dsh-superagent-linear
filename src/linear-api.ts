@@ -7,12 +7,16 @@ import { z } from 'zod'
 export const SCOPE = 'read,write,app:assignable,app:mentionable'
 const TOKEN_SKEW_MS = 60 * 60_000
 const TIMEOUT_MS = 30_000
+/** Linear keeps at most 1,000 tokens per app and evicts the least recently used, so this client mints at most one per 15 minutes. */
+export const MINT_INTERVAL_MS = 15 * 60_000
+export const ENDPOINTS: Endpoints = { tokenUrl: 'https://api.linear.app/oauth/token', apiUrl: 'https://api.linear.app/graphql' }
 
 export class LinearError extends Error {
   constructor(message: string, readonly status?: number, readonly codes: readonly string[] = []) { super(message) }
   /** Linear reports a missing or deleted entity, such as an archived session, this way; a retry cannot succeed. */
   get gone(): boolean { return this.codes.some(code => /not.?found/i.test(code)) || /entity not found|could not find/i.test(this.message) }
   get unauthenticated(): boolean { return this.status === 401 || this.codes.some(code => /authenticat/i.test(code)) }
+  get throttled(): boolean { return this.codes.includes('MINT_THROTTLED') || this.codes.includes('RATELIMITED') }
 }
 
 export interface Credentials { clientIdFile: string; clientSecretFile: string }
@@ -45,11 +49,11 @@ const PageInfo = z.looseObject({ hasNextPage: z.boolean(), endCursor: z.string()
 const Page = z.looseObject({ nodes: z.array(z.unknown()), pageInfo: PageInfo })
 
 const ISSUE_FIELDS = 'id identifier title description url team { id key }'
-const SESSIONS = `query($after: String) { agentSessions(first: 50, after: $after, orderBy: createdAt) {
+const SESSIONS = `query($after: String) { agentSessions(first: 25, after: $after, orderBy: createdAt) {
   nodes { id createdAt url creator { id name } appUser { id name } comment { id body } issue { ${ISSUE_FIELDS} } }
   pageInfo { hasNextPage endCursor } } }`
 const PROMPTS = `query($since: DateTimeOrDuration!, $after: String) {
-  agentActivities(first: 50, after: $after, orderBy: createdAt, filter: { type: { eq: "prompt" }, createdAt: { gt: $since } }) {
+  agentActivities(first: 25, after: $after, orderBy: createdAt, filter: { type: { eq: "prompt" }, createdAt: { gt: $since } }) {
   nodes { id createdAt signal content { ... on AgentActivityPromptContent { body } } user { id name } agentSession { id issue { ${ISSUE_FIELDS} } } }
   pageInfo { hasNextPage endCursor } } }`
 const VIEWER = 'query { viewer { id } }'
@@ -65,19 +69,24 @@ export interface ActivityContent { type: 'thought' | 'response' | 'error'; body:
 
 export class LinearClient {
   private token?: { value: string; expires: number }
+  private minted = 0
+  private limitedUntil = 0
   private viewerId?: string
   private teamList?: { items: { id: string; key: string }[]; until: number }
-  constructor(private readonly credentials: () => Credentials, private readonly endpoints: () => Endpoints, private readonly fetcher: Fetch = fetch) {}
+  constructor(private readonly credentials: () => Credentials, private readonly endpoints: Endpoints = ENDPOINTS, private readonly fetcher: Fetch = fetch) {}
 
   /** Requests an app token with the fixed scope; the request body is written out by hand so the scope reaches Linear byte for byte. */
   private async mint(signal?: AbortSignal): Promise<string> {
+    const wait = this.minted + MINT_INTERVAL_MS - Date.now()
+    if (wait > 0) throw new LinearError(`Linear refused the token minted ${Math.round((Date.now() - this.minted) / 60_000)} min ago; the next token request waits ${Math.ceil(wait / 60_000)} min`, 401, ['MINT_THROTTLED'])
+    this.minted = Date.now()
     const { clientIdFile, clientSecretFile } = this.credentials()
     let id: string, secret: string
     try {
       id = readFileSync(clientIdFile, 'utf8').trim()
       secret = readFileSync(clientSecretFile, 'utf8').trim()
     } catch { throw new LinearError('The Linear app credential files are not readable') }
-    const response = await this.fetcher(this.endpoints().tokenUrl, { method: 'POST', signal: withTimeout(signal),
+    const response = await this.fetcher(this.endpoints.tokenUrl, { method: 'POST', signal: withTimeout(signal),
       headers: { authorization: `Basic ${Buffer.from(`${id}:${secret}`).toString('base64')}`, 'content-type': 'application/x-www-form-urlencoded' },
       body: `grant_type=client_credentials&scope=${SCOPE}` })
     if (!response.ok) throw new LinearError(`The Linear token endpoint answered ${response.status}`, response.status)
@@ -99,11 +108,17 @@ export class LinearClient {
     }
   }
   private async once<T>(query: string, variables: Record<string, unknown>, signal?: AbortSignal): Promise<T> {
+    if (Date.now() < this.limitedUntil) throw new LinearError(`Linear's rate limit holds requests until ${new Date(this.limitedUntil).toISOString()}`, 429, ['RATELIMITED'])
     const token = await this.bearer(signal)
-    const response = await this.fetcher(this.endpoints().apiUrl, { method: 'POST', signal: withTimeout(signal),
+    const response = await this.fetcher(this.endpoints.apiUrl, { method: 'POST', signal: withTimeout(signal),
       headers: { authorization: `Bearer ${token}`, 'content-type': 'application/json' }, body: JSON.stringify({ query, variables }) })
     const body = await response.json().catch(() => ({})) as { data?: T; errors?: { message?: string; extensions?: { code?: string; type?: string } }[] }
     const codes = (body.errors ?? []).flatMap(error => [error.extensions?.code, error.extensions?.type].filter((code): code is string => !!code))
+    if (response.status === 429 || codes.includes('RATELIMITED')) {
+      const reset = Number(response.headers.get('x-ratelimit-requests-reset') ?? response.headers.get('x-ratelimit-endpoint-requests-reset'))
+      this.limitedUntil = Number.isFinite(reset) && reset > Date.now() ? Math.min(reset, Date.now() + 3_600_000) : Date.now() + 60_000
+      throw new LinearError('Linear rate-limited this app', response.status, [...new Set([...codes, 'RATELIMITED'])])
+    }
     if (!response.ok) throw new LinearError(body.errors?.[0]?.message ?? `Linear answered ${response.status}`, response.status, codes)
     if (body.errors?.length) throw new LinearError(body.errors.map(error => error.message ?? 'error').join('; '), response.status, codes)
     if (body.data === undefined) throw new LinearError('Linear answered without data', response.status)
@@ -137,7 +152,10 @@ export class LinearClient {
   async prompts(since: string, signal?: AbortSignal): Promise<{ items: Prompt[]; unreadable: number }> {
     return await this.collect(PROMPTS, { since }, 'agentActivities', PromptSchema, since, signal)
   }
-  /** Reads pages until one reaches `since` or none follows, as Linear's sort direction is not part of its contract. */
+  /**
+   * Reads pages newest first, as Linear sorts by default, until one reaches `since` or none follows; a page that comes oldest
+   * first is read to its end instead, so either direction finds every item after `since`.
+   */
   private async collect<S extends z.ZodType<{ createdAt: string }>>(query: string, variables: Record<string, unknown>, field: string, schema: S,
     since: string, signal?: AbortSignal): Promise<{ items: z.infer<S>[]; unreadable: number }> {
     const items: z.infer<S>[] = []
@@ -145,11 +163,13 @@ export class LinearClient {
     for (let pages = 0; pages < 10; pages++) {
       const page = Page.parse((await this.request<Record<string, unknown>>(query, { ...variables, after }, signal))[field])
       let reached = false
+      const dates = page.nodes.map(node => Date.parse(String((node as { createdAt?: unknown }).createdAt ?? '')))
+      const ascending = dates.length > 1 && dates[0]! < dates.at(-1)!
       for (const node of page.nodes) {
         const parsed = schema.safeParse(node)
         if (!parsed.success) { unreadable++; continue }
         if (Date.parse(parsed.data.createdAt) > Date.parse(since)) items.push(parsed.data)
-        else reached = true
+        else if (!ascending) reached = true
       }
       if (reached || !page.pageInfo.hasNextPage || !page.pageInfo.endCursor) break
       after = page.pageInfo.endCursor
