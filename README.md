@@ -58,7 +58,7 @@ Not implemented: webhooks, thread context for assessments, and more than one rep
 
 Linear allows an OAuth app 5,000 requests and 2,000,000 complexity points per hour, per app user, shared by every service that uses the same app. A round costs two queries of about 200 points each, plus a team list every ten minutes. At the default 10 seconds that is about 730 requests (15%) and 140,000 points (7%) per hour. A longer interval lowers both and delays the first answer: past about 10 seconds Linear may show a session as unresponsive until the thought arrives. When Linear rate-limits the app, the Source sends nothing until the limit resets.
 
-Linear recommends webhooks over polling; an app has one webhook URL, so this Source polls where another service already owns it.
+Linear recommends webhooks over polling. This Source polls so it needs no public endpoint; an app has one webhook URL, and a webhook intake could replace polling later.
 
 A Source package's schema errors come from its own copy of zod; dsh-superagent from c8f41c3 still answers them as validation errors (400) in the panel.
 
