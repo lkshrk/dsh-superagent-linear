@@ -18,8 +18,10 @@ afterEach(() => { rmSync(dir, { recursive: true, force: true }) })
 
 const config = (overrides: Partial<LinearConfig> = {}): LinearConfig => LinearConfigSchema.parse({
   clientIdFile: join(dir, 'client-id'), clientSecretFile: join(dir, 'client-secret'),
-  teams: [{ id: TEAM, key: 'WEB', repository: 'acme/widgets' }, { id: OTHER_TEAM, key: 'OPS', repository: 'acme/other' }], ...overrides })
-const issue = (team = TEAM, n = 1) => ({ id: `issue-${n}`, identifier: `WEB-${n}`, title: 'Fix the footer', description: 'It overlaps.', url: `https://linear.app/x/issue/WEB-${n}`, team: { id: team, key: 'WEB' } })
+  teams: [{ key: 'WEB', repository: 'acme/widgets' }, { key: 'OPS', repository: 'acme/other' }], ...overrides })
+const KEYS_OF: Record<string, string> = { [TEAM]: 'WEB', [OTHER_TEAM]: 'OPS', elsewhere: 'ELSE' }
+const issue = (team = TEAM, n = 1) => ({ id: `issue-${n}`, identifier: `${KEYS_OF[team]}-${n}`, title: 'Fix the footer', description: 'It overlaps.',
+  url: `https://linear.app/x/issue/WEB-${n}`, team: { id: team, key: KEYS_OF[team]! } })
 const session = (id: string, at: string, fields: Partial<Session> = {}): Session => ({ id, createdAt: at, url: `https://linear.app/x/session/${id}`,
   creator: { id: OWNER, name: 'Owner' }, appUser: { id: VIEWER }, comment: null, issue: issue(), ...fields })
 const prompt = (id: string, at: string, fields: Partial<Prompt> = {}): Prompt => ({ id, createdAt: at, signal: null, content: { body: 'Also the header' },
@@ -44,6 +46,7 @@ function linear(handlers: Record<string, (variables: Record<string, unknown>) =>
     if (!valid.has(bearer)) return Response.json({ errors: [{ message: 'Authentication required', extensions: { code: 'AUTHENTICATION_ERROR' } }] }, { status: 401 })
     const operation = Object.keys(handlers).find(name => query.includes(name))
     if (query.includes('viewer') && !operation) return Response.json({ data: { viewer: { id: VIEWER } } })
+    if (query.includes('teams(') && !operation) return Response.json({ data: { teams: page(Object.entries(KEYS_OF).map(([id, key]) => ({ id, key }))) } })
     if (!operation) return Response.json({ errors: [{ message: `unexpected ${query.slice(0, 40)}` }] })
     try { return Response.json({ data: handlers[operation]!(variables) }) }
     catch (error) { return Response.json({ errors: [{ message: String((error as Error).message), extensions: { code: (error as { code?: string }).code } }] }) }
@@ -93,7 +96,7 @@ describe('translation', () => {
     const trigger = sessionTrigger(session('s1', '2026-11-12T10:00:00.000Z'), VIEWER)!
     expect(trigger).toMatchObject({ id: 'linear:session:s1', source: 'linear', threads: [{ source: 'linear', id: 'issue:issue-1' }],
       actor: { source: 'linear', id: OWNER }, human: true, addressed: 'direct', text: 'WEB-1: Fix the footer\n\nIt overlaps.',
-      channel: { source: 'linear', thread: 'linear:issue:issue-1', address: { session: 's1', issue: 'issue-1', team: TEAM, identifier: 'WEB-1' } },
+      channel: { source: 'linear', thread: 'linear:issue:issue-1', address: { session: 's1', issue: 'issue-1', team: TEAM, teamKey: 'WEB', identifier: 'WEB-1' } },
       meta: { team: TEAM, identifier: 'WEB-1', session: 's1', kind: 'session' } })
     expect(sessionTrigger(session('s1', '2026-11-12T10:00:00.000Z', { comment: { id: 'c1', body: '@daedalus please fix' } }), VIEWER)!.text)
       .toBe('@daedalus please fix\n\n(WEB-1: Fix the footer)')
@@ -107,11 +110,17 @@ describe('translation', () => {
     expect(promptTrigger(prompt('a3', '2026-11-12T10:00:00.000Z', { user: { id: VIEWER } }), VIEWER)).toBeUndefined()
     expect(sessionTrigger(session('s3', '2026-11-12T10:00:00.000Z', { issue: null }), VIEWER)).toBeUndefined()
   })
-  it('listens to the listed teams only, and offers sessions-only admission rows', () => {
+  it('listens to the configured teams by key or id, leaves switched-off ones out, and offers a sessions-only admission row per team', () => {
     const kind = linearKind(linear().client)
-    expect(kind.scope!({ meta: { team: TEAM } }, config())).toEqual({ listened: true, observed: false, row: TEAM })
-    expect(kind.scope!({ meta: { team: 'elsewhere' } }, config())).toEqual({ listened: false, reason: 'team_not_listed' })
-    expect(kind.policy!.rows!(config())[0]).toMatchObject({ id: TEAM, cells: { listedUnaddressed: false, unlistedAddressed: true, unlistedUnaddressed: false } })
+    expect(kind.scope!({ meta: { team: TEAM, teamKey: 'web' } }, config())).toEqual({ listened: true, observed: false, row: 'WEB' })
+    expect(kind.scope!({ meta: { team: 'elsewhere', teamKey: 'ELSE' } }, config())).toEqual({ listened: false, reason: 'team_not_listed' })
+    const byId = config({ teams: [{ id: TEAM, key: '', repository: 'acme/widgets', enabled: true }] })
+    expect(kind.scope!({ meta: { team: TEAM, teamKey: 'WEB' } }, byId)).toEqual({ listened: true, observed: false, row: TEAM })
+    const off = config({ teams: [{ id: '', key: 'WEB', repository: 'acme/widgets', enabled: false }] })
+    expect(kind.scope!({ meta: { team: TEAM, teamKey: 'WEB' } }, off)).toMatchObject({ listened: false })
+    expect(kind.policy!.rows!(config()).map(row => row.id)).toEqual(['WEB', 'OPS'])
+    expect(kind.policy!.rows!(config())[0]).toMatchObject({ cells: { listedUnaddressed: false, unlistedAddressed: true, unlistedUnaddressed: false } })
+    expect(() => LinearConfigSchema.parse({ teams: [{ repository: 'acme/widgets' }] })).toThrow('A team id or key')
     expect(kind.find!('see WEB-12 and OPS-3')).toEqual({ threads: [], terms: ['WEB-12', 'OPS-3'] })
   })
 })
@@ -138,6 +147,7 @@ describe('polling', () => {
     // OPS is listed with another repository than the GitHub Source's; an unlisted team goes to receive, whose scope files it as filtered.
     expect(h.received.map(trigger => trigger.id)).toEqual(['linear:session:s1', 'linear:session:s3', 'linear:prompt:a1'])
     expect(round.skipped).toEqual(['OPS'])
+    expect(round.unknown).toEqual([])
     expect(stub.activities).toEqual([{ id: stableUuid('seen:s1'), agentSessionId: 's1', content: { type: 'thought', body: 'Received; looking into it.' }, ephemeral: true }])
     expect(h.state.get(KEYS.sessions)).toBe('2026-11-12T10:02:55.000Z')
     expect(h.state.get(KEYS.prompts)).toBe('2026-11-12T10:03:55.000Z')
@@ -185,6 +195,15 @@ describe('polling', () => {
     await pollLinear(h.ctx, stub.client, config(), signal())
     expect(states).toEqual([{ id: 'issue-1', state: 'done-1' }])
   })
+})
+
+it('reports configured teams Linear does not know', async () => {
+  const stub = linear({ agentSessions: () => ({ agentSessions: page([]) }), agentActivities: () => ({ agentActivities: page([]) }) })
+  const h = context()
+  h.state.set(KEYS.sessions, '2026-11-12T10:00:00.000Z'); h.state.set(KEYS.prompts, '2026-11-12T10:00:00.000Z')
+  const round = await pollLinear(h.ctx, stub.client, config({ teams: [{ id: '', key: 'WEB', repository: 'acme/widgets', enabled: true },
+    { id: '', key: 'NOPE', repository: 'acme/widgets', enabled: true }, { id: 'missing-id', key: '', repository: 'acme/widgets', enabled: true }] }), signal())
+  expect(round.unknown).toEqual(['NOPE', 'missing-id'])
 })
 
 describe('replies', () => {

@@ -53,6 +53,8 @@ const PROMPTS = `query($since: DateTimeOrDuration!, $after: String) {
   nodes { id createdAt signal content { ... on AgentActivityPromptContent { body } } user { id name } agentSession { id issue { ${ISSUE_FIELDS} } } }
   pageInfo { hasNextPage endCursor } } }`
 const VIEWER = 'query { viewer { id } }'
+const TEAMS = 'query($after: String) { teams(first: 100, after: $after) { nodes { id key } pageInfo { hasNextPage endCursor } } }'
+const TEAMS_TTL_MS = 10 * 60_000
 const ACTIVITY = 'query($id: String!) { agentActivity(id: $id) { id } }'
 const CREATE_ACTIVITY = `mutation($input: AgentActivityCreateInput!) { agentActivityCreate(input: $input) { success } }`
 const ADD_URLS = `mutation($id: String!, $input: AgentSessionUpdateInput!) { agentSessionUpdate(id: $id, input: $input) { success } }`
@@ -64,6 +66,7 @@ export interface ActivityContent { type: 'thought' | 'response' | 'error'; body:
 export class LinearClient {
   private token?: { value: string; expires: number }
   private viewerId?: string
+  private teamList?: { items: { id: string; key: string }[]; until: number }
   constructor(private readonly credentials: () => Credentials, private readonly endpoints: () => Endpoints, private readonly fetcher: Fetch = fetch) {}
 
   /** Requests an app token with the fixed scope; the request body is written out by hand so the scope reaches Linear byte for byte. */
@@ -111,6 +114,20 @@ export class LinearClient {
   async viewer(signal?: AbortSignal): Promise<string> {
     this.viewerId ??= z.object({ viewer: z.object({ id: z.string() }) }).parse(await this.request(VIEWER, {}, signal)).viewer.id
     return this.viewerId
+  }
+  /** The workspace's teams the token can see, read again every ten minutes, to resolve configured keys and report unknown ones. */
+  async teams(signal?: AbortSignal): Promise<{ id: string; key: string }[]> {
+    if (this.teamList && Date.now() < this.teamList.until) return this.teamList.items
+    const items: { id: string; key: string }[] = []
+    let after: string | undefined
+    for (let pages = 0; pages < 10; pages++) {
+      const page = Page.parse((await this.request<Record<string, unknown>>(TEAMS, { after }, signal)).teams)
+      for (const node of page.nodes) { const team = Team.safeParse(node); if (team.success) items.push({ id: team.data.id, key: team.data.key }) }
+      if (!page.pageInfo.hasNextPage || !page.pageInfo.endCursor) break
+      after = page.pageInfo.endCursor
+    }
+    this.teamList = { items, until: Date.now() + TEAMS_TTL_MS }
+    return items
   }
   /** Sessions created after `since`, oldest first, with the number of nodes that did not parse. */
   async sessions(since: string, signal?: AbortSignal): Promise<{ items: Session[]; unreadable: number }> {

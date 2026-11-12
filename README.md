@@ -32,7 +32,7 @@ Set these on the Linear Source in the panel, or in the plugin configuration's `m
 | Key | Meaning |
 | --- | --- |
 | `clientIdFile`, `clientSecretFile` | Absolute paths of the files holding the app's client id and secret |
-| `teams` | `[{ id, key, repository }]`: the teams whose sessions are received, and the repository each works in. A team whose `repository` is not the GitHub Source's repository is left out, and the Source's health says so |
+| `teams` | `[{ key or id, repository, enabled }]`: the teams whose sessions are received, each by its key (such as `ENG`) or id, and the repository it works in; `enabled` defaults to on. Each team is one row of the Source's admission table. A team whose `repository` is not the GitHub Source's repository, or that Linear does not know, is left out, and the Source's health says so |
 | `pollSeconds` | Polling interval, default 10 |
 | `completeOnMerge` | Move the Issue to its team's first completed state once the ticket's own pull request merged, unless it is completed already; default on |
 | `apiUrl`, `tokenUrl` | Linear's endpoints; change only for tests |

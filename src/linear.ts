@@ -10,13 +10,23 @@ const REPOSITORY = /^[A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+$/
 export const LinearConfigSchema = z.object({
   clientIdFile: z.string().trim().refine(path => path === '' || path.startsWith('/'), 'An absolute path').default(''),
   clientSecretFile: z.string().trim().refine(path => path === '' || path.startsWith('/'), 'An absolute path').default(''),
-  teams: z.array(z.object({ id: z.string().trim().min(1), key: z.string().trim().default(''), repository: z.string().trim().regex(REPOSITORY) }).strict()).default([]),
+  teams: z.array(z.object({ id: z.string().trim().default(''), key: z.string().trim().default(''), repository: z.string().trim().regex(REPOSITORY),
+    enabled: z.boolean().default(true) }).strict().refine(team => team.id !== '' || team.key !== '', 'A team id or key')).default([]),
   pollSeconds: z.number().int().min(5).max(600).default(10),
   completeOnMerge: z.boolean().default(true),
   apiUrl: z.url().default('https://api.linear.app/graphql'),
   tokenUrl: z.url().default('https://api.linear.app/oauth/token'),
 }).strict()
 export type LinearConfig = z.infer<typeof LinearConfigSchema>
+type TeamConfig = LinearConfig['teams'][number]
+
+/** A configured team's row in the admission table and its name in health: its key, or its id when it names no key. */
+export const teamName = (team: TeamConfig) => team.key || team.id
+/** The enabled configured team a Trigger's Issue belongs to, matched by id or, case-insensitively, by key. */
+export function teamOf(config: LinearConfig, meta: Record<string, unknown>): TeamConfig | undefined {
+  return config.teams.find(team => team.enabled && ((team.id !== '' && team.id === meta.team)
+    || (team.key !== '' && team.key.toUpperCase() === String(meta.teamKey ?? '').toUpperCase())))
+}
 
 export const KEYS = {
   sessions: 'linear-sessions-cursor',
@@ -33,7 +43,7 @@ const cursorAt = (at: string) => new Date(Date.parse(at) - 5000).toISOString()
 type Issue = NonNullable<Session['issue']>
 function channel(issue: Issue, session: string, url: string) {
   return { source: SOURCE, thread: `${SOURCE}:${threadOf(issue.id)}`,
-    address: { session, issue: issue.id, team: issue.team.id, identifier: issue.identifier, url } }
+    address: { session, issue: issue.id, team: issue.team.id, teamKey: issue.team.key, identifier: issue.identifier, url } }
 }
 function meta(issue: Issue, session: string, kind: string) {
   return { team: issue.team.id, teamKey: issue.team.key, issue: issue.id, identifier: issue.identifier, session, kind }
@@ -86,20 +96,20 @@ export function linearKind(client: LinearClient): SourceKind<LinearConfig> {
     fields: [
       { key: 'clientIdFile', type: 'text', label: { zh: '应用 client id 文件', en: 'App client id file' } },
       { key: 'clientSecretFile', type: 'text', label: { zh: '应用 client secret 文件', en: 'App client secret file' } },
-      { key: 'teams', type: 'rows', label: { zh: '接收的团队', en: 'Teams' }, columns: [
-        { key: 'id', type: 'text', label: { zh: '团队 id', en: 'Team id' } },
+      { key: 'teams', type: 'rows', label: { zh: '接收的团队', en: 'Teams' }, hint: { zh: '团队 key（例如 WEB）或 id 填一个即可', en: 'A team key, such as WEB, or its id' }, columns: [
         { key: 'key', type: 'text', label: { zh: '团队 key', en: 'Team key' }, optional: true },
+        { key: 'id', type: 'text', label: { zh: '团队 id', en: 'Team id' }, optional: true },
         { key: 'repository', type: 'text', label: { zh: '仓库', en: 'Repository' }, pattern: REPOSITORY.source.slice(1, -1) }] },
       { key: 'completeOnMerge', type: 'switch', advanced: true, label: { zh: 'PR 合并后完成 Issue', en: 'Complete the Issue once its pull request merges' } },
       { key: 'pollSeconds', type: 'number', advanced: true, min: 5, max: 600, label: { zh: '轮询间隔 / 秒', en: 'Polling interval / seconds' } },
     ],
     health: [HEALTH],
     scope({ meta }, config) {
-      const team = config.teams.find(item => item.id === meta.team)
-      return team ? { listened: true, observed: false, row: team.id } : { listened: false, reason: 'team_not_listed' }
+      const team = teamOf(config, meta)
+      return team ? { listened: true, observed: false, row: teamName(team) } : { listened: false, reason: 'team_not_listed' }
     },
     channel: {
-      allowed: (address, config) => config.teams.some(team => team.id === address.team),
+      allowed: (address, config) => teamOf(config, { team: address.team, teamKey: address.teamKey }) !== undefined,
       send: (_host, message) => sendLinear(client, message),
       link: address => ({ url: address.url ?? '', label: { zh: `Linear ${address.identifier ?? ''}`, en: `Linear ${address.identifier ?? ''}` } }),
     },
@@ -111,7 +121,7 @@ export function linearKind(client: LinearClient): SourceKind<LinearConfig> {
         { key: 'name', type: 'text', label: { zh: '名字', en: 'Name' }, optional: true }] }],
       explicit: { zh: '名单里的人把 Issue 指派给智能体，或在评论里 @ 它。', en: 'Someone on the list delegates an Issue to the agent, or mentions it in a comment.' },
       unnamed: { person: { zh: 'Linear 用户', en: 'Linear user' }, bot: { zh: 'Linear 应用', en: 'Linear app' } },
-      rows: stored => LinearConfigSchema.parse(stored).teams.map(team => ({ id: team.id, label: team.key || team.id,
+      rows: stored => LinearConfigSchema.parse(stored).teams.filter(team => team.enabled).map(team => ({ id: teamName(team), label: teamName(team),
         note: { zh: '仅会话', en: 'Sessions only' }, cells: { listedUnaddressed: false, unlistedAddressed: true, unlistedUnaddressed: false } })),
     },
     environment: {
@@ -126,7 +136,7 @@ export function linearKind(client: LinearClient): SourceKind<LinearConfig> {
   }
 }
 
-export interface Round { sessions: number; prompts: number; unreadable: number; skipped: string[] }
+export interface Round { sessions: number; prompts: number; unreadable: number; skipped: string[]; unknown: string[] }
 
 /**
  * One polling round: new sessions, then new prompts, then the pull requests and merges of tickets that started on Linear.
@@ -134,13 +144,17 @@ export interface Round { sessions: number; prompts: number; unreadable: number; 
  */
 export async function pollLinear(ctx: SourceContext, client: LinearClient, config: LinearConfig, signal: AbortSignal): Promise<Round> {
   const repository = ctx.deployment.repository
-  const skipped = config.teams.filter(team => team.repository !== repository).map(team => team.key || team.id)
-  const teams = new Set(config.teams.filter(team => team.repository === repository).map(team => team.id))
+  const enabled = config.teams.filter(team => team.enabled)
+  const skipped = enabled.filter(team => team.repository !== repository).map(teamName)
+  const known = await client.teams(signal)
+  const unknown = enabled.filter(team => !known.some(item => (team.id !== '' && item.id === team.id)
+    || (team.key !== '' && item.key.toUpperCase() === team.key.toUpperCase()))).map(teamName)
   // A listed team whose repository is not the GitHub Source's is left out; an unlisted one goes to receive, whose scope filters it.
-  const misrouted = (trigger: Trigger) => !teams.has(String(trigger.meta.team)) && config.teams.some(team => team.id === trigger.meta.team)
+  const misrouted = (trigger: Trigger) => { const team = teamOf(config, trigger.meta); return team !== undefined && team.repository !== repository }
+  const served = (trigger: Trigger) => teamOf(config, trigger.meta)?.repository === repository
   const viewer = await client.viewer(signal)
   const now = new Date().toISOString()
-  const round: Round = { sessions: 0, prompts: 0, unreadable: 0, skipped }
+  const round: Round = { sessions: 0, prompts: 0, unreadable: 0, skipped, unknown }
   const sessionsSince = ctx.state.get<string>(KEYS.sessions)
   const promptsSince = ctx.state.get<string>(KEYS.prompts)
   // A first round starts from now: sessions from before the Source was switched on are not work for it.
@@ -159,7 +173,7 @@ export async function pollLinear(ctx: SourceContext, client: LinearClient, confi
     if (!trigger || misrouted(trigger)) continue
     try {
       // Linear marks a session unresponsive when nothing answers within seconds; an evaluation takes longer.
-      if (teams.has(String(trigger.meta.team)) && !ctx.state.get(KEYS.seen(session.id))) {
+      if (served(trigger) && !ctx.state.get(KEYS.seen(session.id))) {
         await client.activity(session.id, stableUuid(`seen:${session.id}`), { type: 'thought', body: 'Received; looking into it.' }, true, signal)
           .catch((error: unknown) => { if (!(error instanceof LinearError && error.gone)) throw error })
         ctx.state.set(KEYS.seen(session.id), true)
@@ -237,15 +251,16 @@ export async function watchLinear(ctx: SourceContext, client: LinearClient, sign
     const config = ctx.config<LinearConfig>(SOURCE)
     const at = new Date().toISOString()
     if (!config) ctx.report(HEALTH, { state: 'paused', detail: 'Off', at })
-    else if (!config.clientIdFile || !config.clientSecretFile || !config.teams.length) {
+    else if (!config.clientIdFile || !config.clientSecretFile || !config.teams.some(team => team.enabled)) {
       ctx.report(HEALTH, { state: 'paused', detail: 'Set the app credential files and a team', at })
     } else {
       try {
         const round = await pollLinear(ctx, client, config, signal)
         failures = 0
         const skipped = round.skipped.length ? `; teams ${round.skipped.join(', ')} skipped: their repository is not the GitHub Source's` : ''
-        ctx.report(HEALTH, { state: round.skipped.length ? 'error' : 'ready', at,
-          detail: `${round.sessions} sessions, ${round.prompts} prompts, ${round.unreadable} unreadable${skipped}` })
+        const unknown = round.unknown.length ? `; teams ${round.unknown.join(', ')} not found in Linear` : ''
+        ctx.report(HEALTH, { state: round.skipped.length || round.unknown.length ? 'error' : 'ready', at,
+          detail: `${round.sessions} sessions, ${round.prompts} prompts, ${round.unreadable} unreadable${skipped}${unknown}` })
       } catch (error) {
         failures++
         if (!signal.aborted && failures >= 3) ctx.report(HEALTH, { state: 'error', at, detail: `${failures} failed polls in a row; last: ${String(error)}` })
