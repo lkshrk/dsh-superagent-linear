@@ -35,7 +35,8 @@ export function stableUuid(seed: string): string {
 const User = z.looseObject({ id: z.string(), name: z.string().nullish() })
 const Team = z.looseObject({ id: z.string(), key: z.string() })
 const Issue = z.looseObject({ id: z.string(), identifier: z.string(), title: z.string(), description: z.string().nullish(), url: z.string(), team: Team,
-  delegate: z.looseObject({ id: z.string() }).nullish(), project: z.looseObject({ id: z.string(), name: z.string().nullish() }).nullish() })
+  delegate: z.looseObject({ id: z.string() }).nullish(), project: z.looseObject({ id: z.string(), name: z.string().nullish() }).nullish(),
+  labels: z.looseObject({ nodes: z.array(z.looseObject({ name: z.string() })) }).nullish() })
 export const SessionSchema = z.looseObject({
   id: z.string(), createdAt: z.string(), url: z.string().nullish(), creator: User.nullish(), appUser: User.nullish(),
   comment: z.looseObject({ id: z.string(), body: z.string().nullish() }).nullish(), issue: Issue.nullish(),
@@ -49,7 +50,7 @@ export type Prompt = z.infer<typeof PromptSchema>
 const PageInfo = z.looseObject({ hasNextPage: z.boolean(), endCursor: z.string().nullish() })
 const Page = z.looseObject({ nodes: z.array(z.unknown()), pageInfo: PageInfo })
 
-const ISSUE_FIELDS = 'id identifier title description url team { id key } delegate { id } project { id name }'
+const ISSUE_FIELDS = 'id identifier title description url team { id key } delegate { id } project { id name } labels { nodes { name } }'
 const SESSIONS = `query($after: String) { agentSessions(first: 25, after: $after, orderBy: createdAt) {
   nodes { id createdAt url creator { id name } appUser { id name } comment { id body } issue { ${ISSUE_FIELDS} } }
   pageInfo { hasNextPage endCursor } } }`

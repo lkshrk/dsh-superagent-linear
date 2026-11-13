@@ -73,7 +73,7 @@ function channel(issue: Issue, session: string, url: string) {
 function meta(issue: Issue, session: string, kind: string) {
   return { team: issue.team.id, teamKey: issue.team.key, issue: issue.id, identifier: issue.identifier, session, kind,
     ...issue.project ? { project: issue.project.id, ...issue.project.name ? { projectName: issue.project.name } : {} } : {},
-    ...issue.delegate ? { delegate: issue.delegate.id } : {} }
+    ...issue.delegate ? { delegate: issue.delegate.id } : {}, ...issue.labels?.nodes.length ? { labels: issue.labels.nodes.map(label => label.name) } : {} }
 }
 
 /** The Trigger of a session a person started by delegating an issue to the app or mentioning it; the app's own sessions produce none. */

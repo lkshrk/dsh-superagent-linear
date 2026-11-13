@@ -121,6 +121,14 @@ describe('translation', () => {
       .toBe('@daedalus please fix\n\n(WEB-1: Fix the footer)')
     expect(promptTrigger(prompt('a1', '2026-11-12T10:01:00.000Z'), VIEWER)).toMatchObject({ id: 'linear:prompt:a1', text: 'Also the header',
       threads: [{ id: 'issue:issue-1' }], meta: { session: 's1', activity: 'a1', kind: 'prompt' } })
+    expect(trigger.meta).not.toHaveProperty('labels')
+  })
+  it('carries the Issue\'s label names on session and prompt Triggers, and none when it has no labels', () => {
+    const labelled = { ...issue(), labels: { nodes: [{ name: 'hard' }, { name: 'Bug' }] } }
+    expect(sessionTrigger(session('s1', '2026-11-12T10:00:00.000Z', { issue: labelled }), VIEWER)!.meta.labels).toEqual(['hard', 'Bug'])
+    expect(promptTrigger(prompt('a1', '2026-11-12T10:00:00.000Z', { agentSession: { id: 's1', issue: labelled } }), VIEWER)!.meta.labels).toEqual(['hard', 'Bug'])
+    expect(sessionTrigger(session('s2', '2026-11-12T10:00:00.000Z', { issue: { ...issue(), labels: { nodes: [] } } }), VIEWER)!.meta).not.toHaveProperty('labels')
+    expect(promptTrigger(prompt('a2', '2026-11-12T10:00:00.000Z'), VIEWER)!.meta).not.toHaveProperty('labels')
   })
   it('makes a stop signal explicit, and drops what the app itself wrote', () => {
     expect(promptTrigger(prompt('a2', '2026-11-12T10:02:00.000Z', { signal: 'stop', content: { body: '' } }), VIEWER))
