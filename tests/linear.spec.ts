@@ -270,8 +270,32 @@ describe('polling', () => {
       const h = context({ tickets: [ticket], triggers: [origin], repositories, threads: { 'github:acme/other#3': { url: 'https://github.com/acme/other/pull/3' } } })
       h.state.set(KEYS.sessions, T0); h.state.set(KEYS.prompts, T0)
       await pollLinear(h.ctx, stub.client, config({ teams }), signal())
-      expect(h.received.map(trigger => [trigger.meta.kind, trigger.meta.repository])).toEqual([['prompt', undefined], ['undelegated', 'acme/other']])
+      expect(h.received.map(trigger => [trigger.meta.kind, trigger.meta.repository])).toEqual([['prompt', 'acme/other'], ['undelegated', 'acme/other']])
       expect(updates.map(update => update.input.addedExternalUrls[0]!.label)).toEqual(['Pull request #3'])
+    })
+
+    it('lets a stop prompt through to the open ticket after its Issue moved to an unmapped project or another team', async () => {
+      const teams = [{ key: 'WEB', projects: [{ id: 'p-o', repository: 'acme/other' }] }]
+      const start = await take(teams, [session('s1', '2026-11-12T10:01:00.000Z', { issue: inProject(1, { id: 'p-o' }) })])
+      const origin = start.received[0]!
+      const ticket: Ticket = { id: 't1', origin: { triggerId: origin.id, triggerIds: [origin.id] }, execution: { repository: 'acme/other' } }
+      const moved = [inProject(1, { id: 'p-z', name: 'Else' }), inProject(1, null, 'elsewhere')]
+      const stub = sources([], moved.map((where, n) => prompt(`a${n}`, `2026-11-12T10:0${5 + n}:00.000Z`,
+        { signal: 'stop', content: { body: '' }, agentSession: { id: 's1', issue: where } })))
+      const h = context({ tickets: [ticket], triggers: [origin], repositories })
+      h.state.set(KEYS.sessions, T0); h.state.set(KEYS.prompts, T0)
+      const round = await pollLinear(h.ctx, stub.client, config({ teams }), signal())
+      expect(round).toMatchObject({ prompts: 2, unmapped: [], misrouted: [] })
+      expect(h.received.map(trigger => [trigger.text, trigger.meta.repository, trigger.meta.teamKey])).toEqual([
+        ['Stop requested in Linear.', 'acme/other', 'WEB'], ['Stop requested in Linear.', 'acme/other', 'WEB']])
+      expect(linearKind(stub.client).scope!({ meta: h.received[1]!.meta }, config({ teams }))).toMatchObject({ listened: true })
+    })
+
+    it('still routes a prompt on an Issue without an open ticket by its project', async () => {
+      const { received, round } = await take([{ key: 'WEB', projects: [{ id: 'p-o', repository: 'acme/other' }] }], [],
+        [prompt('a1', '2026-11-12T10:05:00.000Z', { agentSession: { id: 's1', issue: inProject(1, { id: 'p-z' }) } })])
+      expect(received).toEqual([])
+      expect(round.unmapped).toEqual(['WEB-1'])
     })
 
     it('needs a repository or projects on a team, and an id or name on a project', () => {

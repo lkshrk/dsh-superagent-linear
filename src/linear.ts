@@ -201,6 +201,14 @@ export async function pollLinear(ctx: SourceContext, client: LinearClient, confi
   }
   const placed = (trigger: Trigger, repository: string | undefined): Trigger =>
     repository && !sameName(repository, ctx.deployment.repository) ? { ...trigger, meta: { ...trigger.meta, repository } } : trigger
+  // A prompt on an Issue with an open ticket follows that ticket, wherever the Issue has moved since.
+  const openTicketOf = (issue: string) => {
+    for (const ticket of ctx.tickets.open()) {
+      const origin = ctx.triggers.get(ticket.origin.triggerId)
+      if (origin?.source === SOURCE && origin.meta.issue === issue) return { ticket, origin }
+    }
+    return undefined
+  }
   const viewer = await client.viewer(signal)
   const now = new Date().toISOString()
   const round: Round = { sessions: 0, prompts: 0, unreadable: 0, skipped, unknown, misrouted: [], unmapped: [], unverified: !known }
@@ -257,10 +265,17 @@ export async function pollLinear(ctx: SourceContext, client: LinearClient, confi
     if (signal.aborted) throw new Error('The Linear Source stopped during the read')
     const found = promptTrigger(prompt, viewer)
     if (!found) continue
-    const where = route(found)
-    if (where.kind === 'misrouted') { round.misrouted.push(String(found.meta.identifier)); continue }
-    if (where.kind === 'unmapped') { round.unmapped.push(String(found.meta.identifier)); continue }
-    const trigger = placed(found, where.kind === 'served' ? where.repository : undefined)
+    const open = openTicketOf(String(found.meta.issue))
+    let trigger: Trigger
+    if (open) {
+      const { team, teamKey } = open.origin.meta
+      trigger = placed({ ...found, meta: { ...found.meta, team, teamKey } }, open.ticket.execution?.repository ?? repositoryMeta(open.origin))
+    } else {
+      const where = route(found)
+      if (where.kind === 'misrouted') { round.misrouted.push(String(found.meta.identifier)); continue }
+      if (where.kind === 'unmapped') { round.unmapped.push(String(found.meta.identifier)); continue }
+      trigger = placed(found, where.kind === 'served' ? where.repository : undefined)
+    }
     try {
       await ctx.receive(trigger)
       round.prompts++
