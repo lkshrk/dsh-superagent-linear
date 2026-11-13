@@ -869,6 +869,17 @@ describe('split mode', () => {
     expect(h.received[0]!.text.split('\n')[0]).toBe(SPLIT_LINE)
     expect(h.received[0]!.meta.mode).toBe('split')
   })
+  it('does not split an epic on an unlisted team', async () => {
+    const elsewhere = { ...issue('elsewhere', 3), labels: { nodes: [{ name: 'epic' }] } }
+    const stub = linear({ agentSessions: () => ({ agentSessions: page([session('s3', '2026-11-12T10:01:00.000Z', { issue: elsewhere })]) }),
+      agentActivities: () => ({ agentActivities: page([]) }), agentActivityCreate: () => ({ agentActivityCreate: { success: true } }),
+      IssueContext: () => { throw new Error('not expected') } })
+    const h = context(); h.state.set(KEYS.sessions, T0); h.state.set(KEYS.prompts, T0)
+    await pollLinear(h.ctx, stub.client, config(), signal())
+    expect(h.received[0]!.id).toBe('linear:session:s3')
+    expect(h.received[0]!.meta).not.toHaveProperty('mode')
+    expect(h.received[0]!.text).not.toContain(SPLIT_LINE)
+  })
   it('sets DSH_SUPERAGENT_LINEAR_MODE to split for a split ticket, and empty otherwise', () => {
     expect(linearKind(linear().client).environment!.variables.map(variable => variable.key)).toContain('DSH_SUPERAGENT_LINEAR_MODE')
     expect(env(withMode(epic(), childless)).DSH_SUPERAGENT_LINEAR_MODE).toBe('split')

@@ -293,7 +293,7 @@ export async function pollLinear(ctx: SourceContext, client: LinearClient, confi
       const context = where.kind === 'served' && !ctx.triggers.get(trigger.id)
         ? await client.issueContext(String(trigger.meta.issue), signal).catch((error: unknown) => { if (signal.aborted) throw error; round.contextFailed++; return undefined })
         : undefined
-      await ctx.receive(withMode(withContext(trigger, context), context))
+      await ctx.receive(where.kind === 'served' ? withMode(withContext(trigger, context), context) : trigger)
       describe(ctx, trigger)
       round.sessions++
     } catch (error) {
