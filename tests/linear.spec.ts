@@ -5,7 +5,7 @@ import { join } from 'node:path'
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import type { z } from 'zod'
 import { LinearClient, MINT_INTERVAL_MS, SCOPE, stableUuid, type IssueContext, type Prompt, type Session } from '../src/linear-api.ts'
-import { CLOSE_HORIZON_MS, DELEGATION_INTERVAL_MS, KEYS, PARENT_DESCRIPTION_LIMIT, LinearConfigSchema, pullOf, undelegationTrigger, linearKind, pollLinear, promptTrigger, sendLinear, sessionTrigger, watchLinear, withContext, type LinearConfig } from '../src/linear.ts'
+import { CLOSE_HORIZON_MS, DELEGATION_INTERVAL_MS, KEYS, PARENT_DESCRIPTION_LIMIT, LinearConfigSchema, pullOf, undelegationTrigger, linearKind, pollLinear, promptTrigger, sendLinear, sessionTrigger, SPLIT_LINE, watchLinear, withContext, withMode, type LinearConfig } from '../src/linear.ts'
 import { apply } from '../src/index.ts'
 import type { OutboundMessage, SourceContext, Ticket, Trigger } from '../src/types.ts'
 
@@ -806,6 +806,76 @@ describe('issue context', () => {
     await expect(pollLinear(h.ctx, stub.client, config(), controller.signal)).rejects.toThrow()
     expect(h.received).toEqual([])
     expect(h.state.get(KEYS.sessions)).toBe(T0)
+  })
+})
+
+describe('split mode', () => {
+  const T0 = '2026-11-12T10:00:00.000Z'
+  const labelled = (...names: string[]) => ({ ...issue(), labels: { nodes: names.map(name => ({ name })) } })
+  const epic = (name = 'epic') => sessionTrigger(session('s1', '2026-11-12T10:01:00.000Z', { issue: labelled('Bug', name) }), VIEWER)!
+  const childless: IssueContext = { parent: null, children: { nodes: [], pageInfo: { hasNextPage: false } } }
+  const withChild: IssueContext = { parent: null, children: { nodes: [{ identifier: 'WEB-2', title: 'Part', state: { type: 'started' } }], pageInfo: { hasNextPage: false } } }
+  const env = (trigger?: Trigger) => linearKind(linear().client).environment!.values({ config: config(), ...trigger ? { trigger } : {} })
+
+  it('splits a session on an epic with no sub-issues, naming the epic and putting the mode on the first line', () => {
+    const trigger = withMode(epic(), childless)
+    expect(trigger.meta).toMatchObject({ mode: 'split', epic: 'issue-1', identifier: 'WEB-1' })
+    expect(trigger.text).toBe(`${SPLIT_LINE}\n${epic().text}`)
+    expect(SPLIT_LINE).toBe('Mode: split (plan this epic into sub-issues; no code)')
+  })
+  it('matches the epic label ignoring case', () => {
+    expect(withMode(epic('EPIC'), childless).meta.mode).toBe('split')
+    expect(withMode(epic('Epic'), childless).meta.mode).toBe('split')
+  })
+  it('splits an epic whose context read failed or was skipped', () => {
+    expect(withMode(epic(), undefined).meta).toMatchObject({ mode: 'split', epic: 'issue-1' })
+  })
+  it('leaves an epic with sub-issues, and an Issue without the label, unsplit', () => {
+    const split = epic()
+    expect(withMode(split, withChild)).toBe(split)
+    const plain = sessionTrigger(session('s1', '2026-11-12T10:01:00.000Z', { issue: labelled('Bug', 'epics') }), VIEWER)!
+    expect(withMode(plain, childless)).toBe(plain)
+    const bare = sessionTrigger(session('s1', '2026-11-12T10:01:00.000Z'), VIEWER)!
+    expect(withMode(bare, undefined)).toBe(bare)
+  })
+  it('never splits a prompt or an undelegation', () => {
+    const prompted = promptTrigger(prompt('a1', '2026-11-12T10:02:00.000Z', { agentSession: { id: 's1', issue: labelled('EPIC') } }), VIEWER)!
+    expect(withMode(prompted, childless)).toBe(prompted)
+    const stop = undelegationTrigger(epic(), 'ticket-1', undefined, '2026-11-12T10:03:00.000Z')
+    expect(withMode({ ...stop, meta: { ...stop.meta, labels: ['epic'] } }, childless).meta).not.toHaveProperty('mode')
+  })
+  it('keeps the mode line first above the parent header', async () => {
+    const stub = linear({ agentSessions: () => ({ agentSessions: page([session('s1', '2026-11-12T10:01:00.000Z', { issue: labelled('EPIC') })]) }),
+      agentActivities: () => ({ agentActivities: page([prompt('a1', '2026-11-12T10:02:00.000Z', { agentSession: { id: 's1', issue: labelled('EPIC') } })]) }),
+      agentActivityCreate: () => ({ agentActivityCreate: { success: true } }),
+      IssueContext: () => ({ issue: { parent: { id: 'issue-0', identifier: 'WEB-0', title: 'Roadmap', url: 'https://linear.app/x/issue/WEB-0', description: null },
+        children: { nodes: [], pageInfo: { hasNextPage: false } } } }) })
+    const h = context(); h.state.set(KEYS.sessions, T0); h.state.set(KEYS.prompts, T0)
+    await pollLinear(h.ctx, stub.client, config(), signal())
+    const [first, second] = h.received[0]!.text.split('\n')
+    expect(first).toBe(SPLIT_LINE)
+    expect(second).toBe('Parent: WEB-0 "Roadmap" https://linear.app/x/issue/WEB-0')
+    expect(h.received[0]!.meta).toMatchObject({ mode: 'split', epic: 'issue-1', parent: 'issue-0', children: 0 })
+    expect(h.received[1]!.meta).not.toHaveProperty('mode')
+    expect(h.received[1]!.text).toBe('Also the header')
+  })
+  it('splits a polled epic whose context read failed', async () => {
+    const stub = linear({ agentSessions: () => ({ agentSessions: page([session('s1', '2026-11-12T10:01:00.000Z', { issue: labelled('epic') })]) }),
+      agentActivities: () => ({ agentActivities: page([]) }), agentActivityCreate: () => ({ agentActivityCreate: { success: true } }),
+      IssueContext: () => { throw new Error('Internal error') } })
+    const h = context(); h.state.set(KEYS.sessions, T0); h.state.set(KEYS.prompts, T0)
+    const round = await pollLinear(h.ctx, stub.client, config(), signal())
+    expect(round.contextFailed).toBe(1)
+    expect(h.received[0]!.text.split('\n')[0]).toBe(SPLIT_LINE)
+    expect(h.received[0]!.meta.mode).toBe('split')
+  })
+  it('sets DSH_SUPERAGENT_LINEAR_MODE to split for a split ticket, and empty otherwise', () => {
+    expect(linearKind(linear().client).environment!.variables.map(variable => variable.key)).toContain('DSH_SUPERAGENT_LINEAR_MODE')
+    expect(env(withMode(epic(), childless)).DSH_SUPERAGENT_LINEAR_MODE).toBe('split')
+    expect(env(withMode(epic(), withChild))).toMatchObject({ DSH_SUPERAGENT_LINEAR_MODE: '', DSH_SUPERAGENT_LINEAR_ISSUE: 'WEB-1' })
+    const github = { ...epic(), source: 'github', meta: { mode: 'split' } }
+    expect(env(github)).toEqual({ DSH_SUPERAGENT_LINEAR_ISSUE: '', DSH_SUPERAGENT_LINEAR_ISSUE_URL: '', DSH_SUPERAGENT_LINEAR_MODE: '' })
+    expect(env().DSH_SUPERAGENT_LINEAR_MODE).toBe('')
   })
 })
 

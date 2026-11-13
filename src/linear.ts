@@ -142,6 +142,14 @@ export function withContext(trigger: Trigger, context: IssueContext | undefined)
     meta: { ...trigger.meta, ...parent ? { parent: parent.id } : {}, children: children.length } }
 }
 
+export const SPLIT_LINE = 'Mode: split (plan this epic into sub-issues; no code)'
+/** A session Trigger on an Issue labelled epic becomes a split when its context shows no sub-issues or could not be read. */
+export function withMode(trigger: Trigger, context: IssueContext | undefined): Trigger {
+  const labels = Array.isArray(trigger.meta.labels) ? trigger.meta.labels : []
+  if (trigger.meta.kind !== 'session' || !labels.some(label => String(label).toLowerCase() === 'epic') || context?.children.nodes.length) return trigger
+  return { ...trigger, text: `${SPLIT_LINE}\n${trigger.text}`, meta: { ...trigger.meta, mode: 'split', epic: trigger.meta.issue } }
+}
+
 const CONTENT: Record<OutboundMessage['kind'], ActivityContent['type']> = { acknowledgement: 'thought', reply: 'response', notice: 'thought' }
 /** Sends a message as an activity in its session, once per message id. */
 export async function sendLinear(client: LinearClient, message: OutboundMessage): Promise<'sent' | 'gone'> {
@@ -199,10 +207,12 @@ export function linearKind(client: LinearClient): SourceKind<LinearConfig> {
       variables: [
         { key: 'DSH_SUPERAGENT_LINEAR_ISSUE', description: { zh: '接下工单的 Linear Issue 标识，例如 ENG-12；工单不是从 Linear 来的时为空', en: 'Identifier of the Linear Issue that started the ticket, such as ENG-12; empty when the ticket did not start on Linear' } },
         { key: 'DSH_SUPERAGENT_LINEAR_ISSUE_URL', description: { zh: '那个 Linear Issue 的链接', en: 'Link to that Linear Issue' } },
+        { key: 'DSH_SUPERAGENT_LINEAR_MODE', description: { zh: '工单要把 Linear epic 拆成子 Issue 时为 split；其他情况为空', en: 'split when the ticket plans a Linear epic into sub-issues; empty otherwise' } },
       ],
       values: ({ trigger }) => trigger?.source === SOURCE
-        ? { DSH_SUPERAGENT_LINEAR_ISSUE: String(trigger.meta.identifier ?? ''), DSH_SUPERAGENT_LINEAR_ISSUE_URL: trigger.url ?? '' }
-        : { DSH_SUPERAGENT_LINEAR_ISSUE: '', DSH_SUPERAGENT_LINEAR_ISSUE_URL: '' },
+        ? { DSH_SUPERAGENT_LINEAR_ISSUE: String(trigger.meta.identifier ?? ''), DSH_SUPERAGENT_LINEAR_ISSUE_URL: trigger.url ?? '',
+          DSH_SUPERAGENT_LINEAR_MODE: String(trigger.meta.mode ?? '') }
+        : { DSH_SUPERAGENT_LINEAR_ISSUE: '', DSH_SUPERAGENT_LINEAR_ISSUE_URL: '', DSH_SUPERAGENT_LINEAR_MODE: '' },
     },
   }
 }
@@ -283,7 +293,7 @@ export async function pollLinear(ctx: SourceContext, client: LinearClient, confi
       const context = where.kind === 'served' && !ctx.triggers.get(trigger.id)
         ? await client.issueContext(String(trigger.meta.issue), signal).catch((error: unknown) => { if (signal.aborted) throw error; round.contextFailed++; return undefined })
         : undefined
-      await ctx.receive(withContext(trigger, context))
+      await ctx.receive(withMode(withContext(trigger, context), context))
       describe(ctx, trigger)
       round.sessions++
     } catch (error) {
