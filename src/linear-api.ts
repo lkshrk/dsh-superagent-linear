@@ -196,7 +196,6 @@ export class LinearClient {
   async addLinks(session: string, links: { label: string; url: string }[], signal?: AbortSignal): Promise<void> {
     await this.request(ADD_URLS, { id: session, input: { addedExternalUrls: links } }, signal)
   }
-  /** The delegate of each issue Linear still has, by issue id, null when none is delegated; a chunk of 50 that fails is left out. */
   /** Each Issue's delegate and close, 50 Issues a request; a chunk that cannot be read is left out. */
   async issues(ids: string[], signal?: AbortSignal): Promise<Map<string, IssueStatus>> {
     const issues = new Map<string, IssueStatus>()
