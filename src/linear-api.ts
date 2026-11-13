@@ -75,7 +75,6 @@ const IssueContextSchema = z.looseObject({
   children: z.looseObject({ nodes: z.array(z.looseObject({ identifier: z.string(), title: z.string(), state: z.looseObject({ type: z.string() }).nullish() })),
     pageInfo: z.looseObject({ hasNextPage: z.boolean() }) }),
 })
-/** An Issue's parent and its first 30 sub-issues. */
 export type IssueContext = z.infer<typeof IssueContextSchema>
 
 /** An Issue's delegate, and when it closed (moved to a completed or canceled state), if it is closed. */
@@ -232,7 +231,6 @@ export class LinearClient {
       .sort((a, b) => Date.parse(b.createdAt) - Date.parse(a.createdAt))[0]
     return change && { id: change.id, at: change.createdAt, ...change.actor ? { actor: { id: change.actor.id, name: change.actor.name } } : {} }
   }
-  /** The issue's parent and first 30 sub-issues. */
   async issueContext(issue: string, signal?: AbortSignal): Promise<IssueContext> {
     return z.object({ issue: IssueContextSchema }).parse(await this.request(ISSUE_CONTEXT, { id: issue }, signal)).issue
   }

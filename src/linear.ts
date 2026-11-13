@@ -117,13 +117,22 @@ export function undelegationTrigger(origin: Trigger, ticket: string, change: Und
 
 const SUB_ISSUE_STATES: Record<string, string> = { completed: 'done', canceled: 'canceled' }
 export const PARENT_DESCRIPTION_LIMIT = 1500
-/** The Trigger with its Issue's parent and sub-issues on top of its text, and the parent's description fenced below it as data. */
+const SUB_ISSUES_SHOWN = 8
+const PARENT_TITLE_LIMIT = 80
+const oneLine = (text: string, limit: number) => {
+  const flat = text.replace(/\s+/g, ' ').trim()
+  return flat.length > limit ? `${flat.slice(0, limit - 1)}…` : flat
+}
 export function withContext(trigger: Trigger, context: IssueContext | undefined): Trigger {
-  const parent = context?.parent, children = context?.children.nodes ?? []
+  if (!context) return trigger
+  const { parent, children: { nodes: children, pageInfo } } = context
   if (!parent && !children.length) return trigger
-  const more = context!.children.pageInfo.hasNextPage ? ', and more' : ''
-  const header = [...parent ? [`Parent: ${parent.identifier} ${parent.title} ${parent.url}`] : [],
-    ...children.length ? [`Sub-issues: ${children.map(child => `${child.identifier} (${SUB_ISSUE_STATES[child.state?.type ?? ''] ?? 'open'})`).join(', ')}${more}`] : []]
+  const states = children.map(child => ({ identifier: child.identifier, state: SUB_ISSUE_STATES[child.state?.type ?? ''] ?? 'open' }))
+  const shown = [...states.filter(child => child.state === 'open'), ...states.filter(child => child.state !== 'open')].slice(0, SUB_ISSUES_SHOWN)
+  const rest = children.length - shown.length
+  const more = rest ? `, and ${rest}${pageInfo.hasNextPage ? '+' : ''} more` : pageInfo.hasNextPage ? ', and more' : ''
+  const header = [...parent ? [`Parent: ${parent.identifier} "${oneLine(parent.title, PARENT_TITLE_LIMIT)}" ${parent.url}`] : [],
+    ...shown.length ? [`Sub-issues: ${shown.map(child => `${child.identifier} (${child.state})`).join(', ')}${more}`] : []]
   const description = parent?.description?.trim()
   const cut = description && description.length > PARENT_DESCRIPTION_LIMIT
     ? `${description.slice(0, PARENT_DESCRIPTION_LIMIT)}\n[cut at ${PARENT_DESCRIPTION_LIMIT} characters]` : description
@@ -270,7 +279,8 @@ export async function pollLinear(ctx: SourceContext, client: LinearClient, confi
           .catch((error: unknown) => { if (!(error instanceof LinearError && error.gone)) throw error })
         ctx.state.set(KEYS.seen(session.id), true)
       }
-      const context = where.kind === 'served'
+      // The cursor replays the newest session every round; a stored Trigger needs no second read.
+      const context = where.kind === 'served' && !ctx.triggers.get(trigger.id)
         ? await client.issueContext(String(trigger.meta.issue), signal).catch((error: unknown) => { if (signal.aborted) throw error; round.contextFailed++; return undefined })
         : undefined
       await ctx.receive(withContext(trigger, context))
@@ -460,7 +470,7 @@ export async function watchLinear(ctx: SourceContext, client: LinearClient, sign
         const list = (items: string[]) => `${items.slice(0, 10).join(', ')}${items.length > 10 ? ' and more' : ''}`
         const misrouted = round.misrouted.length ? `; left out ${list(round.misrouted)}` : ''
         const unmapped = round.unmapped.length ? `; no repository for ${list(round.unmapped)}: map their project or give the team a repository` : ''
-        const contextFailed = round.contextFailed ? `; parent and sub-issues not readable for ${round.contextFailed} sessions` : ''
+        const contextFailed = round.contextFailed ? `; parent and sub-issues unreadable: ${round.contextFailed}` : ''
         report({ state: round.skipped.length || round.unknown.length ? 'error' : 'ready', at,
           detail: `${round.sessions} sessions, ${round.prompts} prompts, ${round.unreadable} unreadable${contextFailed}${skipped}${misrouted}${unmapped}${unknown}` })
       } catch (error) {
