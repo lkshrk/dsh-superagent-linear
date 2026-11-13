@@ -7,7 +7,7 @@ import type { z } from 'zod'
 import { LinearClient, MINT_INTERVAL_MS, SCOPE, stableUuid, type IssueContext, type Prompt, type Session } from '../src/linear-api.ts'
 import { CLOSE_HORIZON_MS, DELEGATION_INTERVAL_MS, KEYS, PARENT_DESCRIPTION_LIMIT, LinearConfigSchema, pullOf, undelegationTrigger, linearKind, pollLinear, promptTrigger, sendLinear, sessionTrigger, SPLIT_LINE, watchLinear, withContext, withMode, type LinearConfig } from '../src/linear.ts'
 import { apply } from '../src/index.ts'
-import { CHAIN_KEYS, type ChainRecord } from '../src/linear-chain.ts'
+import { CHAIN_KEYS, HOLD_MS, type ChainRecord } from '../src/linear-chain.ts'
 import type { OutboundMessage, SourceContext, Ticket, Trigger } from '../src/types.ts'
 
 const VIEWER = 'app-user', OWNER = 'owner-1', TEAM = 'team-web', OTHER_TEAM = 'team-ops'
@@ -1399,9 +1399,9 @@ describe('chain', () => {
     expect(w.received[1]).toMatchObject({ human: true, threads: [{ id: 'issue:kid-2' }], meta: { signal: 'stop', issue: 'kid-2', session: 'cs-1' } })
   })
 
-  it('leaves children in progress or assigned to someone else alone, waits for them, and finishes once they close', async () => {
+  it('leaves children assigned to a person alone, waits for them, and finishes once they close', async () => {
     const w = world()
-    w.epic(); w.kid(2, { state: 'started' }); w.kid(3, { assignee: 'someone' }); w.kid(4, { assignee: VIEWER }); w.kid(5)
+    w.epic(); w.kid(2, { assignee: 'other' }); w.kid(3, { assignee: 'someone' }); w.kid(4, { assignee: VIEWER }); w.kid(5)
     w.delegate('es1')
     await w.round()
     expect(w.startedKids()).toEqual(['WEB-4', 'WEB-5'])
@@ -1426,6 +1426,31 @@ describe('chain', () => {
     expect(w.record()).toBeUndefined()
     await w.round()
     expect(w.startedKids()).toEqual(['WEB-2'])
+  })
+
+  it('stops holding a delegated session whose sub-issues stay unreadable for 10 minutes, says so once, and moves the cursor on', async () => {
+    const w = world()
+    w.epic(); w.kid(2)
+    w.delegate('es1')
+    w.failures.IssueContext = 99
+    await expect(w.round()).rejects.toThrow('not taken in')
+    expect(w.state.get(KEYS.sessions)).toBe(T0)
+    w.state.set(CHAIN_KEYS.held('es1'), new Date(Date.now() - HOLD_MS - 1000).toISOString())
+    await w.round()
+    expect(w.received).toEqual([])
+    expect(w.record()).toBeUndefined()
+    expect(w.state.get(KEYS.sessions)).not.toBe(T0)
+    expect(w.activities.at(-1)).toEqual({ session: 'es1', type: 'error', body: 'Could not read the sub-issues of WEB-10; delegate it again to retry.' })
+    await w.round()
+    expect(w.activities.filter(activity => activity.type === 'error')).toHaveLength(1)
+  })
+
+  it('retries a child in progress that is unassigned or assigned to the app, and leaves one assigned to a person alone', async () => {
+    const w = world(3)
+    w.epic(); w.kid(2, { state: 'started' }); w.kid(3, { state: 'started', assignee: VIEWER }); w.kid(4, { state: 'started', assignee: 'someone' })
+    w.delegate('es1')
+    await w.round()
+    expect(w.startedKids()).toEqual(['WEB-2', 'WEB-3'])
   })
 
   it('starts no chain on a mention of an Issue with sub-issues, and answers with the chain\'s status', async () => {

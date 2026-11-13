@@ -8,9 +8,11 @@ export const CHAIN_KEYS = {
   sessions: 'linear-chain-sessions',
   chains: 'linear-chains',
   run: (session: string) => `linear-chain-run:${session}`,
+  held: (session: string) => `linear-chain-held:${session}`,
 }
 export const CHAIN_INTERVAL_MS = 30_000
 export const CHAIN_WAIT_MS = 30 * 60_000
+export const HOLD_MS = 10 * 60_000
 
 export interface Started { identifier: string; at: string; session?: string; url?: string; trigger?: string; ticket?: string }
 export interface ChainRecord {
@@ -189,7 +191,7 @@ async function advance(env: Env, epic: string, record: ChainRecord): Promise<voi
 
   const blockers = (child: Child) => child.inverseRelations.nodes.flatMap(relation => relation.type === 'blocks' && relation.issue ? [relation.issue] : [])
   const elsewhere = children.filter(child => !done(child.id) && !running.has(child.id) && !record.started[child.id]
-    && (child.state?.type === 'started' || (!!child.assignee && child.assignee.id !== viewer)))
+    && !!child.assignee && child.assignee.id !== viewer)
   const ready = children.filter(child => !done(child.id) && !running.has(child.id) && !record.started[child.id] && !elsewhere.includes(child)
     && blockers(child).every(blocker => closed(blocker.state)))
     .sort((a, b) => (a.subIssueSortOrder ?? Infinity) - (b.subIssueSortOrder ?? Infinity) || a.identifier.localeCompare(b.identifier, 'en', { numeric: true }))
