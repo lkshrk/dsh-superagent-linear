@@ -315,12 +315,73 @@ describe('polling', () => {
       expect(h.received.map(trigger => trigger.id)).toEqual(['linear:undelegated:h2'])
     })
 
-    it('still stops, unattributed, when the Issue\'s recent history does not show the change', async () => {
-      const stub = delegation(() => null, [])
+    it('still stops, unattributed, when the history does not show the change, only shows one before the ticket started, or cannot be read', async () => {
+      const histories: (() => unknown)[] = [() => ({ issue: { history: { nodes: [] } } }),
+        () => ({ issue: { history: { nodes: [{ ...removal, createdAt: '2026-11-12T09:58:00.000Z' }] } } }),
+        () => { throw new Error('history unavailable') }]
+      for (const history of histories) {
+        const stub = linear({ agentSessions: () => ({ agentSessions: page([]) }), agentActivities: () => ({ agentActivities: page([]) }),
+          'issues(': () => ({ issues: { nodes: [{ id: 'issue-1', delegate: null }] } }), history })
+        const h = running(sessionTrigger(delegated, VIEWER)!)
+        await round(h, stub)
+        expect(h.received).toHaveLength(1)
+        expect(h.received[0]!.id).toMatch(/^linear:undelegated:t1:\d{4}-\d\d-\d\dT/)
+        expect(h.received[0]).toMatchObject({ human: false, actor: { id: '' }, at: h.received[0]!.id.slice('linear:undelegated:t1:'.length),
+          text: 'Stop requested in Linear.\n\nSomeone removed the app as the delegate of WEB-1.', meta: { kind: 'undelegated', signal: 'stop' } })
+        expect(h.received[0]!.meta.history).toBeUndefined()
+      }
+    })
+
+    it('keeps an unattributed stop\'s id across a retry, and gives a later removal a new one', async () => {
+      vi.useFakeTimers({ toFake: ['Date'] })
+      try {
+        vi.setSystemTime(new Date('2026-11-12T11:00:00.000Z'))
+        let current: string | null = null
+        const stub = delegation(() => current, [])
+        const h = running(sessionTrigger(delegated, VIEWER)!)
+        h.receive.mockRejectedValueOnce(new Error('busy'))
+        await round(h, stub)
+        vi.setSystemTime(new Date('2026-11-12T11:01:00.000Z'))
+        await round(h, stub)
+        current = VIEWER
+        await round(h, stub)
+        current = null
+        vi.setSystemTime(new Date('2026-11-12T11:02:00.000Z'))
+        await round(h, stub)
+        expect(h.receive.mock.calls.map(([trigger]) => trigger.id)).toEqual(['linear:undelegated:t1:2026-11-12T11:00:00.000Z',
+          'linear:undelegated:t1:2026-11-12T11:00:00.000Z', 'linear:undelegated:t1:2026-11-12T11:02:00.000Z'])
+      } finally { vi.useRealTimers() }
+    })
+
+    it('reads the delegates 50 Issues at a time, and still checks the others when one chunk fails', async () => {
+      const reads: string[][] = []
+      const stub = linear({ agentSessions: () => ({ agentSessions: page([]) }), agentActivities: () => ({ agentActivities: page([]) }),
+        'issues(': variables => {
+          const ids = variables.ids as string[]
+          reads.push(ids)
+          if (ids.includes('issue-1')) throw new Error('Internal error')
+          return { issues: { nodes: ids.map(id => ({ id, delegate: null })) } }
+        },
+        history: () => ({ issue: { history: { nodes: [] } } }) })
+      const origins = Array.from({ length: 60 }, (_, n) => sessionTrigger(session(`s${n + 1}`, T0, { issue: { ...issue(TEAM, n + 1), delegate: { id: VIEWER } } }), VIEWER)!)
+      const tickets: Ticket[] = origins.map((origin, n) => ({ id: `t${n + 1}`, origin: { triggerId: origin.id, triggerIds: [origin.id] } }))
+      const h = context({ tickets, triggers: origins })
+      h.state.set(KEYS.sessions, T0); h.state.set(KEYS.prompts, T0)
+      await round(h, stub)
+      expect(reads.map(ids => ids.length)).toEqual([50, 10])
+      expect(h.received.map(trigger => trigger.meta.issue)).toEqual(Array.from({ length: 10 }, (_, n) => `issue-${n + 51}`))
+    })
+
+    it('skips an Issue Linear no longer returns, and stops its ticket once it is back without the delegation', async () => {
+      let nodes: unknown[] = []
+      const stub = linear({ agentSessions: () => ({ agentSessions: page([]) }), agentActivities: () => ({ agentActivities: page([]) }),
+        'issues(': () => ({ issues: { nodes } }), history: () => ({ issue: { history: { nodes: [removal] } } }) })
       const h = running(sessionTrigger(delegated, VIEWER)!)
       await round(h, stub)
-      expect(h.received[0]).toMatchObject({ id: 'linear:undelegated:t1:issue-1', human: false, actor: { id: '' },
-        text: 'Stop requested in Linear.\n\nSomeone removed the app as the delegate of WEB-1.', meta: { signal: 'stop' } })
+      expect(h.received).toEqual([])
+      nodes = [{ id: 'issue-1', delegate: null }]
+      await round(h, stub)
+      expect(h.received.map(trigger => trigger.id)).toEqual(['linear:undelegated:h2'])
     })
 
     it('leaves a ticket the app was only mentioned on running, and stops it after a later delegation is removed', async () => {

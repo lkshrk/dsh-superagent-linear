@@ -193,22 +193,25 @@ export class LinearClient {
   async addLinks(session: string, links: { label: string; url: string }[], signal?: AbortSignal): Promise<void> {
     await this.request(ADD_URLS, { id: session, input: { addedExternalUrls: links } }, signal)
   }
-  /** The delegate of each issue Linear still has, by issue id; null when none is delegated. */
+  /** The delegate of each issue Linear still has, by issue id, null when none is delegated; a chunk of 50 that fails is left out. */
   async delegates(ids: string[], signal?: AbortSignal): Promise<Map<string, string | null>> {
     const delegates = new Map<string, string | null>()
+    const schema = z.object({ issues: z.object({ nodes: z.array(z.object({ id: z.string(), delegate: z.object({ id: z.string() }).nullish() })) }) })
     for (let start = 0; start < ids.length; start += 50) {
-      const data = z.object({ issues: z.object({ nodes: z.array(z.object({ id: z.string(), delegate: z.object({ id: z.string() }).nullish() })) }) })
-        .parse(await this.request(DELEGATES, { ids: ids.slice(start, start + 50) }, signal))
-      for (const node of data.issues.nodes) delegates.set(node.id, node.delegate?.id ?? null)
+      try {
+        const data = schema.parse(await this.request(DELEGATES, { ids: ids.slice(start, start + 50) }, signal))
+        for (const node of data.issues.nodes) delegates.set(node.id, node.delegate?.id ?? null)
+      } catch (error) { if (signal?.aborted) throw error }
     }
     return delegates
   }
-  /** The newest of the issue's last 50 changes that took its delegation away from `agent`. */
-  async undelegation(issue: string, agent: string, signal?: AbortSignal): Promise<Undelegation | undefined> {
+  /** The newest of the issue's last 50 changes, made at or after `since`, that took its delegation away from `agent`. */
+  async undelegation(issue: string, agent: string, since: string, signal?: AbortSignal): Promise<Undelegation | undefined> {
     const entry = z.looseObject({ id: z.string(), createdAt: z.string(), actor: User.nullish(), fromDelegate: z.object({ id: z.string() }).nullish(),
       toDelegate: z.object({ id: z.string() }).nullish() })
     const data = z.object({ issue: z.object({ history: z.object({ nodes: z.array(entry) }) }) }).parse(await this.request(HISTORY, { id: issue }, signal))
-    const change = data.issue.history.nodes.filter(node => node.fromDelegate?.id === agent && node.toDelegate?.id !== agent)
+    const change = data.issue.history.nodes
+      .filter(node => node.fromDelegate?.id === agent && node.toDelegate?.id !== agent && Date.parse(node.createdAt) >= Date.parse(since))
       .sort((a, b) => Date.parse(b.createdAt) - Date.parse(a.createdAt))[0]
     return change && { id: change.id, at: change.createdAt, ...change.actor ? { actor: { id: change.actor.id, name: change.actor.name } } : {} }
   }

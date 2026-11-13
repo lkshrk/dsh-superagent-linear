@@ -35,7 +35,7 @@ export const KEYS = {
   linked: (session: string, url: string) => `linear-linked:${session}:${url}`,
   completed: (ticket: string) => `linear-completed:${ticket}`,
   followed: 'linear-followed-tickets',
-  delegated: 'linear-delegated-tickets',
+  delegation: 'linear-delegation',
   delegationChecked: 'linear-delegation-checked',
 }
 export const DELEGATION_INTERVAL_MS = 30_000
@@ -79,11 +79,11 @@ export function promptTrigger(prompt: Prompt, viewer: string): Trigger | undefin
 }
 
 /** The stop Trigger for a ticket whose Issue is no longer delegated to the app, from the change that removed it when the history has it. */
-export function undelegationTrigger(origin: Trigger, ticket: string, change: Undelegation | undefined, now = new Date().toISOString()): Trigger {
+export function undelegationTrigger(origin: Trigger, ticket: string, change: Undelegation | undefined, observed: string): Trigger {
   const { team, teamKey, issue, identifier, session } = origin.meta
   const who = change?.actor?.name ?? 'Someone'
-  return { id: change ? `linear:undelegated:${change.id}` : `linear:undelegated:${ticket}:${String(issue)}`, source: SOURCE, threads: origin.threads,
-    actor: { source: SOURCE, id: change?.actor?.id ?? '' }, human: !!change?.actor, addressed: 'direct', at: change?.at ?? now,
+  return { id: change ? `linear:undelegated:${change.id}` : `linear:undelegated:${ticket}:${observed}`, source: SOURCE, threads: origin.threads,
+    actor: { source: SOURCE, id: change?.actor?.id ?? '' }, human: !!change?.actor, addressed: 'direct', at: change?.at ?? observed,
     text: `Stop requested in Linear.\n\n${who} removed the app as the delegate of ${String(identifier)}.`,
     ...origin.channel ? { channel: origin.channel } : {}, ...origin.url ? { url: origin.url } : {},
     meta: { team, teamKey, issue, identifier, session, kind: 'undelegated', ...change ? { history: change.id } : {}, signal: 'stop' } }
@@ -267,6 +267,7 @@ async function followTickets(ctx: SourceContext, client: LinearClient, config: L
 }
 
 /** Stops each open ticket whose Issue was delegated to the app and no longer is, reading the delegates at most every 30 seconds. */
+interface Delegation { delegated: boolean; observed?: string }
 async function followDelegation(ctx: SourceContext, client: LinearClient, viewer: string, signal: AbortSignal): Promise<void> {
   const checked = ctx.state.get<string>(KEYS.delegationChecked)
   if (checked && Date.now() - Date.parse(checked) < DELEGATION_INTERVAL_MS) return
@@ -274,25 +275,29 @@ async function followDelegation(ctx: SourceContext, client: LinearClient, viewer
     const origin = ctx.triggers.get(ticket.origin.triggerId)
     return origin?.source === SOURCE && typeof origin.meta.issue === 'string' ? [{ ticket, origin, issue: origin.meta.issue }] : []
   })
-  const known = ctx.state.get<Record<string, boolean>>(KEYS.delegated) ?? {}
-  if (!running.length) { if (Object.keys(known).length) ctx.state.set(KEYS.delegated, {}); return }
-  ctx.state.set(KEYS.delegationChecked, new Date().toISOString())
-  const delegates = await client.delegates([...new Set(running.map(item => item.issue))], signal).catch(() => undefined)
-  if (!delegates) return
-  const next: Record<string, boolean> = {}
+  const known = ctx.state.get<Record<string, Delegation>>(KEYS.delegation) ?? {}
+  if (!running.length) { if (Object.keys(known).length) ctx.state.set(KEYS.delegation, {}); return }
+  const now = new Date().toISOString()
+  ctx.state.set(KEYS.delegationChecked, now)
+  const delegates = await client.delegates([...new Set(running.map(item => item.issue))], signal)
+  const next: Record<string, Delegation> = Object.fromEntries(running.map(({ ticket, origin }) =>
+    [ticket.id, known[ticket.id] ?? { delegated: origin.meta.delegate === viewer }]))
   for (const { ticket, origin, issue } of running) {
-    const before = known[ticket.id] ?? origin.meta.delegate === viewer
-    next[ticket.id] = before
     if (signal.aborted || !delegates.has(issue)) continue
-    const delegated = delegates.get(issue) === viewer
-    if (delegated || !before) { next[ticket.id] = delegated; continue }
+    const before = next[ticket.id]!
+    if (delegates.get(issue) === viewer) { next[ticket.id] = { delegated: true }; continue }
+    if (!before.delegated) continue
+    // Saved before the Trigger, so a replay after a crash builds the same fallback id.
+    const observed = before.observed ?? now
+    next[ticket.id] = { delegated: true, observed }
+    ctx.state.set(KEYS.delegation, next)
+    const change = await client.undelegation(issue, viewer, origin.at, signal).catch((error: unknown) => { if (signal.aborted) throw error; return undefined })
     try {
-      const change = await client.undelegation(issue, viewer, signal)
-      await ctx.receive(undelegationTrigger(origin, ticket.id, change))
-      next[ticket.id] = false
+      await ctx.receive(undelegationTrigger(origin, ticket.id, change, observed))
+      next[ticket.id] = { delegated: false }
     } catch (error) { if (signal.aborted) throw error }
   }
-  ctx.state.set(KEYS.delegated, next)
+  ctx.state.set(KEYS.delegation, next)
 }
 
 /** Reads every `pollSeconds` once setup finished, reporting the Source's health; three failed rounds in a row are an error. */
