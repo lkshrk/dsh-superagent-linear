@@ -5,7 +5,7 @@ import { join } from 'node:path'
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import type { z } from 'zod'
 import { LinearClient, MINT_INTERVAL_MS, SCOPE, stableUuid, type Prompt, type Session } from '../src/linear-api.ts'
-import { DELEGATION_INTERVAL_MS, KEYS, LinearConfigSchema, pullOf, undelegationTrigger, linearKind, pollLinear, promptTrigger, sendLinear, sessionTrigger, watchLinear, type LinearConfig } from '../src/linear.ts'
+import { CLOSE_HORIZON_MS, DELEGATION_INTERVAL_MS, KEYS, LinearConfigSchema, pullOf, undelegationTrigger, linearKind, pollLinear, promptTrigger, sendLinear, sessionTrigger, watchLinear, type LinearConfig } from '../src/linear.ts'
 import { apply } from '../src/index.ts'
 import type { OutboundMessage, SourceContext, Ticket, Trigger } from '../src/types.ts'
 
@@ -586,6 +586,68 @@ describe('polling', () => {
       await round(h, stub)
       expect(h.received.map(trigger => trigger.id)).toEqual(['linear:undelegated:h2'])
     })
+  })
+})
+
+describe('issue closes', () => {
+  const T0 = '2026-11-12T10:00:00.000Z'
+  function watching(tickets: Ticket[], states: () => Record<string, { type: string; at?: string } | Error>) {
+    const reads: string[][] = []
+    const stub = linear({
+      agentSessions: () => ({ agentSessions: page([]) }), agentActivities: () => ({ agentActivities: page([]) }),
+      'issues(': variables => {
+        const ids = variables.ids as string[]
+        reads.push(ids)
+        const current = states()
+        const failure = ids.map(id => current[id]).find(state => state instanceof Error)
+        if (failure) throw failure
+        return { issues: { nodes: ids.map(id => {
+          const state = current[id] as { type: string; at?: string }
+          return { id, delegate: null, state: { type: state.type }, completedAt: state.type === 'completed' ? state.at : null,
+            canceledAt: state.type === 'canceled' ? state.at : null }
+        }) } }
+      },
+    })
+    const origins = tickets.map(ticket => sessionTrigger(session(`s-${ticket.id}`, T0, { issue: issue(TEAM, Number(ticket.id.slice(1))) }), VIEWER)!)
+    const stored = tickets.map((ticket, n) => ({ ...ticket, origin: { triggerId: origins[n]!.id, triggerIds: [origins[n]!.id] } }))
+    const h = context({ tickets: stored, triggers: origins })
+    const closed: [string, string][] = []
+    h.ctx.tickets.open = () => stored.filter(ticket => !ticket.ended)
+    h.ctx.tickets.issueClosed = (id, at) => { closed.push([id, at]); stored.find(ticket => ticket.id === id)!.issueClosed = at }
+    h.state.set(KEYS.sessions, T0); h.state.set(KEYS.prompts, T0)
+    // Each ended ticket was open, and watched, before it ended.
+    h.state.set(KEYS.closing, tickets.map(ticket => ticket.id))
+    const round = async () => { h.state.set(KEYS.delegationChecked, undefined); await pollLinear(h.ctx, stub.client, config(), signal()) }
+    return { h, reads, closed, round }
+  }
+  const ended = (id: string, at = new Date().toISOString()): Ticket => ({ id, origin: { triggerId: '', triggerIds: [] }, ended: { at } })
+  const open = (id: string): Ticket => ({ id, origin: { triggerId: '', triggerIds: [] } })
+
+  it('reports an Issue moved to a completed or canceled state, for open and ended tickets alike, and no other state', async () => {
+    const states: Record<string, { type: string; at?: string }> = { 'issue-1': { type: 'started' }, 'issue-2': { type: 'completed', at: '2026-11-12T11:00:00.000Z' },
+      'issue-3': { type: 'canceled', at: '2026-11-12T12:00:00.000Z' }, 'issue-4': { type: 'backlog' } }
+    const w = watching([open('t1'), ended('t2'), ended('t3'), ended('t4')], () => states)
+    await w.round()
+    expect(w.closed).toEqual([['t2', '2026-11-12T11:00:00.000Z'], ['t3', '2026-11-12T12:00:00.000Z']])
+    expect(w.reads).toEqual([['issue-1', 'issue-2', 'issue-3', 'issue-4']])
+    // A reported Issue is read again only for an open ticket's delegate; one closing later is reported then, once.
+    states['issue-1'] = { type: 'completed', at: '2026-11-12T13:00:00.000Z' }
+    await w.round(); await w.round()
+    expect(w.reads.slice(1)).toEqual([['issue-1', 'issue-4'], ['issue-1', 'issue-4']])
+    expect(w.closed.at(-1)).toEqual(['t1', '2026-11-12T13:00:00.000Z'])
+    expect(w.closed).toHaveLength(3)
+  })
+
+  it('stops watching a ticket that ended long ago, and goes on after a read that failed', async () => {
+    let states: Record<string, { type: string; at?: string } | Error> = { 'issue-1': new Error('Internal error') }
+    const w = watching([ended('t1'), ended('t2', new Date(Date.now() - CLOSE_HORIZON_MS).toISOString())], () => states)
+    await expect(w.round()).resolves.toBeUndefined()
+    expect(w.reads).toEqual([['issue-1']])
+    states = { 'issue-1': { type: 'canceled', at: '2026-11-12T11:00:00.000Z' } }
+    await w.round()
+    expect(w.closed).toEqual([['t1', '2026-11-12T11:00:00.000Z']])
+    await w.round()
+    expect(w.reads).toHaveLength(2)
   })
 })
 

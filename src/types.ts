@@ -22,7 +22,8 @@ export type ReceiveResult = string
 export type ScopeResult = { listened: true; observed: boolean; row?: string } | { listened: false; reason: string }
 export type Health = { state: 'starting' | 'ready' | 'paused' | 'error'; detail: string; at?: string }
 export interface Follow { thread: string; own: boolean; closed?: { at: string; outcome: 'merged' | 'closed' } }
-export interface Ticket { id: string; follows?: Follow[]; origin: { triggerId: string; triggerIds: string[] }; execution?: { repository?: string } }
+export interface Ticket { id: string; follows?: Follow[]; origin: { triggerId: string; triggerIds: string[] }; execution?: { repository?: string }
+  ended?: { at: string }; issueClosed?: string }
 export interface Thread { meta: Record<string, unknown> }
 
 type FieldBase = { key: string; label: Localized; hint?: Localized; advanced?: boolean; optional?: boolean }
@@ -41,7 +42,8 @@ export interface SourceContext {
   receive(trigger: Trigger): ReceiveResult | Promise<ReceiveResult>
   state: { get<V>(key: string): V | undefined; set<V>(key: string, value: V | undefined): void }
   threads: { get(key: string): Thread | undefined; describe(key: string, description: { label?: string; url?: string }): void }
-  tickets: { get(id: string): Ticket | undefined; open(): Ticket[] }
+  /** `issueClosed` reports that the Issue a ticket started on closed; hosts before it have none. */
+  tickets: { get(id: string): Ticket | undefined; open(): Ticket[]; issueClosed?(id: string, at: string): void }
   triggers: { get(id: string): Trigger | undefined }
   report(entry: string, health: Health): void
 }

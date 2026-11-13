@@ -65,10 +65,12 @@ const ACTIVITY = 'query($id: String!) { agentActivity(id: $id) { id } }'
 const CREATE_ACTIVITY = `mutation($input: AgentActivityCreateInput!) { agentActivityCreate(input: $input) { success } }`
 const ADD_URLS = `mutation($id: String!, $input: AgentSessionUpdateInput!) { agentSessionUpdate(id: $id, input: $input) { success } }`
 const ISSUE_STATE = `query($id: String!) { issue(id: $id) { state { type } team { states { nodes { id type position } } } } }`
-const DELEGATES = 'query($ids: [ID!]) { issues(first: 50, filter: { id: { in: $ids } }) { nodes { id delegate { id } } } }'
+const ISSUES = 'query($ids: [ID!]) { issues(first: 50, filter: { id: { in: $ids } }) { nodes { id delegate { id } state { type } completedAt canceledAt } } }'
 const HISTORY = `query($id: String!) { issue(id: $id) { history(first: 50) { nodes { id createdAt actor { id name } fromDelegate { id } toDelegate { id } } } } }`
 const SET_STATE = `mutation($id: String!, $state: String!) { issueUpdate(id: $id, input: { stateId: $state }) { success } }`
 
+/** An Issue's delegate, and when it closed (moved to a completed or canceled state), if it is closed. */
+export interface IssueStatus { delegate: string | null; closedAt?: string }
 export interface Undelegation { id: string; at: string; actor?: { id: string; name?: string | null } }
 export interface ActivityContent { type: 'thought' | 'response' | 'error'; body: string }
 
@@ -195,16 +197,22 @@ export class LinearClient {
     await this.request(ADD_URLS, { id: session, input: { addedExternalUrls: links } }, signal)
   }
   /** The delegate of each issue Linear still has, by issue id, null when none is delegated; a chunk of 50 that fails is left out. */
-  async delegates(ids: string[], signal?: AbortSignal): Promise<Map<string, string | null>> {
-    const delegates = new Map<string, string | null>()
-    const schema = z.object({ issues: z.object({ nodes: z.array(z.object({ id: z.string(), delegate: z.object({ id: z.string() }).nullish() })) }) })
+  /** Each Issue's delegate and close, 50 Issues a request; a chunk that cannot be read is left out. */
+  async issues(ids: string[], signal?: AbortSignal): Promise<Map<string, IssueStatus>> {
+    const issues = new Map<string, IssueStatus>()
+    const schema = z.object({ issues: z.object({ nodes: z.array(z.object({ id: z.string(), delegate: z.object({ id: z.string() }).nullish(),
+      state: z.object({ type: z.string() }).nullish(), completedAt: z.string().nullish(), canceledAt: z.string().nullish() })) }) })
     for (let start = 0; start < ids.length; start += 50) {
       try {
-        const data = schema.parse(await this.request(DELEGATES, { ids: ids.slice(start, start + 50) }, signal))
-        for (const node of data.issues.nodes) delegates.set(node.id, node.delegate?.id ?? null)
+        const data = schema.parse(await this.request(ISSUES, { ids: ids.slice(start, start + 50) }, signal))
+        for (const node of data.issues.nodes) {
+          const closed = node.state?.type === 'completed' || node.state?.type === 'canceled'
+          issues.set(node.id, { delegate: node.delegate?.id ?? null,
+            ...closed ? { closedAt: (node.state!.type === 'completed' ? node.completedAt : node.canceledAt) ?? new Date().toISOString() } : {} })
+        }
       } catch (error) { if (signal?.aborted) throw error }
     }
-    return delegates
+    return issues
   }
   /** The newest of the issue's last 50 changes, made at or after `since`, that took its delegation away from `agent`. */
   async undelegation(issue: string, agent: string, since: string, signal?: AbortSignal): Promise<Undelegation | undefined> {

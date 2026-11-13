@@ -1,6 +1,6 @@
 /** The Linear Source: a Linear agent app's sessions on the listed teams become Triggers, and replies go back as agent activities. */
 import { z } from 'zod'
-import { LinearClient, LinearError, stableUuid, type ActivityContent, type Prompt, type Session, type Undelegation } from './linear-api.ts'
+import { LinearClient, LinearError, stableUuid, type ActivityContent, type IssueStatus, type Prompt, type Session, type Undelegation } from './linear-api.ts'
 import type { OutboundMessage, SourceContext, SourceKind, Trigger } from './types.ts'
 import { Waker } from './webhook.ts'
 
@@ -58,8 +58,11 @@ export const KEYS = {
   followed: 'linear-followed-tickets',
   delegation: 'linear-delegation',
   delegationChecked: 'linear-delegation-checked',
+  closing: 'linear-closing-tickets',
 }
 export const DELEGATION_INTERVAL_MS = 30_000
+/** How long after a ticket ended the Issue it started on is still watched for its close. */
+export const CLOSE_HORIZON_MS = 14 * 24 * 3600_000
 const threadOf = (issue: string) => `issue:${issue}`
 /** The next cursor: five seconds before the newest item read, for writes Linear records late, and never behind the current one. */
 const cursorAfter = (since: string, newest: string | undefined) =>
@@ -289,7 +292,7 @@ export async function pollLinear(ctx: SourceContext, client: LinearClient, confi
   if (!failed) ctx.state.set(KEYS.prompts, cursorAfter(promptsSince, prompts.items.at(-1)?.createdAt))
 
   await followTickets(ctx, client, config, signal)
-  await followDelegation(ctx, client, viewer, signal)
+  await followIssues(ctx, client, viewer, signal)
   if (failed || sessionsFailed) throw new Error('A Linear session or prompt was not taken in; the next round reads it again')
   return round
 }
@@ -343,27 +346,37 @@ async function followTickets(ctx: SourceContext, client: LinearClient, config: L
   ctx.state.set(KEYS.followed, [...followed])
 }
 
-/** Stops each open ticket whose Issue was delegated to the app and no longer is, reading the delegates at most every 30 seconds. */
 const repositoryMeta = (trigger: Trigger) => typeof trigger.meta.repository === 'string' && trigger.meta.repository ? trigger.meta.repository : undefined
 interface Delegation { delegated: boolean; observed?: string }
-async function followDelegation(ctx: SourceContext, client: LinearClient, viewer: string, signal: AbortSignal): Promise<void> {
-  const checked = ctx.state.get<string>(KEYS.delegationChecked)
-  if (checked && Date.now() - Date.parse(checked) < DELEGATION_INTERVAL_MS) return
+/**
+ * Reads, at most every 30 seconds and in one batch, the Issues of open tickets that started on Linear and of those tickets
+ * whose Issue is not yet known to be closed: stops each open ticket whose Issue was delegated to the app and no longer is, and
+ * reports each Issue that moved to a completed or canceled state.
+ */
+async function followIssues(ctx: SourceContext, client: LinearClient, viewer: string, signal: AbortSignal): Promise<void> {
   const running = ctx.tickets.open().flatMap(ticket => {
     const origin = ctx.triggers.get(ticket.origin.triggerId)
     return origin?.source === SOURCE && typeof origin.meta.issue === 'string' ? [{ ticket, origin, issue: origin.meta.issue }] : []
   })
+  // Taken every round, so a ticket that ends between two reads is still watched for its Issue's close.
+  const closing = closingTickets(ctx, running.map(item => item.ticket.id))
+  const checked = ctx.state.get<string>(KEYS.delegationChecked)
+  if (checked && Date.now() - Date.parse(checked) < DELEGATION_INTERVAL_MS) return
   const known = ctx.state.get<Record<string, Delegation>>(KEYS.delegation) ?? {}
-  if (!running.length) { if (Object.keys(known).length) ctx.state.set(KEYS.delegation, {}); return }
+  if (!running.length && Object.keys(known).length) ctx.state.set(KEYS.delegation, {})
+  if (!running.length && !closing.length) return
   const now = new Date().toISOString()
   ctx.state.set(KEYS.delegationChecked, now)
-  const delegates = await client.delegates([...new Set(running.map(item => item.issue))], signal)
+  const issues = await client.issues([...new Set([...running, ...closing].map(item => item.issue))], signal)
+  reportClosed(ctx, closing, issues)
+  if (!running.length) return
   const next: Record<string, Delegation> = Object.fromEntries(running.map(({ ticket, origin }) =>
     [ticket.id, known[ticket.id] ?? { delegated: origin.meta.delegate === viewer }]))
   for (const { ticket, origin, issue } of running) {
-    if (signal.aborted || !delegates.has(issue)) continue
+    const status = issues.get(issue)
+    if (signal.aborted || !status) continue
     const before = next[ticket.id]!
-    if (delegates.get(issue) === viewer) { next[ticket.id] = { delegated: true }; continue }
+    if (status.delegate === viewer) { next[ticket.id] = { delegated: true }; continue }
     if (!before.delegated) continue
     // Saved before the Trigger, so a replay after a crash builds the same fallback id.
     const observed = before.observed ?? now
@@ -376,6 +389,28 @@ async function followDelegation(ctx: SourceContext, client: LinearClient, viewer
     } catch (error) { if (signal.aborted) throw error }
   }
   ctx.state.set(KEYS.delegation, next)
+}
+/**
+ * The tickets that started on Linear whose Issue is not known to be closed, open ones and those that ended within
+ * `CLOSE_HORIZON_MS`, with their Issues; none on a host that cannot take an Issue's close.
+ */
+function closingTickets(ctx: SourceContext, open: string[]): { id: string; issue: string }[] {
+  if (!ctx.tickets.issueClosed) return []
+  const ids = new Set([...ctx.state.get<string[]>(KEYS.closing) ?? [], ...open])
+  const closing = [...ids].flatMap(id => {
+    const ticket = ctx.tickets.get(id)
+    const origin = ticket && !ticket.issueClosed ? ctx.triggers.get(ticket.origin.triggerId) : undefined
+    const recent = !ticket?.ended || Date.now() - Date.parse(ticket.ended.at) < CLOSE_HORIZON_MS
+    return origin?.source === SOURCE && typeof origin.meta.issue === 'string' && recent ? [{ id, issue: origin.meta.issue }] : []
+  })
+  const kept = closing.map(item => item.id)
+  if (kept.join() !== (ctx.state.get<string[]>(KEYS.closing) ?? []).join()) ctx.state.set(KEYS.closing, kept.length ? kept : undefined)
+  return closing
+}
+function reportClosed(ctx: SourceContext, closing: { id: string; issue: string }[], issues: Map<string, IssueStatus>): void {
+  const closed = closing.filter(item => issues.get(item.issue)?.closedAt !== undefined)
+  for (const { id, issue } of closed) ctx.tickets.issueClosed!(id, issues.get(issue)!.closedAt!)
+  if (closed.length) ctx.state.set(KEYS.closing, closing.filter(item => !closed.includes(item)).map(item => item.id))
 }
 
 /** Reads every `pollSeconds` once setup finished, reporting the Source's health; three failed rounds in a row are an error. */
