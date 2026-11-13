@@ -378,15 +378,21 @@ async function followDelegation(ctx: SourceContext, client: LinearClient, viewer
 
 /** Reads every `pollSeconds` once setup finished, reporting the Source's health; three failed rounds in a row are an error. */
 export async function watchLinear(ctx: SourceContext, client: LinearClient, signal: AbortSignal): Promise<void> {
+  let last = ''
+  const report = (health: Parameters<SourceContext['report']>[1]) => {
+    ctx.report(HEALTH, health)
+    const line = `${health.state}: ${health.detail ?? ''}`
+    if (line !== last) { last = line; console.log(`dsh-superagent-linear: ${line}`) }
+  }
   await ctx.ready
-  if (!ctx.configured()) { ctx.report(HEALTH, { state: 'paused', detail: 'Waiting for the deployment check' }); return }
+  if (!ctx.configured()) { report({ state: 'paused', detail: 'Waiting for the deployment check' }); return }
   let failures = 0
   while (!signal.aborted) {
     const config = ctx.config<LinearConfig>(SOURCE)
     const at = new Date().toISOString()
-    if (!config) ctx.report(HEALTH, { state: 'paused', detail: 'Off', at })
+    if (!config) report({ state: 'paused', detail: 'Off', at })
     else if (!config.clientIdFile || !config.clientSecretFile || !config.teams.some(team => team.enabled)) {
-      ctx.report(HEALTH, { state: 'paused', detail: 'Set the app credential files and a team', at })
+      report({ state: 'paused', detail: 'Set the app credential files and a team', at })
     } else {
       try {
         const round = await pollLinear(ctx, client, config, signal)
@@ -396,13 +402,14 @@ export async function watchLinear(ctx: SourceContext, client: LinearClient, sign
         const list = (items: string[]) => `${items.slice(0, 10).join(', ')}${items.length > 10 ? ' and more' : ''}`
         const misrouted = round.misrouted.length ? `; left out ${list(round.misrouted)}` : ''
         const unmapped = round.unmapped.length ? `; no repository for ${list(round.unmapped)}: map their project or give the team a repository` : ''
-        ctx.report(HEALTH, { state: round.skipped.length || round.unknown.length ? 'error' : 'ready', at,
+        report({ state: round.skipped.length || round.unknown.length ? 'error' : 'ready', at,
           detail: `${round.sessions} sessions, ${round.prompts} prompts, ${round.unreadable} unreadable${skipped}${misrouted}${unmapped}${unknown}` })
       } catch (error) {
         failures++
+        if (!signal.aborted) console.log(`dsh-superagent-linear: poll failed (${failures} in a row): ${String(error)}`)
         // A refused token or a rate limit needs no three rounds to show: no request can succeed until it passes.
         const blocked = error instanceof LinearError && error.throttled
-        if (!signal.aborted && (blocked || failures >= 3)) ctx.report(HEALTH, { state: 'error', at, detail: `${failures} failed polls in a row; last: ${String(error)}` })
+        if (!signal.aborted && (blocked || failures >= 3)) report({ state: 'error', at, detail: `${failures} failed polls in a row; last: ${String(error)}` })
       }
     }
     await delay((config?.pollSeconds ?? 10) * 1000, undefined, { signal }).catch(() => {})
