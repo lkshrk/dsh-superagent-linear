@@ -68,6 +68,15 @@ const ISSUE_STATE = `query($id: String!) { issue(id: $id) { state { type } team 
 const ISSUES = 'query($ids: [ID!]) { issues(first: 50, filter: { id: { in: $ids } }) { nodes { id delegate { id } state { type } completedAt canceledAt } } }'
 const HISTORY = `query($id: String!) { issue(id: $id) { history(first: 50) { nodes { id createdAt actor { id name } fromDelegate { id } toDelegate { id } } } } }`
 const SET_STATE = `mutation($id: String!, $state: String!) { issueUpdate(id: $id, input: { stateId: $state }) { success } }`
+const ISSUE_CONTEXT = `query IssueContext($id: String!) { issue(id: $id) { parent { id identifier title url description }
+  children(first: 30) { nodes { identifier title state { type } } pageInfo { hasNextPage } } } }`
+const IssueContextSchema = z.looseObject({
+  parent: z.looseObject({ id: z.string(), identifier: z.string(), title: z.string(), url: z.string(), description: z.string().nullish() }).nullish(),
+  children: z.looseObject({ nodes: z.array(z.looseObject({ identifier: z.string(), title: z.string(), state: z.looseObject({ type: z.string() }).nullish() })),
+    pageInfo: z.looseObject({ hasNextPage: z.boolean() }) }),
+})
+/** An Issue's parent and its first 30 sub-issues. */
+export type IssueContext = z.infer<typeof IssueContextSchema>
 
 /** An Issue's delegate, and when it closed (moved to a completed or canceled state), if it is closed. */
 export interface IssueStatus { delegate: string | null; closedAt?: string }
@@ -222,6 +231,10 @@ export class LinearClient {
       .filter(node => node.fromDelegate?.id === agent && node.toDelegate?.id !== agent && Date.parse(node.createdAt) >= Date.parse(since))
       .sort((a, b) => Date.parse(b.createdAt) - Date.parse(a.createdAt))[0]
     return change && { id: change.id, at: change.createdAt, ...change.actor ? { actor: { id: change.actor.id, name: change.actor.name } } : {} }
+  }
+  /** The issue's parent and first 30 sub-issues. */
+  async issueContext(issue: string, signal?: AbortSignal): Promise<IssueContext> {
+    return z.object({ issue: IssueContextSchema }).parse(await this.request(ISSUE_CONTEXT, { id: issue }, signal)).issue
   }
   /** Moves the issue to its team's first completed state unless it is completed or canceled already. */
   async complete(issue: string, signal?: AbortSignal): Promise<boolean> {
