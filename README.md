@@ -48,6 +48,7 @@ In the Policy, list the Linear user ids who may originate work under **Eval → 
 - **Teams on another repository.** Sessions of a listed team whose repository is not the GitHub Source's are left out, and the Source's health names them.
 - **Threads.** A Linear Issue is one Thread (`linear:issue:<issue id>`); later sessions on the same Issue follow its ticket.
 - **Stop.** A prompt with Linear's stop signal becomes a Trigger whose text starts with "Stop requested in Linear."
+- **Removed delegation.** While a ticket that started on Linear is open, the Source reads its Issue's delegate (`Issue.delegate`) at most every 30 seconds, one query for all open tickets. When an Issue that was delegated to the app no longer is, because someone removed the app or delegated another agent, the ticket gets a stop Trigger with the same "Stop requested in Linear." text, attributed to the person in the Issue's history (`fromDelegate`). A ticket that started from a mention, without delegation, keeps running unless the Issue is delegated to the app and that is later removed.
 - **Replies.** An acknowledgement or a notice is a `thought`, a reply a `response`, both in the session. Each activity's id is fixed by the message id, so a retry never posts twice; a session Linear no longer has drops the message.
 - **Pull requests.** When a ticket that started on Linear follows a GitHub pull request, its link is added to the session's external URLs (`agentSessionUpdate`, `addedExternalUrls`). Its merge ends the ticket through the GitHub Source as usual.
 - **Execution environment.** `DSH_SUPERAGENT_LINEAR_ISSUE` (such as `ENG-12`) and `DSH_SUPERAGENT_LINEAR_ISSUE_URL`. A PR body with `Fixes ENG-12` lets Linear's GitHub integration close the Issue too.
@@ -56,7 +57,7 @@ Not implemented: webhooks, thread context for assessments, and more than one rep
 
 ## Rate limits
 
-Linear allows an OAuth app 5,000 requests and 2,000,000 complexity points per hour, per app user, shared by every service that uses the same app. A round costs two queries of about 200 points each, plus a team list every ten minutes. At the default 10 seconds that is about 730 requests (15%) and 140,000 points (7%) per hour. A longer interval lowers both and delays the first answer: past about 10 seconds Linear may show a session as unresponsive until the thought arrives. When Linear rate-limits the app, the Source sends nothing until the limit resets.
+Linear allows an OAuth app 5,000 requests and 2,000,000 complexity points per hour, per app user, shared by every service that uses the same app. A round costs two queries of about 200 points each, plus a team list every ten minutes and, while tickets that started on Linear are open, one delegate query every 30 seconds. At the default 10 seconds that is about 730 requests (15%) and 140,000 points (7%) per hour, and at most 120 requests (2.4%) more while tickets run. A longer interval lowers both and delays the first answer: past about 10 seconds Linear may show a session as unresponsive until the thought arrives. When Linear rate-limits the app, the Source sends nothing until the limit resets.
 
 Linear recommends webhooks over polling. This Source polls so it needs no public endpoint; an app has one webhook URL, and a webhook intake could replace polling later.
 

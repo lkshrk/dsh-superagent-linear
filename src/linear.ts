@@ -1,7 +1,7 @@
 /** The Linear Source: a Linear agent app's sessions on the listed teams become Triggers, and replies go back as agent activities. */
 import { setTimeout as delay } from 'node:timers/promises'
 import { z } from 'zod'
-import { LinearClient, LinearError, stableUuid, type ActivityContent, type Prompt, type Session } from './linear-api.ts'
+import { LinearClient, LinearError, stableUuid, type ActivityContent, type Prompt, type Session, type Undelegation } from './linear-api.ts'
 import type { OutboundMessage, SourceContext, SourceKind, Trigger } from './types.ts'
 
 export const SOURCE = 'linear'
@@ -35,7 +35,10 @@ export const KEYS = {
   linked: (session: string, url: string) => `linear-linked:${session}:${url}`,
   completed: (ticket: string) => `linear-completed:${ticket}`,
   followed: 'linear-followed-tickets',
+  delegated: 'linear-delegated-tickets',
+  delegationChecked: 'linear-delegation-checked',
 }
+export const DELEGATION_INTERVAL_MS = 30_000
 const threadOf = (issue: string) => `issue:${issue}`
 /** The next cursor: five seconds before the newest item read, for writes Linear records late, and never behind the current one. */
 const cursorAfter = (since: string, newest: string | undefined) =>
@@ -47,7 +50,8 @@ function channel(issue: Issue, session: string, url: string) {
     address: { session, issue: issue.id, team: issue.team.id, teamKey: issue.team.key, identifier: issue.identifier, url } }
 }
 function meta(issue: Issue, session: string, kind: string) {
-  return { team: issue.team.id, teamKey: issue.team.key, issue: issue.id, identifier: issue.identifier, session, kind }
+  return { team: issue.team.id, teamKey: issue.team.key, issue: issue.id, identifier: issue.identifier, session, kind,
+    ...issue.delegate ? { delegate: issue.delegate.id } : {} }
 }
 
 /** The Trigger of a session a person started by delegating an issue to the app or mentioning it; the app's own sessions produce none. */
@@ -72,6 +76,17 @@ export function promptTrigger(prompt: Prompt, viewer: string): Trigger | undefin
     text: stop ? `Stop requested in Linear.${body ? `\n\n${body}` : ''}` : body,
     channel: channel(issue, prompt.agentSession.id, issue.url), url: issue.url,
     meta: { ...meta(issue, prompt.agentSession.id, 'prompt'), activity: prompt.id, ...stop ? { signal: 'stop' } : {} } }
+}
+
+/** The stop Trigger for a ticket whose Issue is no longer delegated to the app, from the change that removed it when the history has it. */
+export function undelegationTrigger(origin: Trigger, ticket: string, change: Undelegation | undefined, now = new Date().toISOString()): Trigger {
+  const { team, teamKey, issue, identifier, session } = origin.meta
+  const who = change?.actor?.name ?? 'Someone'
+  return { id: change ? `linear:undelegated:${change.id}` : `linear:undelegated:${ticket}:${String(issue)}`, source: SOURCE, threads: origin.threads,
+    actor: { source: SOURCE, id: change?.actor?.id ?? '' }, human: !!change?.actor, addressed: 'direct', at: change?.at ?? now,
+    text: `Stop requested in Linear.\n\n${who} removed the app as the delegate of ${String(identifier)}.`,
+    ...origin.channel ? { channel: origin.channel } : {}, ...origin.url ? { url: origin.url } : {},
+    meta: { team, teamKey, issue, identifier, session, kind: 'undelegated', ...change ? { history: change.id } : {}, signal: 'stop' } }
 }
 
 const CONTENT: Record<OutboundMessage['kind'], ActivityContent['type']> = { acknowledgement: 'thought', reply: 'response', notice: 'thought' }
@@ -211,6 +226,7 @@ export async function pollLinear(ctx: SourceContext, client: LinearClient, confi
   if (!failed) ctx.state.set(KEYS.prompts, cursorAfter(promptsSince, prompts.items.at(-1)?.createdAt))
 
   await followTickets(ctx, client, config, signal)
+  await followDelegation(ctx, client, viewer, signal)
   if (failed || sessionsFailed) throw new Error('A Linear session or prompt was not taken in; the next round reads it again')
   return round
 }
@@ -248,6 +264,35 @@ async function followTickets(ctx: SourceContext, client: LinearClient, config: L
     if (!open.has(id) && !pending) followed.delete(id)
   }
   ctx.state.set(KEYS.followed, [...followed])
+}
+
+/** Stops each open ticket whose Issue was delegated to the app and no longer is, reading the delegates at most every 30 seconds. */
+async function followDelegation(ctx: SourceContext, client: LinearClient, viewer: string, signal: AbortSignal): Promise<void> {
+  const checked = ctx.state.get<string>(KEYS.delegationChecked)
+  if (checked && Date.now() - Date.parse(checked) < DELEGATION_INTERVAL_MS) return
+  const running = ctx.tickets.open().flatMap(ticket => {
+    const origin = ctx.triggers.get(ticket.origin.triggerId)
+    return origin?.source === SOURCE && typeof origin.meta.issue === 'string' ? [{ ticket, origin, issue: origin.meta.issue }] : []
+  })
+  const known = ctx.state.get<Record<string, boolean>>(KEYS.delegated) ?? {}
+  if (!running.length) { if (Object.keys(known).length) ctx.state.set(KEYS.delegated, {}); return }
+  ctx.state.set(KEYS.delegationChecked, new Date().toISOString())
+  const delegates = await client.delegates([...new Set(running.map(item => item.issue))], signal).catch(() => undefined)
+  if (!delegates) return
+  const next: Record<string, boolean> = {}
+  for (const { ticket, origin, issue } of running) {
+    const before = known[ticket.id] ?? origin.meta.delegate === viewer
+    next[ticket.id] = before
+    if (signal.aborted || !delegates.has(issue)) continue
+    const delegated = delegates.get(issue) === viewer
+    if (delegated || !before) { next[ticket.id] = delegated; continue }
+    try {
+      const change = await client.undelegation(issue, viewer, signal)
+      await ctx.receive(undelegationTrigger(origin, ticket.id, change))
+      next[ticket.id] = false
+    } catch (error) { if (signal.aborted) throw error }
+  }
+  ctx.state.set(KEYS.delegated, next)
 }
 
 /** Reads every `pollSeconds` once setup finished, reporting the Source's health; three failed rounds in a row are an error. */

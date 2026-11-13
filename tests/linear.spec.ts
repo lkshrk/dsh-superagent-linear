@@ -4,7 +4,7 @@ import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import { LinearClient, MINT_INTERVAL_MS, SCOPE, stableUuid, type Prompt, type Session } from '../src/linear-api.ts'
-import { KEYS, LinearConfigSchema, linearKind, pollLinear, promptTrigger, sendLinear, sessionTrigger, watchLinear, type LinearConfig } from '../src/linear.ts'
+import { DELEGATION_INTERVAL_MS, KEYS, LinearConfigSchema, linearKind, pollLinear, promptTrigger, sendLinear, sessionTrigger, watchLinear, type LinearConfig } from '../src/linear.ts'
 import { apply } from '../src/index.ts'
 import type { OutboundMessage, SourceContext, Ticket, Trigger } from '../src/types.ts'
 
@@ -267,6 +267,101 @@ describe('polling', () => {
     expect(states).toEqual([{ id: 'issue-1', state: 'done' }])
     expect(h.state.get(KEYS.followed)).toEqual([])
     open.mockRestore()
+  })
+  describe('delegation', () => {
+    function delegation(delegate: () => string | null, history: unknown[] = []) {
+      const reads: unknown[] = []
+      const stub = linear({
+        agentSessions: () => ({ agentSessions: page([]) }), agentActivities: () => ({ agentActivities: page([]) }),
+        'issues(': variables => { reads.push(variables); return { issues: { nodes: [{ id: 'issue-1', delegate: delegate() === null ? null : { id: delegate() } }] } } },
+        history: () => ({ issue: { history: { nodes: history } } }),
+      })
+      return { ...stub, reads }
+    }
+    const delegated = session('s1', T0, { issue: { ...issue(), delegate: { id: VIEWER } } })
+    const removal = { id: 'h2', createdAt: '2026-11-12T10:05:00.000Z', actor: { id: OWNER, name: 'Owner' }, fromDelegate: { id: VIEWER }, toDelegate: null }
+    const round = async (h: ReturnType<typeof context>, stub: { client: LinearClient }) => {
+      h.state.set(KEYS.delegationChecked, undefined)
+      await pollLinear(h.ctx, stub.client, config(), signal())
+    }
+    function running(origin: Trigger) {
+      const ticket: Ticket = { id: 't1', origin: { triggerId: origin.id, triggerIds: [origin.id] } }
+      const h = context({ tickets: [ticket], triggers: [origin] })
+      h.state.set(KEYS.sessions, T0); h.state.set(KEYS.prompts, T0)
+      return h
+    }
+
+    it('stops a running ticket once its Issue is no longer delegated to the app, attributed to the change, and only once', async () => {
+      let current: string | null = VIEWER
+      const stub = delegation(() => current, [
+        { id: 'h1', createdAt: '2026-11-12T09:59:00.000Z', actor: { id: OWNER }, fromDelegate: null, toDelegate: { id: VIEWER } }, removal])
+      const h = running(sessionTrigger(delegated, VIEWER)!)
+      await round(h, stub)
+      expect(h.received).toEqual([])
+      current = null
+      await round(h, stub)
+      await round(h, stub)
+      expect(h.received).toHaveLength(1)
+      expect(h.received[0]).toMatchObject({ id: 'linear:undelegated:h2', actor: { source: 'linear', id: OWNER }, human: true, at: removal.createdAt,
+        text: 'Stop requested in Linear.\n\nOwner removed the app as the delegate of WEB-1.', threads: [{ source: 'linear', id: 'issue:issue-1' }],
+        channel: { address: { session: 's1', issue: 'issue-1' } }, meta: { issue: 'issue-1', session: 's1', kind: 'undelegated', signal: 'stop' } })
+      expect(stub.reads).toEqual([{ ids: ['issue-1'] }, { ids: ['issue-1'] }, { ids: ['issue-1'] }])
+    })
+
+    it('stops when the delegation is gone by the first check, and also when it went to another agent', async () => {
+      const stub = delegation(() => 'other-agent', [{ ...removal, toDelegate: { id: 'other-agent' } }])
+      const h = running(sessionTrigger(delegated, VIEWER)!)
+      await round(h, stub)
+      expect(h.received.map(trigger => trigger.id)).toEqual(['linear:undelegated:h2'])
+    })
+
+    it('still stops, unattributed, when the Issue\'s recent history does not show the change', async () => {
+      const stub = delegation(() => null, [])
+      const h = running(sessionTrigger(delegated, VIEWER)!)
+      await round(h, stub)
+      expect(h.received[0]).toMatchObject({ id: 'linear:undelegated:t1:issue-1', human: false, actor: { id: '' },
+        text: 'Stop requested in Linear.\n\nSomeone removed the app as the delegate of WEB-1.', meta: { signal: 'stop' } })
+    })
+
+    it('leaves a ticket the app was only mentioned on running, and stops it after a later delegation is removed', async () => {
+      let current: string | null = null
+      const stub = delegation(() => current, [removal])
+      const h = running(sessionTrigger(session('s1', T0), VIEWER)!)
+      await round(h, stub)
+      expect(h.received).toEqual([])
+      current = VIEWER
+      await round(h, stub)
+      current = null
+      await round(h, stub)
+      expect(h.received.map(trigger => trigger.id)).toEqual(['linear:undelegated:h2'])
+    })
+
+    it('reads the delegates at most every 30 seconds, and not at all without a running Linear ticket', async () => {
+      const stub = delegation(() => VIEWER)
+      const h = running(sessionTrigger(delegated, VIEWER)!)
+      await pollLinear(h.ctx, stub.client, config(), signal())
+      await pollLinear(h.ctx, stub.client, config(), signal())
+      expect(stub.reads).toHaveLength(1)
+      h.state.set(KEYS.delegationChecked, new Date(Date.now() - DELEGATION_INTERVAL_MS).toISOString())
+      await pollLinear(h.ctx, stub.client, config(), signal())
+      expect(stub.reads).toHaveLength(2)
+      const idle = context()
+      idle.state.set(KEYS.sessions, T0); idle.state.set(KEYS.prompts, T0)
+      await pollLinear(idle.ctx, stub.client, config(), signal())
+      expect(stub.reads).toHaveLength(2)
+    })
+
+    it('keeps the round going when the delegates cannot be read, and tries the stop again when it was not taken in', async () => {
+      const failing = linear({ agentSessions: () => ({ agentSessions: page([]) }), agentActivities: () => ({ agentActivities: page([]) }) })
+      const h = running(sessionTrigger(delegated, VIEWER)!)
+      await expect(round(h, failing)).resolves.toBeUndefined()
+      const stub = delegation(() => null, [removal])
+      h.receive.mockRejectedValueOnce(new Error('busy'))
+      await round(h, stub)
+      expect(h.received).toEqual([])
+      await round(h, stub)
+      expect(h.received.map(trigger => trigger.id)).toEqual(['linear:undelegated:h2'])
+    })
   })
 })
 

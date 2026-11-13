@@ -34,7 +34,8 @@ export function stableUuid(seed: string): string {
 
 const User = z.looseObject({ id: z.string(), name: z.string().nullish() })
 const Team = z.looseObject({ id: z.string(), key: z.string() })
-const Issue = z.looseObject({ id: z.string(), identifier: z.string(), title: z.string(), description: z.string().nullish(), url: z.string(), team: Team })
+const Issue = z.looseObject({ id: z.string(), identifier: z.string(), title: z.string(), description: z.string().nullish(), url: z.string(), team: Team,
+  delegate: z.looseObject({ id: z.string() }).nullish() })
 export const SessionSchema = z.looseObject({
   id: z.string(), createdAt: z.string(), url: z.string().nullish(), creator: User.nullish(), appUser: User.nullish(),
   comment: z.looseObject({ id: z.string(), body: z.string().nullish() }).nullish(), issue: Issue.nullish(),
@@ -48,7 +49,7 @@ export type Prompt = z.infer<typeof PromptSchema>
 const PageInfo = z.looseObject({ hasNextPage: z.boolean(), endCursor: z.string().nullish() })
 const Page = z.looseObject({ nodes: z.array(z.unknown()), pageInfo: PageInfo })
 
-const ISSUE_FIELDS = 'id identifier title description url team { id key }'
+const ISSUE_FIELDS = 'id identifier title description url team { id key } delegate { id }'
 const SESSIONS = `query($after: String) { agentSessions(first: 25, after: $after, orderBy: createdAt) {
   nodes { id createdAt url creator { id name } appUser { id name } comment { id body } issue { ${ISSUE_FIELDS} } }
   pageInfo { hasNextPage endCursor } } }`
@@ -63,8 +64,11 @@ const ACTIVITY = 'query($id: String!) { agentActivity(id: $id) { id } }'
 const CREATE_ACTIVITY = `mutation($input: AgentActivityCreateInput!) { agentActivityCreate(input: $input) { success } }`
 const ADD_URLS = `mutation($id: String!, $input: AgentSessionUpdateInput!) { agentSessionUpdate(id: $id, input: $input) { success } }`
 const ISSUE_STATE = `query($id: String!) { issue(id: $id) { state { type } team { states { nodes { id type position } } } } }`
+const DELEGATES = 'query($ids: [ID!]) { issues(first: 50, filter: { id: { in: $ids } }) { nodes { id delegate { id } } } }'
+const HISTORY = `query($id: String!) { issue(id: $id) { history(first: 50) { nodes { id createdAt actor { id name } fromDelegate { id } toDelegate { id } } } } }`
 const SET_STATE = `mutation($id: String!, $state: String!) { issueUpdate(id: $id, input: { stateId: $state }) { success } }`
 
+export interface Undelegation { id: string; at: string; actor?: { id: string; name?: string | null } }
 export interface ActivityContent { type: 'thought' | 'response' | 'error'; body: string }
 
 export class LinearClient {
@@ -188,6 +192,25 @@ export class LinearClient {
   /** Adds links, such as the ticket's pull request, to the session's external links. */
   async addLinks(session: string, links: { label: string; url: string }[], signal?: AbortSignal): Promise<void> {
     await this.request(ADD_URLS, { id: session, input: { addedExternalUrls: links } }, signal)
+  }
+  /** The delegate of each issue Linear still has, by issue id; null when none is delegated. */
+  async delegates(ids: string[], signal?: AbortSignal): Promise<Map<string, string | null>> {
+    const delegates = new Map<string, string | null>()
+    for (let start = 0; start < ids.length; start += 50) {
+      const data = z.object({ issues: z.object({ nodes: z.array(z.object({ id: z.string(), delegate: z.object({ id: z.string() }).nullish() })) }) })
+        .parse(await this.request(DELEGATES, { ids: ids.slice(start, start + 50) }, signal))
+      for (const node of data.issues.nodes) delegates.set(node.id, node.delegate?.id ?? null)
+    }
+    return delegates
+  }
+  /** The newest of the issue's last 50 changes that took its delegation away from `agent`. */
+  async undelegation(issue: string, agent: string, signal?: AbortSignal): Promise<Undelegation | undefined> {
+    const entry = z.looseObject({ id: z.string(), createdAt: z.string(), actor: User.nullish(), fromDelegate: z.object({ id: z.string() }).nullish(),
+      toDelegate: z.object({ id: z.string() }).nullish() })
+    const data = z.object({ issue: z.object({ history: z.object({ nodes: z.array(entry) }) }) }).parse(await this.request(HISTORY, { id: issue }, signal))
+    const change = data.issue.history.nodes.filter(node => node.fromDelegate?.id === agent && node.toDelegate?.id !== agent)
+      .sort((a, b) => Date.parse(b.createdAt) - Date.parse(a.createdAt))[0]
+    return change && { id: change.id, at: change.createdAt, ...change.actor ? { actor: { id: change.actor.id, name: change.actor.name } } : {} }
   }
   /** Moves the issue to its team's first completed state unless it is completed or canceled already. */
   async complete(issue: string, signal?: AbortSignal): Promise<boolean> {
