@@ -1,5 +1,5 @@
 /** Chains: a person's session on an Issue with sub-issues works through them, each in a session of its own, in the order their `blocks` relations allow. */
-import { LinearError, stableUuid, type Chain, type Issue, type IssueContext, type LinearClient, type Session } from './linear-api.ts'
+import { LinearError, stableUuid, type Chain, type Issue, type IssueContext, type LinearClient, type Prompt, type Session } from './linear-api.ts'
 import { CLOSE_HORIZON_MS, KEYS, SOURCE, channel, meta, placed, routeOf, threadOf, withContext, type LinearConfig, type Round } from './linear.ts'
 import type { SourceContext, Ticket, Trigger } from './types.ts'
 
@@ -42,34 +42,50 @@ function addOwnSession(ctx: SourceContext, id: string): void {
 const ignoreGone = (error: unknown) => { if (!(error instanceof LinearError && error.gone)) throw error }
 const closed = (state: { type: string } | null | undefined) => state?.type === 'completed' || state?.type === 'canceled'
 
-/** Starts a fresh run on `session`'s Issue, replacing any earlier run; the children that run started and are still busy carry over. */
-export async function startChain(ctx: SourceContext, client: LinearClient, session: Session, context: IssueContext, viewer: string, parallel: number,
+interface Start { run: string; session: string; issue: Issue; delegator: { id: string; name?: string | null } }
+/** Starts a fresh run, replacing any earlier one; the children that run started and are still busy carry over. Idempotent per `run`. */
+async function startRun(ctx: SourceContext, client: LinearClient, start: Start, context: IssueContext, viewer: string, parallel: number,
   signal: AbortSignal): Promise<void> {
-  const issue = session.issue!
+  const { issue, run, session, delegator } = start
   const before = chainOf(ctx, issue.id)
-  if (before?.run !== session.id) {
+  if (before?.run !== run) {
     const carried = before?.status === 'running' ? [...busy(ctx, before)].flatMap(id => before.started[id] ? [[id, before.started[id]] as const] : []) : []
-    save(ctx, issue.id, { run: session.id, session: session.id, delegator: { id: session.creator!.id, ...session.creator!.name ? { name: session.creator!.name } : {} },
+    save(ctx, issue.id, { run, session, delegator: { id: delegator.id, ...delegator.name ? { name: delegator.name } : {} },
       status: 'running', team: issue.team.id, teamKey: issue.team.key, ...issue.project ? { project: issue.project.id, ...issue.project.name ? { projectName: issue.project.name } : {} } : {},
       identifier: issue.identifier, url: issue.url, delegated: issue.delegate?.id === viewer, started: Object.fromEntries(carried) })
   }
   setActive(ctx, issue.id, true)
   const list = context.children.nodes.map(child => `${child.identifier}${closed(child.state) ? ' (done)' : ''}`).join(', ')
   const more = context.children.pageInfo.hasNextPage ? ' and more' : ''
-  await client.activity(session.id, stableUuid(`chain-plan:${session.id}`), { type: 'thought',
+  await client.activity(session, stableUuid(`chain-plan:${run}`), { type: 'thought',
     body: `Working through the sub-issues of ${issue.identifier} in the order their blocking relations allow, at most ${parallel} at a time: ${list}${more}.` }, false, signal)
     .catch(ignoreGone)
-  ctx.state.set(CHAIN_KEYS.run(session.id), issue.id)
+  ctx.state.set(CHAIN_KEYS.run(run), issue.id)
+}
+export async function startChain(ctx: SourceContext, client: LinearClient, session: Session, context: IssueContext, viewer: string, parallel: number,
+  signal: AbortSignal): Promise<void> {
+  await startRun(ctx, client, { run: session.id, session: session.id, issue: session.issue!, delegator: session.creator! }, context, viewer, parallel, signal)
 }
 
-/** Answers a prompt on an epic, which never becomes a Trigger: a stop stops its chain, anything else gets a note. False for any other Issue. */
-export async function epicPrompt(ctx: SourceContext, client: LinearClient, trigger: Trigger, signal: AbortSignal): Promise<boolean> {
+/** Answers a prompt on an epic, never a Trigger: stops its chain, starts one (a new delegation reuses the session), or notes its status. */
+export async function epicPrompt(ctx: SourceContext, client: LinearClient, prompt: Prompt, trigger: Trigger, viewer: string, parallel: number,
+  signal: AbortSignal): Promise<boolean> {
   const epic = String(trigger.meta.issue)
+  if (ctx.state.get(CHAIN_KEYS.run(prompt.id))) return true
   const record = chainOf(ctx, epic)
+  const stop = trigger.meta.signal === 'stop'
+  if (!stop && record?.status !== 'running' && trigger.meta.delegate === viewer) {
+    const context = await client.issueContext(epic, signal)
+    if (context.children.nodes.some(child => !closed(child.state))) {
+      await startRun(ctx, client, { run: prompt.id, session: prompt.agentSession.id, issue: prompt.agentSession.issue!, delegator: prompt.user! },
+        context, viewer, parallel, signal)
+      return true
+    }
+  }
   const labels = Array.isArray(trigger.meta.labels) ? trigger.meta.labels : []
   if (!record && !labels.some(label => String(label).toLowerCase() === 'epic') && !await client.hasChildren(epic, signal)) return false
   const identifier = String(trigger.meta.identifier)
-  if (record?.status === 'running' && trigger.meta.signal === 'stop') {
+  if (record?.status === 'running' && stop) {
     await stopChain(ctx, client, epic, record, 'stop requested in Linear', { id: trigger.actor.id }, signal)
     return true
   }
@@ -88,10 +104,10 @@ export async function epicMention(ctx: SourceContext, client: LinearClient, sess
 
 function statusText(ctx: SourceContext, record: ChainRecord | undefined, identifier: string, app: string): string {
   if (record?.status !== 'running') {
-    return `Not working on ${identifier}${record?.reason ? ` (stopped: ${record.reason})` : ''}. Delegate the issue to ${app} to start a chain.`
+    return `Not working on ${identifier}${record?.reason ? ` (stopped: ${record.reason})` : ''}. To start a chain, delegate the issue to ${app}, then write "start" in its session.`
   }
   const working = [...busy(ctx, record)].map(id => identifierOf(record, id))
-  return `Working on ${working.length ? working.join(', ') : 'the next sub-issues'} of ${identifier}. Delegate the issue to ${app} again to restart.`
+  return `Working on ${working.length ? working.join(', ') : 'the next sub-issues'} of ${identifier}. A stop in this session ends the chain.`
 }
 
 const identifierOf = (record: ChainRecord, id: string) =>

@@ -1082,11 +1082,13 @@ describe('chain', () => {
 
   it('never receives a prompt on an epic without a ticket, with or without a chain, and answers it in its session', async () => {
     const w = world()
-    w.epic(); w.kid(2)
+    w.epic().delegate = null; w.kid(2)
     w.prompt('p1', 'epic-1')
     await w.round()
     expect(w.received).toEqual([])
-    expect(w.activities.map(activity => [activity.session, activity.body])).toEqual([['es1', 'Not working on WEB-10. Delegate the issue to the app to start a chain.']])
+    expect(w.record()).toBeUndefined()
+    expect(w.activities.map(activity => [activity.session, activity.body])).toEqual([['es1',
+      'Not working on WEB-10. To start a chain, delegate the issue to the app, then write "start" in its session.']])
     const labelled = world()
     labelled.epic(); labelled.kids.clear()
     labelled.prompts.push(prompt('p2', '2026-11-12T10:01:00.000Z', { agentSession: { id: 'es9', issue: { ...issue(), labels: { nodes: [{ name: 'EPIC' }] } } } }))
@@ -1099,7 +1101,43 @@ describe('chain', () => {
     running.prompt('p3', 'epic-1')
     await running.round()
     expect(running.received.map(trigger => trigger.meta.kind)).toEqual(['chain', 'chain'])
-    expect(running.activities.at(-1)).toEqual({ session: 'es1', type: 'thought', body: 'Working on WEB-2, WEB-3 of WEB-10. Delegate the issue to the app again to restart.' })
+    expect(running.activities.at(-1)).toEqual({ session: 'es1', type: 'thought', body: 'Working on WEB-2, WEB-3 of WEB-10. A stop in this session ends the chain.' })
+  })
+
+  it('starts a chain from a person\'s prompt in the session Linear reuses on a delegated epic, once, keyed by the prompt', async () => {
+    const w = world()
+    w.epic(); w.kid(2); w.kid(3, { state: 'completed' })
+    w.prompt('p1', 'epic-1', { content: { body: 'start' } })
+    await w.round()
+    expect(w.record()).toMatchObject({ run: 'p1', session: 'es1', status: 'running', delegator: { id: OWNER, name: 'Owner' }, delegated: true })
+    expect(w.chainTriggers().map(trigger => [trigger.id, trigger.actor.id])).toEqual([['linear:chain:p1:kid-2', OWNER]])
+    await w.round(); await w.round()
+    expect(w.activities.filter(activity => activity.body.startsWith('Working through'))).toHaveLength(1)
+    expect(w.chainTriggers()).toHaveLength(1)
+    expect(w.received.filter(trigger => trigger.meta.kind === 'prompt')).toEqual([])
+  })
+
+  it('restarts a stopped chain from a prompt on the delegated epic, skipping done children, and starts none from a stop or with all children closed', async () => {
+    const w = world()
+    w.epic(); w.kid(2); w.kid(3)
+    w.delegate('es1')
+    await w.round(); await w.round()
+    w.close(2); w.end(3); await w.round()
+    expect(w.record()!.status).toBe('stopped')
+    w.prompt('p1', 'epic-1', { signal: 'stop', content: { body: '' } })
+    await w.round()
+    expect(w.record()).toMatchObject({ run: 'es1', status: 'stopped' })
+    w.prompt('p2', 'epic-1', { content: { body: 'start' } })
+    await w.round()
+    expect(w.record()).toMatchObject({ run: 'p2', status: 'running' })
+    expect(w.chainTriggers().map(trigger => trigger.id)).toEqual(['linear:chain:es1:kid-2', 'linear:chain:es1:kid-3', 'linear:chain:p2:kid-3'])
+    const closedKids = world()
+    closedKids.epic(); closedKids.kid(2, { state: 'completed' })
+    closedKids.prompt('p1', 'epic-1')
+    await closedKids.round()
+    expect(closedKids.record()).toBeUndefined()
+    expect(closedKids.received).toEqual([])
+    expect(closedKids.activities.at(-1)!.body).toMatch(/^Not working on WEB-10\./)
   })
 
   it('stops the chain on a stop signal: running children get a stop Trigger, the epic\'s session the reason, nothing more starts', async () => {
@@ -1461,7 +1499,7 @@ describe('chain', () => {
       await w.round()
       expect(w.received).toEqual([])
       expect(w.record()).toBeUndefined()
-      expect(w.activities.at(-1)).toEqual({ session: 'm1', type: 'thought', body: 'Not working on WEB-10. Delegate the issue to dsh to start a chain.' })
+      expect(w.activities.at(-1)).toEqual({ session: 'm1', type: 'thought', body: 'Not working on WEB-10. To start a chain, delegate the issue to dsh, then write "start" in its session.' })
     }
     const w = world()
     w.epic(); w.kid(2)
@@ -1470,7 +1508,7 @@ describe('chain', () => {
     w.delegate('m2', 'epic-1', { id: OWNER }, { comment: { id: 'c2', body: '@dsh?' }, appUser: { id: VIEWER, name: 'dsh' } })
     await w.round()
     expect(w.record()!.run).toBe('es1')
-    expect(w.activities.at(-1)).toEqual({ session: 'm2', type: 'thought', body: 'Working on WEB-2 of WEB-10. Delegate the issue to dsh again to restart.' })
+    expect(w.activities.at(-1)).toEqual({ session: 'm2', type: 'thought', body: 'Working on WEB-2 of WEB-10. A stop in this session ends the chain.' })
   })
 
   it('offers chainParallel between 1 and 8, 2 by default, in the panel', () => {

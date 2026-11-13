@@ -355,7 +355,7 @@ export async function pollLinear(ctx: SourceContext, client: LinearClient, confi
       served = where.kind === 'served'
     }
     try {
-      if (served && await epicPrompt(ctx, client, trigger, signal)) continue
+      if (served && await epicPrompt(ctx, client, prompt, trigger, viewer, config.chainParallel, signal)) continue
       await ctx.receive(trigger)
       round.prompts++
     } catch (error) {
