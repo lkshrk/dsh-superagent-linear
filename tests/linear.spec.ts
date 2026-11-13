@@ -7,6 +7,7 @@ import type { z } from 'zod'
 import { LinearClient, MINT_INTERVAL_MS, SCOPE, stableUuid, type IssueContext, type Prompt, type Session } from '../src/linear-api.ts'
 import { CLOSE_HORIZON_MS, DELEGATION_INTERVAL_MS, KEYS, PARENT_DESCRIPTION_LIMIT, LinearConfigSchema, pullOf, undelegationTrigger, linearKind, pollLinear, promptTrigger, sendLinear, sessionTrigger, SPLIT_LINE, watchLinear, withContext, withMode, type LinearConfig } from '../src/linear.ts'
 import { apply } from '../src/index.ts'
+import { CHAIN_KEYS, type ChainRecord } from '../src/linear-chain.ts'
 import type { OutboundMessage, SourceContext, Ticket, Trigger } from '../src/types.ts'
 
 const VIEWER = 'app-user', OWNER = 'owner-1', TEAM = 'team-web', OTHER_TEAM = 'team-ops'
@@ -50,6 +51,7 @@ function linear(handlers: Record<string, (variables: Record<string, unknown>) =>
     if (query.includes('viewer') && !operation) return Response.json({ data: { viewer: { id: VIEWER } } })
     if (query.includes('teams(') && !operation) return Response.json({ data: { teams: page(Object.entries(KEYS_OF).map(([id, key]) => ({ id, key }))) } })
     if (query.includes('IssueContext') && !operation) return Response.json({ data: { issue: { parent: null, children: { nodes: [], pageInfo: { hasNextPage: false } } } } })
+    if (query.includes('EpicCheck') && !operation) return Response.json({ data: { issue: { children: { nodes: [] } } } })
     if (query.includes('teams(') && operation === 'teams(') return Response.json({ errors: [{ message: 'Internal error' }] })
     if (!operation) return Response.json({ errors: [{ message: `unexpected ${query.slice(0, 40)}` }] })
     try { return Response.json({ data: handlers[operation]!(variables) }) }
@@ -760,15 +762,15 @@ describe('issue context', () => {
   }
   const polled = () => { const h = context(); h.state.set(KEYS.sessions, T0); h.state.set(KEYS.prompts, T0); return h }
   it('reads the context of a served session\'s Issue after answering it, into the session\'s Trigger, not the prompt\'s, and once', async () => {
-    const stub = served(() => ({ issue: { parent: parent(), children: children([child(2, 'completed')]) } }))
+    const stub = served(() => ({ issue: { parent: parent(), children: none } }))
     const h = polled()
     const round = await pollLinear(h.ctx, stub.client, config(), signal())
     expect(stub.reads).toEqual([{ id: 'issue-1' }])
     const order = stub.calls.map(call => call.query ?? '')
     expect(order.findIndex(query => query.includes('agentActivityCreate'))).toBeLessThan(order.findIndex(query => query.includes('IssueContext')))
     expect(round.contextFailed).toBe(0)
-    expect(h.received[0]!.text).toBe(`${PARENT_LINE}\nSub-issues: WEB-2 (done)\n\n${base().text}`)
-    expect(h.received[0]!.meta).toMatchObject({ parent: 'issue-0', children: 1 })
+    expect(h.received[0]!.text).toBe(`${PARENT_LINE}\n\n${base().text}`)
+    expect(h.received[0]!.meta).toMatchObject({ parent: 'issue-0', children: 0 })
     expect(h.received[1]!.text).toBe('Also the header')
     await pollLinear(h.ctx, stub.client, config(), signal())
     expect(h.received.map(trigger => trigger.id)).toContain('linear:session:s1')
@@ -850,7 +852,8 @@ describe('split mode', () => {
       agentActivityCreate: () => ({ agentActivityCreate: { success: true } }),
       IssueContext: () => ({ issue: { parent: { id: 'issue-0', identifier: 'WEB-0', title: 'Roadmap', url: 'https://linear.app/x/issue/WEB-0', description: null },
         children: { nodes: [], pageInfo: { hasNextPage: false } } } }) })
-    const h = context(); h.state.set(KEYS.sessions, T0); h.state.set(KEYS.prompts, T0)
+    const h = context({ tickets: [{ id: 't1', origin: { triggerId: 'linear:session:s1', triggerIds: ['linear:session:s1'] } }] })
+    h.state.set(KEYS.sessions, T0); h.state.set(KEYS.prompts, T0)
     await pollLinear(h.ctx, stub.client, config(), signal())
     const [first, second] = h.received[0]!.text.split('\n')
     expect(first).toBe(SPLIT_LINE)
@@ -887,6 +890,456 @@ describe('split mode', () => {
     const github = { ...epic(), source: 'github', meta: { mode: 'split' } }
     expect(env(github)).toEqual({ DSH_SUPERAGENT_LINEAR_ISSUE: '', DSH_SUPERAGENT_LINEAR_ISSUE_URL: '', DSH_SUPERAGENT_LINEAR_MODE: '' })
     expect(env().DSH_SUPERAGENT_LINEAR_MODE).toBe('')
+  })
+})
+
+describe('chain', () => {
+  const T0 = '2026-11-12T10:00:00.000Z'
+  type Kid = { id: string; identifier: string; state: string; order: number | null; blockedBy: string[]; labels: string[]; epic: string; team: string }
+  type Epic = { id: string; identifier: string; state: string; delegate: string | null; more: boolean }
+  const chainSession = (id: string, epic: Epic, at: string) => session(id, at, { issue: { id: epic.id, identifier: epic.identifier, title: 'The epic',
+    description: 'Do it all.', url: `https://linear.app/x/issue/${epic.identifier}`, team: { id: TEAM, key: 'WEB' }, ...epic.delegate ? { delegate: { id: epic.delegate } } : {} } })
+
+  function world(parallel = 2) {
+    const kids = new Map<string, Kid>(), epics = new Map<string, Epic>()
+    const foreign = new Map<string, { id: string; identifier: string; state: string }>()
+    const sessions: Session[] = [], prompts: Prompt[] = [], tickets: Ticket[] = []
+    const created: { issue: string; id: string }[] = []
+    const activities: { session: string; type: string; body: string }[] = []
+    const completed: string[] = []
+    const failures: Record<string, number> = {}
+    const hooks: { complete?: (id: string) => void } = {}
+    let relationsMore = false
+    const failing = (operation: string) => { if (failures[operation]) { failures[operation]--; throw new Error('Internal error') } }
+    const kidsOf = (epic: string) => [...kids.values()].filter(kid => kid.epic === epic)
+    const lookup = (id: string) => {
+      const kid = kids.get(id)
+      if (kid) return { id: kid.id, identifier: kid.identifier, state: { type: kid.state }, parent: { id: kid.epic } }
+      const other = foreign.get(id)!
+      return { id: other.id, identifier: other.identifier, state: { type: other.state }, parent: null }
+    }
+    const stub = linear({
+      agentSessions: () => ({ agentSessions: page(sessions) }),
+      agentActivities: () => ({ agentActivities: page(prompts) }),
+      agentActivityCreate: variables => {
+        const input = variables.input as { agentSessionId: string; content: { type: string; body: string } }
+        activities.push({ session: input.agentSessionId, type: input.content.type, body: input.content.body })
+        return { agentActivityCreate: { success: true } }
+      },
+      IssueContext: variables => {
+        const id = String(variables.id), epic = epics.get(id), kid = kids.get(id)
+        if (epic) return { issue: { parent: null, children: { nodes: kidsOf(id).map(k => ({ identifier: k.identifier, title: 'Part', state: { type: k.state } })), pageInfo: { hasNextPage: false } } } }
+        const parent = kid && epics.get(kid.epic)
+        return { issue: { parent: parent ? { id: parent.id, identifier: parent.identifier, title: 'The epic', url: `https://linear.app/x/issue/${parent.identifier}`, description: 'Epic text.' } : null,
+          children: { nodes: [], pageInfo: { hasNextPage: false } } } }
+      },
+      EpicCheck: variables => ({ issue: { children: { nodes: kidsOf(String(variables.id)).map(kid => ({ id: kid.id })) } } }),
+      ChainRead: variables => {
+        failing('ChainRead')
+        const epic = epics.get(String(variables.id))!
+        return { issue: { id: epic.id, identifier: epic.identifier, state: { type: epic.state }, delegate: epic.delegate ? { id: epic.delegate } : null,
+          children: { nodes: kidsOf(epic.id).map(kid => ({ id: kid.id, identifier: kid.identifier, title: 'Part', state: { type: kid.state }, subIssueSortOrder: kid.order,
+            inverseRelations: { nodes: [{ type: 'related', issue: lookup(kid.id) }, ...kid.blockedBy.map(id => ({ type: 'blocks', issue: lookup(id) }))],
+              pageInfo: { hasNextPage: relationsMore } } })), pageInfo: { hasNextPage: epic.more } } } }
+      },
+      ChainChild: variables => {
+        const kid = kids.get(String(variables.id))!
+        return { issue: { id: kid.id, identifier: kid.identifier, title: `Part ${kid.identifier}`, description: 'Make the part.', url: `https://linear.app/x/issue/${kid.identifier}`,
+          team: { id: kid.team, key: KEYS_OF[kid.team] }, delegate: null, project: null, labels: { nodes: kid.labels.map(name => ({ name })) } } }
+      },
+      ChainSession: variables => {
+        failing('ChainSession')
+        const id = `cs-${created.length + 1}`
+        created.push({ issue: String(variables.issueId), id })
+        return { agentSessionCreateOnIssue: { success: true, agentSession: { id, url: `https://linear.app/x/session/${id}`, createdAt: T0 } } }
+      },
+      'team { states': variables => ({ issue: { state: { type: epics.get(String(variables.id))?.state ?? kids.get(String(variables.id))!.state },
+        team: { states: { nodes: [{ id: 'done', type: 'completed', position: 1 }] } } } }),
+      issueUpdate: variables => {
+        hooks.complete?.(String(variables.id))
+        failing('issueUpdate')
+        completed.push(String(variables.id))
+        const target = epics.get(String(variables.id)) ?? kids.get(String(variables.id))!
+        target.state = 'completed'
+        return { issueUpdate: { success: true } }
+      },
+      'issues(': () => ({ issues: { nodes: [] } }),
+    })
+    const h = context()
+    h.ctx.tickets.open = () => tickets.filter(ticket => !ticket.ended)
+    h.ctx.tickets.get = id => tickets.find(ticket => ticket.id === id)
+    h.state.set(KEYS.sessions, T0); h.state.set(KEYS.prompts, T0)
+    let minute = 0
+    const at = () => `2026-11-12T10:${String(++minute).padStart(2, '0')}:00.000Z`
+    const w = {
+      ...h, stub, kids, epics, foreign, sessions, prompts, tickets, created, activities, completed, failures, hooks, autoTicket: true,
+      epic(id = 'epic-1', identifier = 'WEB-10') { const epic: Epic = { id, identifier, state: 'started', delegate: VIEWER, more: false }; epics.set(id, epic); return epic },
+      kid(n: number, fields: Partial<Kid> = {}) {
+        const kid: Kid = { id: `kid-${n}`, identifier: `WEB-${n}`, state: 'unstarted', order: n, blockedBy: [], labels: [], epic: 'epic-1', team: TEAM, ...fields }
+        kids.set(kid.id, kid); return kid
+      },
+      delegate(id: string, epic = 'epic-1', creator: Session['creator'] = { id: OWNER, name: 'Owner' }) { sessions.push({ ...chainSession(id, epics.get(epic)!, at()), creator }) },
+      prompt(id: string, issue: string, fields: Partial<Prompt> = {}) {
+        const epic = epics.get(issue)
+        prompts.push(prompt(id, at(), { agentSession: { id: 'es1', issue: { ...chainSession('x', epic!, T0).issue! } }, ...fields }))
+      },
+      relationsMore(value: boolean) { relationsMore = value },
+      record: (epic = 'epic-1'): ChainRecord | undefined => h.ctx.state.get<ChainRecord>(CHAIN_KEYS.chain(epic)),
+      chainTriggers: () => h.received.filter(trigger => trigger.meta.kind === 'chain'),
+      startedKids: () => h.received.filter(trigger => trigger.meta.kind === 'chain').map(trigger => trigger.meta.identifier),
+      close(n: number, state = 'completed') {
+        kids.get(`kid-${n}`)!.state = state
+        for (const ticket of tickets.filter(ticket => h.ctx.triggers.get(ticket.origin.triggerId)?.meta.issue === `kid-${n}` && !ticket.ended)) ticket.ended = { at: new Date().toISOString() }
+      },
+      end(n: number) {
+        for (const ticket of tickets.filter(ticket => h.ctx.triggers.get(ticket.origin.triggerId)?.meta.issue === `kid-${n}` && !ticket.ended)) ticket.ended = { at: new Date().toISOString() }
+      },
+      async round(fields: { parallel?: number; throttle?: boolean } = {}) {
+        if (!fields.throttle) for (const epic of epics.keys()) { const record = w.record(epic); if (record) h.state.set(CHAIN_KEYS.chain(epic), { ...record, checked: undefined }) }
+        const result = await pollLinear(h.ctx, stub.client, config({ chainParallel: fields.parallel ?? parallel }), signal())
+        for (const trigger of h.received) {
+          if (trigger.meta.kind !== 'chain' || !w.autoTicket || tickets.some(ticket => ticket.origin.triggerId === trigger.id)) continue
+          tickets.push({ id: `t-${String(trigger.meta.session)}`, origin: { triggerId: trigger.id, triggerIds: [trigger.id] } })
+        }
+        return result
+      },
+    }
+    return w
+  }
+
+  it('starts a run on a person\'s session on an epic with sub-issues, never receives the epic, and turns ready sub-issues into chain Triggers', async () => {
+    const w = world()
+    w.epic(); w.kid(2); w.kid(3); w.kid(4)
+    w.delegate('es1')
+    const round = await w.round()
+    expect(round.chainFailed).toBe(0)
+    expect(w.received.map(trigger => trigger.id)).toEqual(['linear:chain:es1:kid-2', 'linear:chain:es1:kid-3'])
+    expect(w.record()).toMatchObject({ run: 'es1', session: 'es1', status: 'running', delegator: { id: OWNER, name: 'Owner' }, identifier: 'WEB-10', delegated: true })
+    expect(w.state.get(CHAIN_KEYS.chains)).toEqual(['epic-1'])
+    expect(w.activities.filter(activity => activity.session === 'es1').map(activity => activity.body)).toEqual(['Received.',
+      'Working through the sub-issues of WEB-10 in the order their blocking relations allow, at most 2 at a time: WEB-2, WEB-3, WEB-4.'])
+    expect(w.created.map(item => item.issue)).toEqual(['kid-2', 'kid-3'])
+    expect(w.activities.filter(activity => activity.session === 'cs-1').map(activity => activity.body)).toEqual(['Received.'])
+    await w.round()
+    expect(w.received.map(trigger => trigger.id)).toEqual(['linear:chain:es1:kid-2', 'linear:chain:es1:kid-3'])
+    expect(w.activities.filter(activity => activity.session === 'es1')).toHaveLength(2)
+  })
+
+  it('makes a chain Trigger with the epic\'s delegator, the parent header, the child\'s new session as channel, and no delegate or mode', async () => {
+    const w = world()
+    w.epic(); w.kid(2, { labels: ['Epic'] })
+    w.delegate('es1')
+    await w.round()
+    const [trigger] = w.chainTriggers()
+    expect(trigger).toMatchObject({ id: 'linear:chain:es1:kid-2', actor: { source: 'linear', id: OWNER }, human: true, addressed: 'direct',
+      threads: [{ source: 'linear', id: 'issue:kid-2' }], url: 'https://linear.app/x/session/cs-1',
+      channel: { source: 'linear', thread: 'linear:issue:kid-2', address: { session: 'cs-1', issue: 'kid-2', identifier: 'WEB-2' } },
+      meta: { kind: 'chain', chain: 'epic-1', issue: 'kid-2', session: 'cs-1', parent: 'epic-1', labels: ['Epic'] } })
+    expect(trigger!.meta).not.toHaveProperty('delegate')
+    expect(trigger!.meta).not.toHaveProperty('mode')
+    expect(trigger!.text.split('\n')[0]).toBe('Parent: WEB-10 "The epic" https://linear.app/x/issue/WEB-10')
+    expect(trigger!.text).not.toContain(SPLIT_LINE)
+    expect(trigger!.text).toContain('WEB-2: Part WEB-2\n\nMake the part.')
+    expect(linearKind(w.stub.client).environment!.values({ config: config(), trigger: trigger! }).DSH_SUPERAGENT_LINEAR_MODE).toBe('')
+  })
+
+  it('skips the sessions it created on replay, also once their work finished, without relying on their creator', async () => {
+    const w = world()
+    w.epic(); w.kid(2); w.kid(3)
+    w.delegate('es1')
+    await w.round()
+    w.sessions.push(session('cs-1', '2026-11-12T10:30:00.000Z', { creator: null, issue: { ...issue(TEAM, 2), id: 'kid-2' } }),
+      session('cs-2', '2026-11-12T10:31:00.000Z', { creator: { id: OWNER }, issue: { ...issue(TEAM, 3), id: 'kid-3' } }))
+    await w.round()
+    w.close(2); w.close(3)
+    await w.round()
+    await w.round()
+    expect(w.record()!.status).toBe('done')
+    expect(w.received.map(trigger => trigger.id)).toEqual(['linear:chain:es1:kid-2', 'linear:chain:es1:kid-3'])
+    expect(Object.keys(w.state.get(CHAIN_KEYS.sessions) as Record<string, string>)).toEqual(['cs-1', 'cs-2'])
+  })
+
+  it('never receives a prompt on an epic without a ticket, with or without a chain, and answers it in its session', async () => {
+    const w = world()
+    w.epic(); w.kid(2)
+    w.prompt('p1', 'epic-1')
+    await w.round()
+    expect(w.received).toEqual([])
+    expect(w.activities.map(activity => [activity.session, activity.body])).toEqual([['es1', 'Not working on WEB-10. Mention or delegate it again to start.']])
+    const labelled = world()
+    labelled.epic(); labelled.kids.clear()
+    labelled.prompts.push(prompt('p2', '2026-11-12T10:01:00.000Z', { agentSession: { id: 'es9', issue: { ...issue(), labels: { nodes: [{ name: 'EPIC' }] } } } }))
+    await labelled.round()
+    expect(labelled.received).toEqual([])
+    const running = world()
+    running.epic(); running.kid(2); running.kid(3); running.kid(4)
+    running.delegate('es1')
+    await running.round()
+    running.prompt('p3', 'epic-1')
+    await running.round()
+    expect(running.received.map(trigger => trigger.meta.kind)).toEqual(['chain', 'chain'])
+    expect(running.activities.at(-1)).toEqual({ session: 'es1', type: 'thought', body: 'Working on WEB-2, WEB-3 of WEB-10. Mention or delegate WEB-10 again to restart.' })
+  })
+
+  it('stops the chain on a stop signal: running children get a stop Trigger, the epic\'s session the reason, nothing more starts', async () => {
+    const w = world()
+    w.epic(); w.kid(2); w.kid(3); w.kid(4)
+    w.delegate('es1')
+    await w.round()
+    w.prompt('p1', 'epic-1', { signal: 'stop', content: { body: '' } })
+    await w.round()
+    expect(w.received.slice(2).map(trigger => [trigger.id, trigger.meta.signal, trigger.human, trigger.channel?.address.session])).toEqual([
+      ['linear:chain-stop:es1:kid-2', 'stop', true, 'cs-1'], ['linear:chain-stop:es1:kid-3', 'stop', true, 'cs-2']])
+    expect(w.record()).toMatchObject({ status: 'stopped', reason: 'stop requested in Linear' })
+    expect(w.state.get(CHAIN_KEYS.chains)).toEqual([])
+    expect(w.activities.at(-1)).toEqual({ session: 'es1', type: 'response', body: 'Stopped: stop requested in Linear.' })
+    w.close(2)
+    await w.round()
+    expect(w.startedKids()).toEqual(['WEB-2', 'WEB-3'])
+  })
+
+  it('starts children by their blocking relations, then by sub-issue order, and skips done and canceled ones', async () => {
+    const w = world(1)
+    w.epic(); w.kid(2, { order: 3 }); w.kid(3, { order: 1, blockedBy: ['kid-4'] }); w.kid(4, { order: 2 }); w.kid(5, { state: 'completed', order: 0 }); w.kid(6, { state: 'canceled', order: 0 })
+    w.delegate('es1')
+    await w.round()
+    expect(w.startedKids()).toEqual(['WEB-4'])
+    w.close(4); await w.round()
+    expect(w.startedKids()).toEqual(['WEB-4', 'WEB-3'])
+    w.close(3); await w.round()
+    w.close(2); await w.round()
+    expect(w.startedKids()).toEqual(['WEB-4', 'WEB-3', 'WEB-2'])
+    expect(w.created.map(item => item.issue)).toEqual(['kid-4', 'kid-3', 'kid-2'])
+  })
+
+  it('lets a child wait for a blocker outside the epic while others run, and stalls once only that wait is left', async () => {
+    const w = world()
+    w.epic(); w.foreign.set('ops-9', { id: 'ops-9', identifier: 'OPS-9', state: 'started' }); w.kid(2, { blockedBy: ['ops-9'] }); w.kid(3)
+    w.delegate('es1')
+    await w.round()
+    expect(w.startedKids()).toEqual(['WEB-3'])
+    w.foreign.get('ops-9')!.state = 'completed'
+    await w.round()
+    expect(w.startedKids()).toEqual(['WEB-3', 'WEB-2'])
+    const stalled = world()
+    stalled.epic(); stalled.foreign.set('ops-9', { id: 'ops-9', identifier: 'OPS-9', state: 'started' }); stalled.kid(2, { blockedBy: ['ops-9'] }); stalled.kid(3)
+    stalled.delegate('es1')
+    await stalled.round()
+    stalled.close(3); await stalled.round()
+    expect(stalled.record()).toMatchObject({ status: 'stopped', reason: 'stalled: WEB-2 waits for OPS-9' })
+  })
+
+  it('stops a cycle as a stall naming the blockers', async () => {
+    const w = world()
+    w.epic(); w.kid(2, { blockedBy: ['kid-3'] }); w.kid(3, { blockedBy: ['kid-2'] }); w.kid(4, { state: 'completed' })
+    w.delegate('es1')
+    await w.round()
+    expect(w.received).toEqual([])
+    expect(w.record()).toMatchObject({ status: 'stopped', reason: 'stalled: WEB-2 waits for WEB-3; WEB-3 waits for WEB-2' })
+    expect(w.activities.at(-1)).toMatchObject({ session: 'es1', type: 'response', body: 'Stopped: stalled: WEB-2 waits for WEB-3; WEB-3 waits for WEB-2.' })
+  })
+
+  it('caps the children running at once across all chains', async () => {
+    const w = world(3)
+    w.epic('epic-1', 'WEB-10'); w.epic('epic-2', 'WEB-20')
+    w.kid(2); w.kid(3); w.kid(21, { epic: 'epic-2' }); w.kid(22, { epic: 'epic-2' })
+    w.delegate('es1', 'epic-1'); w.delegate('es2', 'epic-2')
+    await w.round()
+    expect(w.startedKids()).toEqual(['WEB-2', 'WEB-3', 'WEB-21'])
+    await w.round()
+    expect(w.startedKids()).toHaveLength(3)
+    w.close(2); await w.round()
+    expect(w.startedKids()).toEqual(['WEB-2', 'WEB-3', 'WEB-21', 'WEB-22'])
+  })
+
+  it('counts a child a person delegated directly, and a resumed ticket, as running', async () => {
+    const w = world(1)
+    w.epic(); w.kid(2); w.kid(3)
+    const direct = sessionTrigger(session('ps1', T0, { issue: { ...issue(TEAM, 2), id: 'kid-2' } }), VIEWER)!
+    await w.ctx.receive(direct); w.received.length = 0
+    w.tickets.push({ id: 'person', origin: { triggerId: direct.id, triggerIds: [direct.id] } })
+    w.delegate('es1')
+    await w.round()
+    expect(w.startedKids()).toEqual([])
+    w.close(2); await w.round()
+    expect(w.startedKids()).toEqual(['WEB-3'])
+
+    const resumed = world()
+    resumed.epic(); resumed.kid(2)
+    const old = sessionTrigger(session('old', T0, { issue: { ...issue(TEAM, 2), id: 'kid-2' } }), VIEWER)!
+    await resumed.ctx.receive(old); resumed.received.length = 0
+    resumed.autoTicket = false
+    resumed.delegate('es1')
+    await resumed.round()
+    resumed.tickets.push({ id: 'old-ticket', origin: { triggerId: old.id, triggerIds: [old.id, 'linear:chain:es1:kid-2'] } })
+    await resumed.round(); await resumed.round()
+    expect(resumed.startedKids()).toEqual(['WEB-2'])
+    expect(resumed.record()!.started['kid-2']).toMatchObject({ ticket: 'old-ticket' })
+    resumed.end(2); await resumed.round()
+    expect(resumed.record()).toMatchObject({ status: 'stopped', reason: 'WEB-2 ended without being completed' })
+  })
+
+  it('stops with a reason when a child\'s ticket ended and its Issue is still open, and stops its running siblings', async () => {
+    const w = world()
+    w.epic(); w.kid(2); w.kid(3); w.kid(4)
+    w.delegate('es1')
+    await w.round(); await w.round()
+    w.end(2); await w.round()
+    expect(w.record()).toMatchObject({ status: 'stopped', reason: 'WEB-2 ended without being completed' })
+    expect(w.received.slice(2).map(trigger => [trigger.id, trigger.human, trigger.actor.id])).toEqual([['linear:chain-stop:es1:kid-3', false, '']])
+    expect(w.startedKids()).toEqual(['WEB-2', 'WEB-3'])
+    expect(w.activities.at(-1)!.body).toBe('Stopped: WEB-2 ended without being completed.')
+  })
+
+  it('starts a fresh run on a new session on the epic that skips done children and retries the rest', async () => {
+    const w = world()
+    w.epic(); w.kid(2); w.kid(3)
+    w.delegate('es1')
+    await w.round(); await w.round()
+    w.close(2); w.end(3); await w.round()
+    expect(w.record()).toMatchObject({ status: 'stopped' })
+    w.delegate('es2')
+    await w.round()
+    expect(w.record()).toMatchObject({ run: 'es2', session: 'es2', status: 'running' })
+    expect(w.chainTriggers().map(trigger => trigger.id)).toEqual(['linear:chain:es1:kid-2', 'linear:chain:es1:kid-3', 'linear:chain:es2:kid-3'])
+    expect(w.state.get(CHAIN_KEYS.chains)).toEqual(['epic-1'])
+  })
+
+  it('picks up children added while the chain runs', async () => {
+    const w = world()
+    w.epic(); w.kid(2)
+    w.delegate('es1')
+    await w.round()
+    w.kid(3); await w.round()
+    expect(w.startedKids()).toEqual(['WEB-2', 'WEB-3'])
+  })
+
+  it('fails closed on more sub-issues or relations than one read returns', async () => {
+    for (const more of ['children', 'relations']) {
+      const w = world()
+      w.epic(); w.kid(2)
+      if (more === 'children') w.epics.get('epic-1')!.more = true
+      else w.relationsMore(true)
+      w.delegate('es1')
+      await w.round()
+      expect(w.received).toEqual([])
+      expect(w.record()).toMatchObject({ status: 'stopped', reason: 'too many sub-issues or relations to read (at most 30 sub-issues and 20 relations on each)' })
+    }
+  })
+
+  it('stops when the admission table filters a child, and when the epic is no longer delegated', async () => {
+    const w = world()
+    w.epic(); w.kid(2)
+    w.delegate('es1')
+    w.receive.mockImplementationOnce(async () => 'filtered')
+    await w.round()
+    expect(w.record()).toMatchObject({ status: 'stopped', reason: 'WEB-2 was filtered by the admission table' })
+    const undelegated = world()
+    undelegated.epic(); undelegated.kid(2); undelegated.kid(3)
+    undelegated.delegate('es1')
+    await undelegated.round()
+    undelegated.epics.get('epic-1')!.delegate = null
+    await undelegated.round()
+    expect(undelegated.record()).toMatchObject({ status: 'stopped', reason: 'WEB-10 is no longer delegated to the app' })
+    expect(undelegated.received.map(trigger => trigger.meta.kind)).toEqual(['chain', 'chain', 'chain-stop', 'chain-stop'])
+  })
+
+  it('creates one new session for a child started before a crash left it without one', async () => {
+    const w = world()
+    w.epic(); w.kid(2)
+    w.delegate('es1')
+    w.failures.ChainSession = 1
+    const round = await w.round()
+    expect(round.chainFailed).toBe(1)
+    expect(w.record()!.started['kid-2']).toMatchObject({ identifier: 'WEB-2' })
+    expect(w.record()!.started['kid-2']).not.toHaveProperty('session')
+    expect(w.received).toEqual([])
+    await w.round(); await w.round()
+    expect(w.created).toEqual([{ issue: 'kid-2', id: 'cs-1' }])
+    expect(w.chainTriggers().map(trigger => trigger.meta.session)).toEqual(['cs-1'])
+  })
+
+  it('writes done before completing the epic, completes it on the next round after a failure, and answers with the children and pull requests', async () => {
+    const w = world()
+    w.epic(); w.kid(2); w.kid(3)
+    w.delegate('es1')
+    await w.round()
+    w.tickets[0]!.follows = [{ thread: 'github:41', own: true }]
+    w.close(2); w.close(3)
+    const seen: (string | undefined)[] = []
+    w.hooks.complete = id => { if (id === 'epic-1') seen.push(w.record()?.status) }
+    w.failures.issueUpdate = 1
+    await w.round()
+    expect(w.record()!.status).toBe('done')
+    expect(w.completed).toEqual([])
+    expect(w.state.get(CHAIN_KEYS.chains)).toEqual(['epic-1'])
+    await w.round()
+    expect(seen).toEqual(['done', 'done'])
+    expect(w.completed).toEqual(['epic-1'])
+    expect(w.record()!.status).toBe('done')
+    expect(w.state.get(CHAIN_KEYS.chains)).toEqual([])
+    expect(w.activities.at(-1)).toEqual({ session: 'es1', type: 'response', body: 'All sub-issues of WEB-10 are done.\n\n- WEB-2\n- WEB-3' })
+    await w.round()
+    expect(w.completed).toEqual(['epic-1'])
+  })
+
+  it('lists the pull requests of the children in the done response', async () => {
+    const w = world()
+    w.epic(); w.kid(2)
+    w.delegate('es1')
+    await w.round()
+    w.tickets[0]!.follows = [{ thread: 'github:41', own: true }, { thread: 'github:7', own: false }]
+    const threads: Record<string, Record<string, unknown>> = { 'github:41': { url: 'https://github.com/acme/widgets/pull/41' }, 'github:7': { url: 'https://github.com/acme/widgets/pull/7' } }
+    w.ctx.threads.get = key => threads[key] ? { meta: threads[key] } : undefined
+    await w.round()
+    w.close(2); await w.round()
+    expect(w.completed).toEqual(['epic-1'])
+    expect(w.activities.at(-1)!.body).toBe('All sub-issues of WEB-10 are done.\n\n- WEB-2 https://github.com/acme/widgets/pull/41')
+  })
+
+  it('keeps intake running when the chain read fails, and says so in health', async () => {
+    const w = world()
+    w.epic(); w.kid(2)
+    w.delegate('es1')
+    w.failures.ChainRead = 1
+    w.sessions.push(session('s9', '2026-11-12T10:20:00.000Z'))
+    const round = await w.round()
+    expect(round.chainFailed).toBe(1)
+    expect(w.received.map(trigger => trigger.id)).toEqual(['linear:session:s9'])
+    expect(w.state.get(CHAIN_KEYS.chains)).toEqual(['epic-1'])
+    await w.round()
+    expect(w.startedKids()).toEqual(['WEB-2'])
+  })
+
+  it('reads an epic at most every 30 seconds, and at once when one of its children\'s tickets ended', async () => {
+    const w = world(1)
+    w.epic(); w.kid(2); w.kid(3)
+    w.delegate('es1')
+    await w.round()
+    const reads = () => w.stub.calls.filter(call => call.query?.includes('ChainRead')).length
+    expect(reads()).toBe(1)
+    await w.round({ throttle: true })
+    expect(reads()).toBe(1)
+    await new Promise(resolve => setTimeout(resolve, 5))
+    w.close(2); await w.round({ throttle: true })
+    expect(reads()).toBe(2)
+    expect(w.startedKids()).toEqual(['WEB-2', 'WEB-3'])
+  })
+
+  it('starts no chain and takes nothing in for a session on an Issue with sub-issues that no person started', async () => {
+    const w = world()
+    w.epic(); w.kid(2)
+    w.delegate('es1', 'epic-1', null)
+    await w.round()
+    expect(w.received).toEqual([])
+    expect(w.record()).toBeUndefined()
+  })
+
+  it('offers chainParallel between 1 and 8, 2 by default, in the panel', () => {
+    expect(config().chainParallel).toBe(2)
+    expect(() => config({ chainParallel: 9 })).toThrow()
+    expect(() => config({ chainParallel: 0 })).toThrow()
+    expect(linearKind(linear().client).fields.find(field => field.key === 'chainParallel')).toMatchObject({ type: 'number', min: 1, max: 8 })
   })
 })
 

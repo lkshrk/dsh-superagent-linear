@@ -3,6 +3,7 @@ import { z } from 'zod'
 import { LinearClient, LinearError, stableUuid, type ActivityContent, type IssueContext, type IssueStatus, type Prompt, type Session, type Undelegation } from './linear-api.ts'
 import type { OutboundMessage, SourceContext, SourceKind, Trigger } from './types.ts'
 import { Waker } from './webhook.ts'
+import { CHAIN_KEYS, advanceChains, chainOf, epicPrompt, ownSession, startChain } from './linear-chain.ts'
 
 export const SOURCE = 'linear'
 export const HEALTH = 'linear'
@@ -19,6 +20,7 @@ export const LinearConfigSchema = z.object({
     .refine(team => team.repository !== '' || team.projects.length > 0, 'A repository or projects')).default([]),
   pollSeconds: z.number().int().min(5).max(600).default(10),
   completeOnMerge: z.boolean().default(true),
+  chainParallel: z.number().int().min(1).max(8).default(2),
 }).strict()
 export type LinearConfig = z.infer<typeof LinearConfigSchema>
 type TeamConfig = LinearConfig['teams'][number]
@@ -63,17 +65,17 @@ export const KEYS = {
 export const DELEGATION_INTERVAL_MS = 30_000
 /** How long after a ticket ended the Issue it started on is still watched for its close. */
 export const CLOSE_HORIZON_MS = 14 * 24 * 3600_000
-const threadOf = (issue: string) => `issue:${issue}`
+export const threadOf = (issue: string) => `issue:${issue}`
 /** The next cursor: five seconds before the newest item read, for writes Linear records late, and never behind the current one. */
 const cursorAfter = (since: string, newest: string | undefined) =>
   newest === undefined ? since : new Date(Math.max(Date.parse(since), Date.parse(newest) - 5000)).toISOString()
 
 type Issue = NonNullable<Session['issue']>
-function channel(issue: Issue, session: string, url: string) {
+export function channel(issue: Issue, session: string, url: string) {
   return { source: SOURCE, thread: `${SOURCE}:${threadOf(issue.id)}`,
     address: { session, issue: issue.id, team: issue.team.id, teamKey: issue.team.key, identifier: issue.identifier, url } }
 }
-function meta(issue: Issue, session: string, kind: string) {
+export function meta(issue: Issue, session: string, kind: string) {
   return { team: issue.team.id, teamKey: issue.team.key, issue: issue.id, identifier: issue.identifier, session, kind,
     ...issue.project ? { project: issue.project.id, ...issue.project.name ? { projectName: issue.project.name } : {} } : {},
     ...issue.delegate ? { delegate: issue.delegate.id } : {}, ...issue.labels?.nodes.length ? { labels: issue.labels.nodes.map(label => label.name) } : {} }
@@ -181,6 +183,8 @@ export function linearKind(client: LinearClient): SourceKind<LinearConfig> {
         { key: 'repository', type: 'text', label: { zh: '仓库', en: 'Repository' }, pattern: REPOSITORY.source.slice(1, -1), optional: true }] },
       { key: 'completeOnMerge', type: 'switch', advanced: true, label: { zh: 'PR 合并后完成 Issue', en: 'Complete the Issue once its pull request merges' } },
       { key: 'pollSeconds', type: 'number', advanced: true, min: 5, max: 600, label: { zh: '轮询间隔 / 秒', en: 'Polling interval / seconds' } },
+      { key: 'chainParallel', type: 'number', advanced: true, min: 1, max: 8, label: { zh: '同时进行的子 Issue', en: 'Sub-issues worked on at once' },
+        hint: { zh: '所有 epic 合计', en: 'Across all epics' } },
     ],
     health: [HEALTH],
     scope({ meta }, config) {
@@ -217,7 +221,21 @@ export function linearKind(client: LinearClient): SourceKind<LinearConfig> {
   }
 }
 
-export interface Round { sessions: number; prompts: number; unreadable: number; skipped: string[]; unknown: string[]; misrouted: string[]; unmapped: string[]; unverified: boolean; contextFailed: number }
+export interface Round { sessions: number; prompts: number; unreadable: number; skipped: string[]; unknown: string[]; misrouted: string[]; unmapped: string[]; unverified: boolean; contextFailed: number; chainFailed: number }
+
+export type Route = { kind: 'unlisted' | 'unmapped' | 'misrouted' } | { kind: 'served'; repository: string }
+// A listed team's Issue without a repository, or whose repository the GitHub Source does not serve, is left out; an unlisted team's goes to
+// receive, whose scope filters it.
+export function routeOf(ctx: SourceContext, config: LinearConfig, trigger: Trigger): Route {
+  const team = teamOf(config, trigger.meta)
+  if (!team) return { kind: 'unlisted' }
+  const named = repositoryFor(team, trigger.meta)
+  if (!named) return { kind: 'unmapped' }
+  const repository = servedRepository(ctx.deployment, named)
+  return repository ? { kind: 'served', repository } : { kind: 'misrouted' }
+}
+export const placed = (ctx: SourceContext, trigger: Trigger, repository: string | undefined): Trigger =>
+  repository && !sameName(repository, ctx.deployment.repository) ? { ...trigger, meta: { ...trigger.meta, repository } } : trigger
 
 /**
  * One polling round: new sessions, then new prompts, then the pull requests and merges of tickets that started on Linear.
@@ -231,18 +249,7 @@ export async function pollLinear(ctx: SourceContext, client: LinearClient, confi
   // Intake does not need the team list; without it the teams are only left unverified.
   const known = await client.teams(signal).catch((error: unknown) => { if (signal.aborted) throw error; return undefined })
   const unknown = known ? enabled.filter(team => !known.some(item => sameTeam(team, item.id, item.key))).map(teamName) : []
-  // A listed team's Issue without a repository, or whose repository the GitHub Source does not serve, is left out; an unlisted team's goes to
-  // receive, whose scope filters it.
-  const route = (trigger: Trigger): { kind: 'unlisted' | 'unmapped' | 'misrouted' } | { kind: 'served'; repository: string } => {
-    const team = teamOf(config, trigger.meta)
-    if (!team) return { kind: 'unlisted' }
-    const named = repositoryFor(team, trigger.meta)
-    if (!named) return { kind: 'unmapped' }
-    const repository = servedRepository(ctx.deployment, named)
-    return repository ? { kind: 'served', repository } : { kind: 'misrouted' }
-  }
-  const placed = (trigger: Trigger, repository: string | undefined): Trigger =>
-    repository && !sameName(repository, ctx.deployment.repository) ? { ...trigger, meta: { ...trigger.meta, repository } } : trigger
+  const route = (trigger: Trigger) => routeOf(ctx, config, trigger)
   // A prompt on an Issue with an open ticket follows that ticket, wherever the Issue has moved since.
   const openTicketOf = (issue: string) => {
     for (const ticket of ctx.tickets.open()) {
@@ -253,7 +260,7 @@ export async function pollLinear(ctx: SourceContext, client: LinearClient, confi
   }
   const viewer = await client.viewer(signal)
   const now = new Date().toISOString()
-  const round: Round = { sessions: 0, prompts: 0, unreadable: 0, skipped, unknown, misrouted: [], unmapped: [], unverified: !known, contextFailed: 0 }
+  const round: Round = { sessions: 0, prompts: 0, unreadable: 0, skipped, unknown, misrouted: [], unmapped: [], unverified: !known, contextFailed: 0, chainFailed: 0 }
   const sessionsSince = ctx.state.get<string>(KEYS.sessions)
   const promptsSince = ctx.state.get<string>(KEYS.prompts)
   // A first round starts from now: sessions from before the Source was switched on are not work for it.
@@ -268,11 +275,12 @@ export async function pollLinear(ctx: SourceContext, client: LinearClient, confi
   let failed = false
   for (const session of sessions.items) {
     if (signal.aborted) throw new Error('The Linear Source stopped during the read')
+    if (ownSession(ctx, session.id)) continue
     const found = sessionTrigger(session, viewer)
     if (!found) continue
     const where = route(found)
     if (where.kind === 'misrouted') { round.misrouted.push(String(found.meta.identifier)); continue }
-    const trigger = placed(found, where.kind === 'served' ? where.repository : undefined)
+    const trigger = placed(ctx, found, where.kind === 'served' ? where.repository : undefined)
     try {
       if (where.kind === 'unmapped') {
         round.unmapped.push(String(found.meta.identifier))
@@ -289,10 +297,18 @@ export async function pollLinear(ctx: SourceContext, client: LinearClient, confi
           .catch((error: unknown) => { if (!(error instanceof LinearError && error.gone)) throw error })
         ctx.state.set(KEYS.seen(session.id), true)
       }
+      if (where.kind === 'served' && ctx.state.get(CHAIN_KEYS.run(session.id))) continue
       // The cursor replays the newest session every round; a stored Trigger needs no second read.
-      const context = where.kind === 'served' && !ctx.triggers.get(trigger.id)
+      const fresh = where.kind === 'served' && !ctx.triggers.get(trigger.id)
+      const context = fresh
         ? await client.issueContext(String(trigger.meta.issue), signal).catch((error: unknown) => { if (signal.aborted) throw error; round.contextFailed++; return undefined })
         : undefined
+      // An Issue with sub-issues is worked through them; it never gets a worker of its own.
+      if (context?.children.nodes.length) {
+        if (found.human) { await startChain(ctx, client, session, context, viewer, config.chainParallel, signal); round.sessions++ }
+        continue
+      }
+      if (fresh && !context && chainOf(ctx, String(trigger.meta.issue))) throw new Error('The sub-issues of a chain\'s epic were not readable')
       await ctx.receive(where.kind === 'served' ? withMode(withContext(trigger, context), context) : trigger)
       describe(ctx, trigger)
       round.sessions++
@@ -313,16 +329,19 @@ export async function pollLinear(ctx: SourceContext, client: LinearClient, confi
     if (!found) continue
     const open = openTicketOf(String(found.meta.issue))
     let trigger: Trigger
+    let served = false
     if (open) {
       const { team, teamKey } = open.origin.meta
-      trigger = placed({ ...found, meta: { ...found.meta, team, teamKey } }, open.ticket.execution?.repository ?? repositoryMeta(open.origin))
+      trigger = placed(ctx, { ...found, meta: { ...found.meta, team, teamKey } }, open.ticket.execution?.repository ?? repositoryMeta(open.origin))
     } else {
       const where = route(found)
       if (where.kind === 'misrouted') { round.misrouted.push(String(found.meta.identifier)); continue }
       if (where.kind === 'unmapped') { round.unmapped.push(String(found.meta.identifier)); continue }
-      trigger = placed(found, where.kind === 'served' ? where.repository : undefined)
+      trigger = placed(ctx, found, where.kind === 'served' ? where.repository : undefined)
+      served = where.kind === 'served'
     }
     try {
+      if (served && await epicPrompt(ctx, client, trigger, signal)) continue
       await ctx.receive(trigger)
       round.prompts++
     } catch (error) {
@@ -334,6 +353,7 @@ export async function pollLinear(ctx: SourceContext, client: LinearClient, confi
 
   await followTickets(ctx, client, config, signal)
   await followIssues(ctx, client, viewer, signal)
+  await advanceChains(ctx, client, config, viewer, round, signal)
   if (failed || sessionsFailed) throw new Error('A Linear session or prompt was not taken in; the next round reads it again')
   return round
 }
@@ -481,8 +501,9 @@ export async function watchLinear(ctx: SourceContext, client: LinearClient, sign
         const misrouted = round.misrouted.length ? `; left out ${list(round.misrouted)}` : ''
         const unmapped = round.unmapped.length ? `; no repository for ${list(round.unmapped)}: map their project or give the team a repository` : ''
         const contextFailed = round.contextFailed ? `; parent and sub-issues unreadable: ${round.contextFailed}` : ''
+        const chainFailed = round.chainFailed ? `; sub-issue chains not advanced: ${round.chainFailed}` : ''
         report({ state: round.skipped.length || round.unknown.length ? 'error' : 'ready', at,
-          detail: `${round.sessions} sessions, ${round.prompts} prompts, ${round.unreadable} unreadable${contextFailed}${skipped}${misrouted}${unmapped}${unknown}` })
+          detail: `${round.sessions} sessions, ${round.prompts} prompts, ${round.unreadable} unreadable${contextFailed}${chainFailed}${skipped}${misrouted}${unmapped}${unknown}` })
       } catch (error) {
         failures++
         if (!signal.aborted) console.log(`dsh-superagent-linear: poll failed (${failures} in a row): ${String(error)}`)

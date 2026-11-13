@@ -76,6 +76,23 @@ const IssueContextSchema = z.looseObject({
     pageInfo: z.looseObject({ hasNextPage: z.boolean() }) }),
 })
 export type IssueContext = z.infer<typeof IssueContextSchema>
+const EPIC_CHECK = 'query EpicCheck($id: String!) { issue(id: $id) { children(first: 1) { nodes { id } } } }'
+const CHAIN_READ = `query ChainRead($id: String!) { issue(id: $id) { id identifier state { type } delegate { id }
+  children(first: 30) { nodes { id identifier title state { type } subIssueSortOrder
+    inverseRelations(first: 20) { nodes { type issue { id identifier state { type } parent { id } } } pageInfo { hasNextPage } } }
+  pageInfo { hasNextPage } } } }`
+const CHAIN_CHILD = `query ChainChild($id: String!) { issue(id: $id) { ${ISSUE_FIELDS} } }`
+const CHAIN_SESSION = `mutation ChainSession($issueId: String!) { agentSessionCreateOnIssue(input: { issueId: $issueId }) {
+  success agentSession { id url createdAt } } }`
+const State = z.looseObject({ type: z.string() }).nullish()
+const ChainSchema = z.looseObject({ id: z.string(), identifier: z.string(), state: State, delegate: z.looseObject({ id: z.string() }).nullish(),
+  children: z.looseObject({ nodes: z.array(z.looseObject({ id: z.string(), identifier: z.string(), title: z.string(), state: State,
+    subIssueSortOrder: z.number().nullish(), inverseRelations: z.looseObject({ nodes: z.array(z.looseObject({ type: z.string(),
+      issue: z.looseObject({ id: z.string(), identifier: z.string(), state: State, parent: z.looseObject({ id: z.string() }).nullish() }).nullish() })),
+    pageInfo: z.looseObject({ hasNextPage: z.boolean() }) }) })), pageInfo: z.looseObject({ hasNextPage: z.boolean() }) }),
+})
+export type Chain = z.infer<typeof ChainSchema>
+export type Issue = z.infer<typeof Issue>
 
 /** An Issue's delegate, and when it closed (moved to a completed or canceled state), if it is closed. */
 export interface IssueStatus { delegate: string | null; closedAt?: string }
@@ -233,6 +250,26 @@ export class LinearClient {
   }
   async issueContext(issue: string, signal?: AbortSignal): Promise<IssueContext> {
     return z.object({ issue: IssueContextSchema }).parse(await this.request(ISSUE_CONTEXT, { id: issue }, signal)).issue
+  }
+  /** Whether the issue has at least one sub-issue. */
+  async hasChildren(issue: string, signal?: AbortSignal): Promise<boolean> {
+    return z.object({ issue: z.object({ children: z.object({ nodes: z.array(z.unknown()) }) }) })
+      .parse(await this.request(EPIC_CHECK, { id: issue }, signal)).issue.children.nodes.length > 0
+  }
+  /** An epic's delegate and state, and its sub-issues with their states, order and blockers. */
+  async chainRead(epic: string, signal?: AbortSignal): Promise<Chain> {
+    return z.object({ issue: ChainSchema }).parse(await this.request(CHAIN_READ, { id: epic }, signal)).issue
+  }
+  async issue(id: string, signal?: AbortSignal): Promise<Issue> {
+    return z.object({ issue: Issue }).parse(await this.request(CHAIN_CHILD, { id }, signal)).issue
+  }
+  /** Opens a new agent session on the issue in the app's name; no delegation needed. */
+  async createSession(issue: string, signal?: AbortSignal): Promise<{ id: string; url?: string | null; createdAt: string }> {
+    const data = z.object({ agentSessionCreateOnIssue: z.object({ success: z.boolean(),
+      agentSession: z.looseObject({ id: z.string(), url: z.string().nullish(), createdAt: z.string() }).nullish() }) })
+      .parse(await this.request(CHAIN_SESSION, { issueId: issue }, signal)).agentSessionCreateOnIssue
+    if (!data.success || !data.agentSession) throw new LinearError('Linear did not create the agent session')
+    return data.agentSession
   }
   /** Moves the issue to its team's first completed state unless it is completed or canceled already. */
   async complete(issue: string, signal?: AbortSignal): Promise<boolean> {
