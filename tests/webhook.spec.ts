@@ -50,11 +50,30 @@ describe('Linear webhook', () => {
       expect(wake).not.toHaveBeenCalled()
     }
   })
-  it('refuses a replayed delivery whose timestamp is over a minute off', async () => {
-    const body = delivery(NOW - 61_000)
-    const { res, wake } = await call(request('POST', body, { 'linear-signature': sign(body) }))
+  it('answers 200 to a signed delivery over a minute off without waking, so a retry is not counted as a failure', async () => {
+    for (const at of [NOW - 61_000, NOW + 61_000]) {
+      const body = delivery(at)
+      const { res, wake } = await call(request('POST', body, { 'linear-signature': sign(body) }))
+      expect(res.status).toBe(200)
+      expect(wake).not.toHaveBeenCalled()
+    }
+  })
+  it('refuses a tampered body under the original signature', async () => {
+    const body = delivery()
+    const { res, wake } = await call(request('POST', body.replace('created', 'prompted'), { 'linear-signature': sign(body) }))
     expect(res.status).toBe(401)
     expect(wake).not.toHaveBeenCalled()
+  })
+  it('answers 400 to a signed delivery without a numeric timestamp', async () => {
+    for (const body of [JSON.stringify({ type: 'AgentSessionEvent' }), JSON.stringify({ webhookTimestamp: String(NOW) }), 'null']) {
+      const { res, wake } = await call(request('POST', body, { 'linear-signature': sign(body) }))
+      expect(res.status).toBe(400)
+      expect(wake).not.toHaveBeenCalled()
+    }
+  })
+  it('answers 413 from the declared length before reading the body', async () => {
+    const { res } = await call(request('POST', '{}', { 'content-length': String(1024 * 1024 + 1) }))
+    expect(res.status).toBe(413)
   })
   it('answers 405 to anything but POST', async () => {
     const { res, wake } = await call(request('GET', ''))
@@ -83,15 +102,26 @@ describe('Linear webhook', () => {
 })
 
 describe('Waker', () => {
-  it('ends a wait early when woken, and a wake between waits ends the next one at once', async () => {
+  it('ends a wait once woken, but not before the minimum gap', async () => {
     const waker = new Waker(), signal = new AbortController().signal
-    const waiting = waker.wait(60_000, signal)
+    const started = Date.now()
+    const waiting = waker.wait(60_000, signal, 100)
     waker.wake()
     await waiting
-    waker.wake()
+    const took = Date.now() - started
+    expect(took).toBeGreaterThanOrEqual(90)
+    expect(took).toBeLessThan(1000)
+  })
+  it('shortens the next wait to the minimum gap after a wake between waits, and coalesces repeated wakes', async () => {
+    const waker = new Waker(), signal = new AbortController().signal
+    waker.wake(); waker.wake()
     const started = Date.now()
-    await waker.wait(60_000, signal)
+    await waker.wait(60_000, signal, 50)
     expect(Date.now() - started).toBeLessThan(1000)
+    const second = Date.now()
+    const waiting = waker.wait(200, signal, 50)
+    await waiting
+    expect(Date.now() - second).toBeGreaterThanOrEqual(190)
   })
   it('ends a wait when the signal aborts', async () => {
     const waker = new Waker(), controller = new AbortController()

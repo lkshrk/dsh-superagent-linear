@@ -37,6 +37,7 @@ export function apply(ctx: PluginContext): void {
       .catch((error: unknown) => { context.report(HEALTH, { state: 'error', detail: String(error) }) })
     return async () => { controller.abort(); await running }
   })
+  if (!ctx.inject) console.log(`${name}: this DSH cannot inject optional services, so ${WEBHOOK_PATH} is not served`)
   ctx.inject?.(['webServer'], child => {
     child.effect(() => child.webServer!.register({ kind: 'exact', path: WEBHOOK_PATH, handler: (req, res) => handleWebhook(req, res, {
       secretFile: () => source?.config<LinearConfig>(SOURCE)?.webhookSecretFile ?? '', wake: () => { waker.wake() } }) }),
