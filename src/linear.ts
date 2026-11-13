@@ -10,8 +10,12 @@ const REPOSITORY = /^[A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+$/
 export const LinearConfigSchema = z.object({
   clientIdFile: z.string().trim().refine(path => path === '' || path.startsWith('/'), 'An absolute path').default(''),
   clientSecretFile: z.string().trim().refine(path => path === '' || path.startsWith('/'), 'An absolute path').default(''),
-  teams: z.array(z.object({ id: z.string().trim().default(''), key: z.string().trim().default(''), repository: z.string().trim().regex(REPOSITORY),
-    enabled: z.boolean().default(true) }).strict().refine(team => team.id !== '' || team.key !== '', 'A team id or key')).default([]),
+  teams: z.array(z.object({ id: z.string().trim().default(''), key: z.string().trim().default(''),
+    repository: z.union([z.literal(''), z.string().trim().regex(REPOSITORY)]).default(''),
+    projects: z.array(z.object({ id: z.string().trim().default(''), name: z.string().trim().default(''), repository: z.string().trim().regex(REPOSITORY) })
+      .strict().refine(project => project.id !== '' || project.name !== '', 'A project id or name')).default([]),
+    enabled: z.boolean().default(true) }).strict().refine(team => team.id !== '' || team.key !== '', 'A team id or key')
+    .refine(team => team.repository !== '' || team.projects.length > 0, 'A repository or projects')).default([]),
   pollSeconds: z.number().int().min(5).max(600).default(10),
   completeOnMerge: z.boolean().default(true),
 }).strict()
@@ -27,6 +31,17 @@ const sameName = (a: string, b: string) => a.toLowerCase() === b.toLowerCase()
 /** The deployment's canonical name for `repository`, or undefined when the GitHub Source does not serve it. */
 export function servedRepository(deployment: SourceContext['deployment'], repository: string): string | undefined {
   return (deployment.repositories ?? [deployment.repository]).find(name => sameName(name, repository))
+}
+type ProjectConfig = TeamConfig['projects'][number]
+/** The project entry an Issue's project matches: by id, else by name ignoring case for an entry that names no id. */
+export function projectOf(team: TeamConfig, project: { id?: unknown; name?: unknown }): ProjectConfig | undefined {
+  return team.projects.find(entry => entry.id !== '' && entry.id === project.id)
+    ?? team.projects.find(entry => entry.id === '' && sameName(entry.name, String(project.name ?? '')))
+}
+/** The repository an Issue of `team` works in: its project's, else the team's; undefined when neither names one. */
+export function repositoryFor(team: TeamConfig, meta: Record<string, unknown>): string | undefined {
+  const project = meta.project ? projectOf(team, { id: meta.project, name: meta.projectName }) : undefined
+  return project?.repository || team.repository || undefined
 }
 /** The enabled configured team a Trigger's Issue belongs to. */
 export function teamOf(config: LinearConfig, meta: Record<string, unknown>): TeamConfig | undefined {
@@ -56,6 +71,7 @@ function channel(issue: Issue, session: string, url: string) {
 }
 function meta(issue: Issue, session: string, kind: string) {
   return { team: issue.team.id, teamKey: issue.team.key, issue: issue.id, identifier: issue.identifier, session, kind,
+    ...issue.project ? { project: issue.project.id, ...issue.project.name ? { projectName: issue.project.name } : {} } : {},
     ...issue.delegate ? { delegate: issue.delegate.id } : {} }
 }
 
@@ -122,7 +138,7 @@ export function linearKind(client: LinearClient): SourceKind<LinearConfig> {
       { key: 'teams', type: 'rows', label: { zh: '接收的团队', en: 'Teams' }, hint: { zh: '团队 key（例如 ENG）或 id 填一个即可', en: 'A team key, such as ENG, or its id' }, columns: [
         { key: 'key', type: 'text', label: { zh: '团队 key', en: 'Team key' }, optional: true },
         { key: 'id', type: 'text', label: { zh: '团队 id', en: 'Team id' }, optional: true },
-        { key: 'repository', type: 'text', label: { zh: '仓库', en: 'Repository' }, pattern: REPOSITORY.source.slice(1, -1) }] },
+        { key: 'repository', type: 'text', label: { zh: '仓库', en: 'Repository' }, pattern: REPOSITORY.source.slice(1, -1), optional: true }] },
       { key: 'completeOnMerge', type: 'switch', advanced: true, label: { zh: 'PR 合并后完成 Issue', en: 'Complete the Issue once its pull request merges' } },
       { key: 'pollSeconds', type: 'number', advanced: true, min: 5, max: 600, label: { zh: '轮询间隔 / 秒', en: 'Polling interval / seconds' } },
     ],
@@ -159,7 +175,7 @@ export function linearKind(client: LinearClient): SourceKind<LinearConfig> {
   }
 }
 
-export interface Round { sessions: number; prompts: number; unreadable: number; skipped: string[]; unknown: string[]; misrouted: string[]; unverified: boolean }
+export interface Round { sessions: number; prompts: number; unreadable: number; skipped: string[]; unknown: string[]; misrouted: string[]; unmapped: string[]; unverified: boolean }
 
 /**
  * One polling round: new sessions, then new prompts, then the pull requests and merges of tickets that started on Linear.
@@ -167,21 +183,27 @@ export interface Round { sessions: number; prompts: number; unreadable: number; 
  */
 export async function pollLinear(ctx: SourceContext, client: LinearClient, config: LinearConfig, signal: AbortSignal): Promise<Round> {
   const enabled = config.teams.filter(team => team.enabled)
-  const skipped = enabled.filter(team => !servedRepository(ctx.deployment, team.repository)).map(teamName)
+  const skipped = enabled.flatMap(team => [
+    ...team.repository && !servedRepository(ctx.deployment, team.repository) ? [teamName(team)] : [],
+    ...team.projects.filter(project => !servedRepository(ctx.deployment, project.repository)).map(project => `${teamName(team)}/${project.name || project.id}`)])
   // Intake does not need the team list; without it the teams are only left unverified.
   const known = await client.teams(signal).catch((error: unknown) => { if (signal.aborted) throw error; return undefined })
   const unknown = known ? enabled.filter(team => !known.some(item => sameTeam(team, item.id, item.key))).map(teamName) : []
-  // A listed team whose repository the GitHub Source does not serve is left out; an unlisted one goes to receive, whose scope filters it.
-  const repositoryOf = (trigger: Trigger) => { const team = teamOf(config, trigger.meta); return team && servedRepository(ctx.deployment, team.repository) }
-  const misrouted = (trigger: Trigger) => teamOf(config, trigger.meta) !== undefined && !repositoryOf(trigger)
-  const served = (trigger: Trigger) => repositoryOf(trigger) !== undefined
-  const placed = (trigger: Trigger): Trigger => {
-    const repository = repositoryOf(trigger)
-    return repository && !sameName(repository, ctx.deployment.repository) ? { ...trigger, meta: { ...trigger.meta, repository } } : trigger
+  // A listed team's Issue without a repository, or whose repository the GitHub Source does not serve, is left out; an unlisted team's goes to
+  // receive, whose scope filters it.
+  const route = (trigger: Trigger): { kind: 'unlisted' | 'unmapped' | 'misrouted' } | { kind: 'served'; repository: string } => {
+    const team = teamOf(config, trigger.meta)
+    if (!team) return { kind: 'unlisted' }
+    const named = repositoryFor(team, trigger.meta)
+    if (!named) return { kind: 'unmapped' }
+    const repository = servedRepository(ctx.deployment, named)
+    return repository ? { kind: 'served', repository } : { kind: 'misrouted' }
   }
+  const placed = (trigger: Trigger, repository: string | undefined): Trigger =>
+    repository && !sameName(repository, ctx.deployment.repository) ? { ...trigger, meta: { ...trigger.meta, repository } } : trigger
   const viewer = await client.viewer(signal)
   const now = new Date().toISOString()
-  const round: Round = { sessions: 0, prompts: 0, unreadable: 0, skipped, unknown, misrouted: [], unverified: !known }
+  const round: Round = { sessions: 0, prompts: 0, unreadable: 0, skipped, unknown, misrouted: [], unmapped: [], unverified: !known }
   const sessionsSince = ctx.state.get<string>(KEYS.sessions)
   const promptsSince = ctx.state.get<string>(KEYS.prompts)
   // A first round starts from now: sessions from before the Source was switched on are not work for it.
@@ -198,11 +220,21 @@ export async function pollLinear(ctx: SourceContext, client: LinearClient, confi
     if (signal.aborted) throw new Error('The Linear Source stopped during the read')
     const found = sessionTrigger(session, viewer)
     if (!found) continue
-    const trigger = placed(found)
-    if (misrouted(trigger)) { round.misrouted.push(String(trigger.meta.identifier)); continue }
+    const where = route(found)
+    if (where.kind === 'misrouted') { round.misrouted.push(String(found.meta.identifier)); continue }
+    const trigger = placed(found, where.kind === 'served' ? where.repository : undefined)
     try {
+      if (where.kind === 'unmapped') {
+        round.unmapped.push(String(found.meta.identifier))
+        if (!ctx.state.get(KEYS.seen(session.id))) {
+          await client.activity(session.id, stableUuid(`unmapped:${session.id}`), { type: 'error', body: unmappedText(found) }, false, signal)
+            .catch((error: unknown) => { if (!(error instanceof LinearError && error.gone)) throw error })
+          ctx.state.set(KEYS.seen(session.id), true)
+        }
+        continue
+      }
       // Linear marks a session unresponsive when nothing answers within seconds; an evaluation takes longer.
-      if (served(trigger) && !ctx.state.get(KEYS.seen(session.id))) {
+      if (where.kind === 'served' && !ctx.state.get(KEYS.seen(session.id))) {
         await client.activity(session.id, stableUuid(`seen:${session.id}`), { type: 'thought', body: 'Received.' }, true, signal)
           .catch((error: unknown) => { if (!(error instanceof LinearError && error.gone)) throw error })
         ctx.state.set(KEYS.seen(session.id), true)
@@ -225,8 +257,10 @@ export async function pollLinear(ctx: SourceContext, client: LinearClient, confi
     if (signal.aborted) throw new Error('The Linear Source stopped during the read')
     const found = promptTrigger(prompt, viewer)
     if (!found) continue
-    const trigger = placed(found)
-    if (misrouted(trigger)) { round.misrouted.push(String(trigger.meta.identifier)); continue }
+    const where = route(found)
+    if (where.kind === 'misrouted') { round.misrouted.push(String(found.meta.identifier)); continue }
+    if (where.kind === 'unmapped') { round.unmapped.push(String(found.meta.identifier)); continue }
+    const trigger = placed(found, where.kind === 'served' ? where.repository : undefined)
     try {
       await ctx.receive(trigger)
       round.prompts++
@@ -241,6 +275,11 @@ export async function pollLinear(ctx: SourceContext, client: LinearClient, confi
   await followDelegation(ctx, client, viewer, signal)
   if (failed || sessionsFailed) throw new Error('A Linear session or prompt was not taken in; the next round reads it again')
   return round
+}
+
+function unmappedText(trigger: Trigger): string {
+  const project = trigger.meta.projectName ?? trigger.meta.project
+  return `Not taken in: team ${String(trigger.meta.teamKey)} names no repository ${project ? `for project ${String(project)}` : 'for Issues without a project'}.`
 }
 
 function describe(ctx: SourceContext, trigger: Trigger): void {
@@ -339,9 +378,11 @@ export async function watchLinear(ctx: SourceContext, client: LinearClient, sign
         failures = 0
         const skipped = round.skipped.length ? `; teams ${round.skipped.join(', ')} skipped: their repository is not one the GitHub Source serves` : ''
         const unknown = round.unknown.length ? `; teams ${round.unknown.join(', ')} not found in Linear` : round.unverified ? '; teams unverified: Linear\'s team list was not readable' : ''
-        const misrouted = round.misrouted.length ? `; left out ${round.misrouted.slice(0, 10).join(', ')}${round.misrouted.length > 10 ? ' and more' : ''}` : ''
+        const list = (items: string[]) => `${items.slice(0, 10).join(', ')}${items.length > 10 ? ' and more' : ''}`
+        const misrouted = round.misrouted.length ? `; left out ${list(round.misrouted)}` : ''
+        const unmapped = round.unmapped.length ? `; no repository for ${list(round.unmapped)}: map their project or give the team a repository` : ''
         ctx.report(HEALTH, { state: round.skipped.length || round.unknown.length ? 'error' : 'ready', at,
-          detail: `${round.sessions} sessions, ${round.prompts} prompts, ${round.unreadable} unreadable${skipped}${misrouted}${unknown}` })
+          detail: `${round.sessions} sessions, ${round.prompts} prompts, ${round.unreadable} unreadable${skipped}${misrouted}${unmapped}${unknown}` })
       } catch (error) {
         failures++
         // A refused token or a rate limit needs no three rounds to show: no request can succeed until it passes.

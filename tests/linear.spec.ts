@@ -3,6 +3,7 @@ import { mkdtempSync, rmSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
+import type { z } from 'zod'
 import { LinearClient, MINT_INTERVAL_MS, SCOPE, stableUuid, type Prompt, type Session } from '../src/linear-api.ts'
 import { DELEGATION_INTERVAL_MS, KEYS, LinearConfigSchema, pullOf, undelegationTrigger, linearKind, pollLinear, promptTrigger, sendLinear, sessionTrigger, watchLinear, type LinearConfig } from '../src/linear.ts'
 import { apply } from '../src/index.ts'
@@ -16,7 +17,7 @@ beforeEach(() => {
 })
 afterEach(() => { rmSync(dir, { recursive: true, force: true }) })
 
-const config = (overrides: Partial<LinearConfig> = {}): LinearConfig => LinearConfigSchema.parse({
+const config = (overrides: Partial<z.input<typeof LinearConfigSchema>> = {}): LinearConfig => LinearConfigSchema.parse({
   clientIdFile: join(dir, 'client-id'), clientSecretFile: join(dir, 'client-secret'),
   teams: [{ key: 'WEB', repository: 'acme/widgets' }, { key: 'OPS', repository: 'acme/other' }], ...overrides })
 const KEYS_OF: Record<string, string> = { [TEAM]: 'WEB', [OTHER_TEAM]: 'OPS', elsewhere: 'ELSE' }
@@ -203,6 +204,83 @@ describe('polling', () => {
     expect(round).toMatchObject({ sessions: 0, skipped: ['OPS'], misrouted: ['OPS-2'] })
     expect(h.received).toEqual([])
   })
+  describe('projects', () => {
+    const inProject = (n: number, project: { id: string; name?: string } | null, team = TEAM) => ({ ...issue(team, n), project })
+    const repositories = ['acme/widgets', 'acme/other']
+    async function take(teams: z.input<typeof LinearConfigSchema>['teams'], sessions: Session[], prompts: Prompt[] = []) {
+      const stub = sources(sessions, prompts)
+      const h = context({ repositories })
+      h.state.set(KEYS.sessions, T0); h.state.set(KEYS.prompts, T0)
+      const round = await pollLinear(h.ctx, stub.client, config({ teams }), signal())
+      return { ...h, ...stub, round }
+    }
+
+    it('sends two projects of one team to two repositories, by project id, else by name ignoring case for an entry without id', async () => {
+      const { received } = await take([{ key: 'WEB', projects: [{ id: 'p-a', repository: 'acme/widgets' }, { name: 'Ops Tools', repository: 'acme/other' },
+        { id: 'p-b', name: 'Alpha', repository: 'acme/other' }] }], [
+        session('s1', '2026-11-12T10:01:00.000Z', { issue: inProject(1, { id: 'p-a', name: 'Site' }) }),
+        session('s2', '2026-11-12T10:02:00.000Z', { issue: inProject(2, { id: 'p-x', name: 'ops tools' }) }),
+        session('s3', '2026-11-12T10:03:00.000Z', { issue: inProject(3, { id: 'p-c', name: 'Alpha' }) })])
+      expect(received.map(trigger => [trigger.id, trigger.meta.repository, trigger.meta.project])).toEqual([
+        ['linear:session:s1', undefined, 'p-a'], ['linear:session:s2', 'acme/other', 'p-x']])
+    })
+
+    it('uses the team\'s repository for an Issue without a project or with an unmapped one', async () => {
+      const { received, round } = await take([{ key: 'WEB', repository: 'acme/widgets', projects: [{ id: 'p-o', repository: 'acme/other' }] }], [
+        session('s1', '2026-11-12T10:01:00.000Z', { issue: inProject(1, null) }),
+        session('s2', '2026-11-12T10:02:00.000Z', { issue: inProject(2, { id: 'p-z', name: 'Else' }) }),
+        session('s3', '2026-11-12T10:03:00.000Z', { issue: inProject(3, { id: 'p-o', name: 'Ops' }) })])
+      expect(received.map(trigger => trigger.meta.repository)).toEqual([undefined, undefined, 'acme/other'])
+      expect(round.unmapped).toEqual([])
+    })
+
+    it('takes in nothing for an unmapped project of a team without a repository, says why in the session once, and in health', async () => {
+      const unmapped = session('s1', '2026-11-12T10:01:00.000Z', { issue: inProject(1, { id: 'p-z', name: 'Else' }) })
+      const h = await take([{ key: 'WEB', projects: [{ id: 'p-a', repository: 'acme/widgets' }] }], [unmapped,
+        session('s2', '2026-11-12T10:02:00.000Z', { issue: inProject(2, null) })],
+        [prompt('a1', '2026-11-12T10:04:00.000Z', { agentSession: { id: 's1', issue: inProject(1, { id: 'p-z', name: 'Else' }) } })])
+      expect(h.received).toEqual([])
+      expect(h.round).toMatchObject({ sessions: 0, prompts: 0, unmapped: ['WEB-1', 'WEB-2', 'WEB-1'], misrouted: [], skipped: [] })
+      expect(h.activities.map(activity => [activity.agentSessionId, activity.content])).toEqual([
+        ['s1', { type: 'error', body: 'Not taken in: team WEB names no repository for project Else.' }],
+        ['s2', { type: 'error', body: 'Not taken in: team WEB names no repository for Issues without a project.' }]])
+      h.state.set(KEYS.sessions, T0)
+      await pollLinear(h.ctx, h.client, config({ teams: [{ key: 'WEB', projects: [{ id: 'p-a', repository: 'acme/widgets' }] }] }), signal())
+      expect(h.activities).toHaveLength(2)
+    })
+
+    it('names a project whose repository is not listed in health, and leaves its Issues out', async () => {
+      const { received, round } = await take([{ key: 'WEB', repository: 'acme/widgets', projects: [{ name: 'Lab', repository: 'acme/lab' }] }],
+        [session('s1', '2026-11-12T10:01:00.000Z', { issue: inProject(1, { id: 'p-l', name: 'lab' }) })])
+      expect(received).toEqual([])
+      expect(round).toMatchObject({ skipped: ['WEB/Lab'], misrouted: ['WEB-1'] })
+    })
+
+    it('keeps the ticket\'s repository after its Issue moves to a project of another repository', async () => {
+      const teams = [{ key: 'WEB', repository: 'acme/widgets', projects: [{ id: 'p-o', repository: 'acme/other' }] }]
+      const start = await take(teams, [session('s1', '2026-11-12T10:01:00.000Z', { issue: { ...inProject(1, { id: 'p-o' }), delegate: { id: VIEWER } } })])
+      const origin = start.received[0]!
+      expect(origin.meta.repository).toBe('acme/other')
+      const ticket: Ticket = { id: 't1', origin: { triggerId: origin.id, triggerIds: [origin.id] }, follows: [{ thread: 'github:acme/other#3', own: true }] }
+      const updates: { input: { addedExternalUrls: { label: string }[] } }[] = []
+      const stub = linear({ agentSessions: () => ({ agentSessions: page([]) }),
+        agentActivities: () => ({ agentActivities: page([prompt('a1', '2026-11-12T10:05:00.000Z', { agentSession: { id: 's1', issue: inProject(1, null) } })]) }),
+        agentSessionUpdate: variables => { updates.push(variables as never); return { agentSessionUpdate: { success: true } } },
+        'issues(': () => ({ issues: { nodes: [{ id: 'issue-1', delegate: null }] } }), history: () => ({ issue: { history: { nodes: [] } } }) })
+      const h = context({ tickets: [ticket], triggers: [origin], repositories, threads: { 'github:acme/other#3': { url: 'https://github.com/acme/other/pull/3' } } })
+      h.state.set(KEYS.sessions, T0); h.state.set(KEYS.prompts, T0)
+      await pollLinear(h.ctx, stub.client, config({ teams }), signal())
+      expect(h.received.map(trigger => [trigger.meta.kind, trigger.meta.repository])).toEqual([['prompt', undefined], ['undelegated', 'acme/other']])
+      expect(updates.map(update => update.input.addedExternalUrls[0]!.label)).toEqual(['Pull request #3'])
+    })
+
+    it('needs a repository or projects on a team, and an id or name on a project', () => {
+      expect(() => LinearConfigSchema.parse({ teams: [{ key: 'WEB' }] })).toThrow('A repository or projects')
+      expect(() => LinearConfigSchema.parse({ teams: [{ key: 'WEB', projects: [{ repository: 'acme/widgets' }] }] })).toThrow('A project id or name')
+      expect(LinearConfigSchema.parse({ teams: [{ key: 'WEB', repository: 'acme/widgets' }] }).teams[0]).toMatchObject({ projects: [] })
+    })
+  })
+
   it('keeps its cursors where they are after a round with nothing new', async () => {
     const stub = sources([])
     const h = context()

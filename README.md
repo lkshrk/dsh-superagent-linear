@@ -34,7 +34,23 @@ Set these on the Linear Source in the panel, or in the plugin configuration's `m
 | Key | Meaning |
 | --- | --- |
 | `clientIdFile`, `clientSecretFile` | Absolute paths of the files holding the app's client id and secret |
-| `teams` | `[{ key or id, repository, enabled }]`: the teams whose sessions are received, each by its key (such as `ENG`) or id, and the repository it works in: the GitHub Source's `repository` or one of its `repositories`, compared ignoring case. An entry with an id matches that team only, with its key as its name; a key alone matches whichever team holds it; `enabled` defaults to on. Each team is one row of the Source's admission table. A team whose `repository` the GitHub Source does not list, or that Linear does not know, is left out, and the Source's health says so |
+| `teams` | `[{ key or id, repository, projects, enabled }]`: the teams whose sessions are received, each by its key (such as `ENG`) or id. An entry with an id matches that team only, with its key as its name; a key alone matches whichever team holds it; `enabled` defaults to on. Each team is one row of the Source's admission table. A team Linear does not know is left out, and the Source's health says so |
+| `teams[].repository` | The repository the team's Issues work in, unless their project names another: the GitHub Source's `repository` or one of its `repositories`, compared ignoring case. Optional when `projects` is set |
+| `teams[].projects` | `[{ id or name, repository }]`: a repository per Linear project of the team. An entry with an id matches that project only; an entry with only a name matches a project of that name, ignoring case. An Issue in a listed project works in the project's repository, any other Issue in the team's. Not shown in the panel; editing the team there keeps them |
+
+A team needs a `repository`, `projects`, or both. A team or project whose repository the GitHub Source does not list is left out, and the Source's health names it (`ENG/Mobile` for a project).
+
+```yaml
+teams:
+  - key: ENG
+    repository: acme/web          # Issues without a listed project
+    projects:
+      - id: 6a1d3f0e-9c2b-4e57-8f13-2b0c7d9e4a61
+        repository: acme/api
+      - name: Mobile
+        repository: acme/mobile
+```
+
 | `pollSeconds` | Polling interval, default 10; see Rate limits |
 | `completeOnMerge` | Move the Issue to its team's first completed state once the ticket's own pull request merged, unless it is completed already; default on |
 
@@ -45,7 +61,8 @@ In the Policy, list the Linear user ids who may originate work under **Eval → 
 - **Intake.** Each round reads the sessions created since its cursor, then the prompt activities people wrote since its cursor, oldest first. A cursor moves only once every item it passes was taken in, and Trigger ids (`linear:session:<id>`, `linear:prompt:<id>`) make a replay harmless. The first round after the Source is switched on starts from that moment.
 - **Answering at once.** Linear expects an agent to answer a session within about 10 seconds, so a new session on a listed team gets an ephemeral thought, "Received.", when the Source first sees it. The Source cannot read the Policy, so this also answers a session that a person off the allowed list started; nothing else follows for them.
 - **Order.** Linear's `agentSessions` takes no filter, so each round reads pages of 25 until one reaches the cursor (newest first, Linear's default) or, for pages that come oldest first, to the end, at most 250 sessions. Prompts are filtered by time. A cursor never moves back, and a round with nothing new leaves it where it is.
-- **Repositories.** A team's sessions and prompts are taken in when the GitHub Source lists its repository. A Trigger of a team on one of the GitHub Source's additional `repositories` carries `meta.repository`, that repository's name as the deployment lists it, so its ticket works there. Triggers of a team on the primary `repository` carry none and are the same as before. Sessions of a listed team whose repository the GitHub Source does not list are left out, and the Source's health names them. With a dsh-superagent that has no `repositories`, only the primary is served.
+- **Repositories.** An Issue's repository is its project's when the team lists that project, else the team's. Sessions and prompts are read with the Issue's project, so this costs no extra request. A Trigger whose repository is one of the GitHub Source's additional `repositories` carries `meta.repository`, that repository's name as the deployment lists it, so its ticket works there. Triggers on the primary `repository` carry none and are the same as before. A ticket keeps the repository it started in when its Issue later moves to another project. Issues whose repository the GitHub Source does not list are left out, and the Source's health names them. With a dsh-superagent that has no `repositories`, only the primary is served.
+- **No repository.** An Issue of a team without a `repository`, in a project the team does not list, is not taken in. Its session gets one `error` activity saying so, such as "Not taken in: team ENG names no repository for project Design.", and the Source's health lists the Issue under "no repository for".
 - **Threads.** A Linear Issue is one Thread (`linear:issue:<issue id>`); later sessions on the same Issue follow its ticket.
 - **Stop.** A prompt with Linear's stop signal becomes a Trigger whose text starts with "Stop requested in Linear."
 - **Removed delegation.** While a ticket that started on Linear is open, the Source reads its Issue's delegate (`Issue.delegate`) at most every 30 seconds, one query for all open tickets. When an Issue that was delegated to the app no longer is, because someone removed the app or delegated another agent, the ticket gets a stop Trigger with the same "Stop requested in Linear." text and the ticket's repository in `meta.repository` when it is an additional one, attributed to the person in the Issue's history (`fromDelegate`) when a change since the ticket started shows it, and to no one otherwise. An Issue the query does not return, such as an archived or deleted one, or one in a chunk of 50 that failed, is left for the next check. A ticket that started from a mention, without delegation, keeps running unless the Issue is delegated to the app and that is later removed.
