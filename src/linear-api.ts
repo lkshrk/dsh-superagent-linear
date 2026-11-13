@@ -78,7 +78,7 @@ const IssueContextSchema = z.looseObject({
 export type IssueContext = z.infer<typeof IssueContextSchema>
 const EPIC_CHECK = 'query EpicCheck($id: String!) { issue(id: $id) { children(first: 1) { nodes { id } } } }'
 const CHAIN_READ = `query ChainRead($id: String!) { issue(id: $id) { id identifier state { type } delegate { id }
-  children(first: 30) { nodes { id identifier title state { type } subIssueSortOrder
+  children(first: 30) { nodes { id identifier title state { type } assignee { id } subIssueSortOrder
     inverseRelations(first: 20) { nodes { type issue { id identifier state { type } parent { id } } } pageInfo { hasNextPage } } }
   pageInfo { hasNextPage } } } }`
 const CHAIN_CHILD = `query ChainChild($id: String!) { issue(id: $id) { ${ISSUE_FIELDS} } }`
@@ -87,7 +87,7 @@ const CHAIN_SESSION = `mutation ChainSession($issueId: String!) { agentSessionCr
 const State = z.looseObject({ type: z.string() }).nullish()
 const ChainSchema = z.looseObject({ id: z.string(), identifier: z.string(), state: State, delegate: z.looseObject({ id: z.string() }).nullish(),
   children: z.looseObject({ nodes: z.array(z.looseObject({ id: z.string(), identifier: z.string(), title: z.string(), state: State,
-    subIssueSortOrder: z.number().nullish(), inverseRelations: z.looseObject({ nodes: z.array(z.looseObject({ type: z.string(),
+    assignee: z.looseObject({ id: z.string() }).nullish(), subIssueSortOrder: z.number().nullish(), inverseRelations: z.looseObject({ nodes: z.array(z.looseObject({ type: z.string(),
       issue: z.looseObject({ id: z.string(), identifier: z.string(), state: State, parent: z.looseObject({ id: z.string() }).nullish() }).nullish() })),
     pageInfo: z.looseObject({ hasNextPage: z.boolean() }) }) })), pageInfo: z.looseObject({ hasNextPage: z.boolean() }) }),
 })

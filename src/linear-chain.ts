@@ -12,7 +12,7 @@ export const CHAIN_KEYS = {
 export const CHAIN_INTERVAL_MS = 30_000
 export const CHAIN_WAIT_MS = 30 * 60_000
 
-export interface Started { identifier: string; at: string; session?: string; url?: string; trigger?: string; ticket?: string; waited?: boolean }
+export interface Started { identifier: string; at: string; session?: string; url?: string; trigger?: string; ticket?: string }
 export interface ChainRecord {
   run: string; session: string; delegator: { id: string; name?: string }; status: 'running' | 'stopped' | 'done'; reason?: string
   team: string; teamKey: string; project?: string; projectName?: string; identifier: string; url: string
@@ -40,15 +40,16 @@ function addOwnSession(ctx: SourceContext, id: string): void {
 const ignoreGone = (error: unknown) => { if (!(error instanceof LinearError && error.gone)) throw error }
 const closed = (state: { type: string } | null | undefined) => state?.type === 'completed' || state?.type === 'canceled'
 
-/** Starts a fresh run on `session`'s Issue, replacing any earlier run; its children keep going and count by their Issue. */
+/** Starts a fresh run on `session`'s Issue, replacing any earlier run; the children that run started and are still busy carry over. */
 export async function startChain(ctx: SourceContext, client: LinearClient, session: Session, context: IssueContext, viewer: string, parallel: number,
   signal: AbortSignal): Promise<void> {
   const issue = session.issue!
   const before = chainOf(ctx, issue.id)
   if (before?.run !== session.id) {
+    const carried = before?.status === 'running' ? [...busy(ctx, before)].flatMap(id => before.started[id] ? [[id, before.started[id]] as const] : []) : []
     save(ctx, issue.id, { run: session.id, session: session.id, delegator: { id: session.creator!.id, ...session.creator!.name ? { name: session.creator!.name } : {} },
       status: 'running', team: issue.team.id, teamKey: issue.team.key, ...issue.project ? { project: issue.project.id, ...issue.project.name ? { projectName: issue.project.name } : {} } : {},
-      identifier: issue.identifier, url: issue.url, delegated: issue.delegate?.id === viewer, started: {} })
+      identifier: issue.identifier, url: issue.url, delegated: issue.delegate?.id === viewer, started: Object.fromEntries(carried) })
   }
   setActive(ctx, issue.id, true)
   const list = context.children.nodes.map(child => `${child.identifier}${closed(child.state) ? ' (done)' : ''}`).join(', ')
@@ -70,13 +71,25 @@ export async function epicPrompt(ctx: SourceContext, client: LinearClient, trigg
     await stopChain(ctx, client, epic, record, 'stop requested in Linear', { id: trigger.actor.id }, signal)
     return true
   }
-  const working = record?.status === 'running' ? [...busy(ctx, record)].map(id => identifierOf(record, id)) : []
-  const body = record?.status === 'running'
-    ? `Working on ${working.length ? working.join(', ') : 'the next sub-issues'} of ${identifier}. Mention or delegate ${identifier} again to restart.`
-    : `Not working on ${identifier}${record?.reason ? ` (stopped: ${record.reason})` : ''}. Mention or delegate it again to start.`
-  await client.activity(String(trigger.meta.session), stableUuid(`epic-prompt:${String(trigger.meta.activity)}`), { type: 'thought', body }, false, signal)
-    .catch(ignoreGone)
+  await client.activity(String(trigger.meta.session), stableUuid(`epic-prompt:${String(trigger.meta.activity)}`),
+    { type: 'thought', body: statusText(ctx, record, identifier, 'the app') }, false, signal).catch(ignoreGone)
   return true
+}
+
+/** Answers a mention on an Issue with sub-issues: only a delegation starts a chain. */
+export async function epicMention(ctx: SourceContext, client: LinearClient, session: Session, signal: AbortSignal): Promise<void> {
+  const issue = session.issue!
+  await client.activity(session.id, stableUuid(`epic-mention:${session.id}`),
+    { type: 'thought', body: statusText(ctx, chainOf(ctx, issue.id), issue.identifier, session.appUser?.name || 'the app') }, false, signal).catch(ignoreGone)
+  ctx.state.set(CHAIN_KEYS.run(session.id), issue.id)
+}
+
+function statusText(ctx: SourceContext, record: ChainRecord | undefined, identifier: string, app: string): string {
+  if (record?.status !== 'running') {
+    return `Not working on ${identifier}${record?.reason ? ` (stopped: ${record.reason})` : ''}. Delegate the issue to ${app} to start a chain.`
+  }
+  const working = [...busy(ctx, record)].map(id => identifierOf(record, id))
+  return `Working on ${working.length ? working.join(', ') : 'the next sub-issues'} of ${identifier}. Delegate the issue to ${app} again to restart.`
 }
 
 const identifierOf = (record: ChainRecord, id: string) =>
@@ -162,6 +175,12 @@ async function advance(env: Env, epic: string, record: ChainRecord): Promise<voi
     return !ctx.tickets.get(ticket) || !!ctx.tickets.get(ticket)!.ended
   })
   if (failed.length) return await stop(`${failed.map(child => child.identifier).join(', ')} ended without being completed`)
+  const now = Date.now()
+  const unticketed = children.filter(child => {
+    const started = record.started[child.id]
+    return started?.trigger && !started.ticket && !done(child.id) && !open.has(child.id) && now - Date.parse(started.at) >= CHAIN_WAIT_MS
+  })
+  if (unticketed.length) return await stop(`${unticketed.map(child => child.identifier).join(', ')} got no ticket within ${CHAIN_WAIT_MS / 60_000} minutes`)
   if (children.every(child => done(child.id))) {
     record.status = 'done'
     save(ctx, epic, record)
@@ -169,9 +188,12 @@ async function advance(env: Env, epic: string, record: ChainRecord): Promise<voi
   }
 
   const blockers = (child: Child) => child.inverseRelations.nodes.flatMap(relation => relation.type === 'blocks' && relation.issue ? [relation.issue] : [])
-  const ready = children.filter(child => !done(child.id) && !running.has(child.id) && !record.started[child.id] && blockers(child).every(blocker => closed(blocker.state)))
+  const elsewhere = children.filter(child => !done(child.id) && !running.has(child.id) && !record.started[child.id]
+    && (child.state?.type === 'started' || (!!child.assignee && child.assignee.id !== viewer)))
+  const ready = children.filter(child => !done(child.id) && !running.has(child.id) && !record.started[child.id] && !elsewhere.includes(child)
+    && blockers(child).every(blocker => closed(blocker.state)))
     .sort((a, b) => (a.subIssueSortOrder ?? Infinity) - (b.subIssueSortOrder ?? Infinity) || a.identifier.localeCompare(b.identifier, 'en', { numeric: true }))
-  if (!running.size && !ready.length) {
+  if (!running.size && !ready.length && !elsewhere.length) {
     const waits = children.filter(child => !done(child.id)).map(child => {
       const waiting = blockers(child).filter(blocker => !closed(blocker.state)).map(blocker => blocker.identifier)
       return waiting.length ? `${child.identifier} waits for ${waiting.join(', ')}` : child.identifier
@@ -195,14 +217,6 @@ async function advance(env: Env, epic: string, record: ChainRecord): Promise<voi
     if (await launch(env, epic, record, child.id) === 'stopped') return
   }
 
-  const now = Date.now()
-  for (const child of children) {
-    const started = record.started[child.id]
-    if (!started?.trigger || started.ticket || started.waited || done(child.id) || open.has(child.id) || now - Date.parse(started.at) < CHAIN_WAIT_MS) continue
-    await client.activity(record.session, stableUuid(`chain-wait:${record.run}:${child.id}`), { type: 'thought',
-      body: `${child.identifier} has no ticket yet; waiting for the main Session.` }, false, signal).catch(ignoreGone)
-    started.waited = true
-  }
   save(ctx, epic, record)
 }
 
@@ -251,17 +265,25 @@ export async function stopChain(ctx: SourceContext, client: LinearClient, epic: 
   signal: AbortSignal): Promise<void> {
   const open = openTickets(ctx)
   const at = new Date().toISOString()
+  const stopped = new Set<string>()
+  const stopTrigger = (origin: Trigger, child: string, repository: string | undefined): Trigger => {
+    const { team, teamKey, issue, identifier, session } = origin.meta
+    return { id: `linear:chain-stop:${record.run}:${child}`, source: SOURCE, threads: origin.threads, actor: { source: SOURCE, id: by?.id ?? '' },
+      human: !!by, addressed: 'direct', at, text: `Stop requested in Linear.\n\nThe work on the sub-issues of ${record.identifier} stopped: ${reason}.`,
+      ...origin.channel ? { channel: origin.channel } : {}, ...origin.url ? { url: origin.url } : {},
+      meta: { team, teamKey, issue, identifier, session, kind: 'chain-stop', signal: 'stop', chain: epic, ...repository ? { repository } : {} } }
+  }
   for (const child of new Set([...(record.children ?? []).map(child => child.id), ...Object.keys(record.started)])) {
     for (const ticket of open.get(child) ?? []) {
       const origin = ctx.triggers.get(ticket.origin.triggerId)!
       if (!(origin.meta.kind === 'chain' && origin.meta.chain === epic) && record.started[child]?.ticket !== ticket.id) continue
-      const { team, teamKey, issue, identifier, session } = origin.meta
       const repository = ticket.execution?.repository ?? (typeof origin.meta.repository === 'string' ? origin.meta.repository : undefined)
-      await ctx.receive({ id: `linear:chain-stop:${record.run}:${child}`, source: SOURCE, threads: origin.threads, actor: { source: SOURCE, id: by?.id ?? '' },
-        human: !!by, addressed: 'direct', at, text: `Stop requested in Linear.\n\nThe work on the sub-issues of ${record.identifier} stopped: ${reason}.`,
-        ...origin.channel ? { channel: origin.channel } : {}, ...origin.url ? { url: origin.url } : {},
-        meta: { team, teamKey, issue, identifier, session, kind: 'chain-stop', signal: 'stop', chain: epic, ...repository ? { repository } : {} } })
+      await ctx.receive(stopTrigger(origin, child, repository))
+      stopped.add(child)
     }
+    const started = record.started[child]
+    const origin = started?.trigger && !started.ticket && !stopped.has(child) ? ctx.triggers.get(started.trigger) : undefined
+    if (origin) await ctx.receive(stopTrigger(origin, child, typeof origin.meta.repository === 'string' ? origin.meta.repository : undefined))
   }
   await client.activity(record.session, stableUuid(`chain-stop:${record.run}`), { type: 'response', body: `Stopped: ${reason}.` }, false, signal).catch(ignoreGone)
   record.status = 'stopped'

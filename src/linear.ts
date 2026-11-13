@@ -3,7 +3,7 @@ import { z } from 'zod'
 import { LinearClient, LinearError, stableUuid, type ActivityContent, type IssueContext, type IssueStatus, type Prompt, type Session, type Undelegation } from './linear-api.ts'
 import type { OutboundMessage, SourceContext, SourceKind, Trigger } from './types.ts'
 import { Waker } from './webhook.ts'
-import { CHAIN_KEYS, advanceChains, chainOf, epicPrompt, ownSession, startChain } from './linear-chain.ts'
+import { CHAIN_KEYS, advanceChains, chainOf, epicMention, epicPrompt, ownSession, startChain } from './linear-chain.ts'
 
 export const SOURCE = 'linear'
 export const HEALTH = 'linear'
@@ -145,10 +145,10 @@ export function withContext(trigger: Trigger, context: IssueContext | undefined)
 }
 
 export const SPLIT_LINE = 'Mode: split (plan this epic into sub-issues; no code)'
-/** A session Trigger on an Issue labelled epic becomes a split when its context shows no sub-issues or could not be read. */
+/** A session Trigger on an Issue labelled epic becomes a split when its context was read and shows no sub-issues. */
 export function withMode(trigger: Trigger, context: IssueContext | undefined): Trigger {
   const labels = Array.isArray(trigger.meta.labels) ? trigger.meta.labels : []
-  if (trigger.meta.kind !== 'session' || !labels.some(label => String(label).toLowerCase() === 'epic') || context?.children.nodes.length) return trigger
+  if (trigger.meta.kind !== 'session' || !labels.some(label => String(label).toLowerCase() === 'epic') || !context || context.children.nodes.length) return trigger
   return { ...trigger, text: `${SPLIT_LINE}\n${trigger.text}`, meta: { ...trigger.meta, mode: 'split', epic: trigger.meta.issue } }
 }
 
@@ -305,10 +305,16 @@ export async function pollLinear(ctx: SourceContext, client: LinearClient, confi
         : undefined
       // An Issue with sub-issues is worked through them; it never gets a worker of its own.
       if (context?.children.nodes.length) {
-        if (found.human) { await startChain(ctx, client, session, context, viewer, config.chainParallel, signal); round.sessions++ }
+        if (found.human && session.issue?.delegate?.id === viewer && !session.comment) {
+          await startChain(ctx, client, session, context, viewer, config.chainParallel, signal)
+          round.sessions++
+        } else if (found.human) await epicMention(ctx, client, session, signal)
         continue
       }
-      if (fresh && !context && chainOf(ctx, String(trigger.meta.issue))) throw new Error('The sub-issues of a chain\'s epic were not readable')
+      // Unknown sub-issues on a delegated Issue could make it a chain; it waits for a readable round.
+      if (fresh && !context && (session.issue?.delegate?.id === viewer || chainOf(ctx, String(trigger.meta.issue)))) {
+        throw new Error('The sub-issues of a delegated Issue were not readable')
+      }
       await ctx.receive(where.kind === 'served' ? withMode(withContext(trigger, context), context) : trigger)
       describe(ctx, trigger)
       round.sessions++
