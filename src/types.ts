@@ -22,7 +22,7 @@ export type ReceiveResult = string
 export type ScopeResult = { listened: true; observed: boolean; row?: string } | { listened: false; reason: string }
 export type Health = { state: 'starting' | 'ready' | 'paused' | 'error'; detail: string; at?: string }
 export interface Follow { thread: string; own: boolean; closed?: { at: string; outcome: 'merged' | 'closed' } }
-export interface Ticket { id: string; follows?: Follow[]; origin: { triggerId: string; triggerIds: string[] } }
+export interface Ticket { id: string; follows?: Follow[]; origin: { triggerId: string; triggerIds: string[] }; execution?: { repository?: string } }
 export interface Thread { meta: Record<string, unknown> }
 
 type FieldBase = { key: string; label: Localized; hint?: Localized; advanced?: boolean; optional?: boolean }
@@ -34,7 +34,7 @@ export type FieldSpec =
 export interface AdmissionRowView { id: string; label: Localized | string; note: Localized; cells: { listedUnaddressed: boolean; unlistedAddressed: boolean; unlistedUnaddressed: boolean } }
 
 export interface SourceContext {
-  readonly deployment: { repository: string }
+  readonly deployment: { repository: string; repositories?: string[] }
   readonly ready: Promise<void>
   configured(): boolean
   config<C extends Record<string, unknown>>(kind: string): C | undefined

@@ -23,6 +23,11 @@ export const teamName = (team: TeamConfig) => team.key || team.id
 /** Whether a team entry names Linear team `id` with `key`: by id when the entry has one, as a key can move to another team, else by key ignoring case. */
 export const sameTeam = (team: TeamConfig, id: unknown, key: unknown) =>
   team.id !== '' ? team.id === id : team.key.toUpperCase() === String(key ?? '').toUpperCase()
+const sameName = (a: string, b: string) => a.toLowerCase() === b.toLowerCase()
+/** The deployment's canonical name for `repository`, or undefined when the GitHub Source does not serve it. */
+export function servedRepository(deployment: SourceContext['deployment'], repository: string): string | undefined {
+  return (deployment.repositories ?? [deployment.repository]).find(name => sameName(name, repository))
+}
 /** The enabled configured team a Trigger's Issue belongs to. */
 export function teamOf(config: LinearConfig, meta: Record<string, unknown>): TeamConfig | undefined {
   return config.teams.find(team => team.enabled && sameTeam(team, meta.team, meta.teamKey))
@@ -79,14 +84,15 @@ export function promptTrigger(prompt: Prompt, viewer: string): Trigger | undefin
 }
 
 /** The stop Trigger for a ticket whose Issue is no longer delegated to the app, from the change that removed it when the history has it. */
-export function undelegationTrigger(origin: Trigger, ticket: string, change: Undelegation | undefined, observed: string): Trigger {
+export function undelegationTrigger(origin: Trigger, ticket: string, change: Undelegation | undefined, observed: string, repository?: string): Trigger {
   const { team, teamKey, issue, identifier, session } = origin.meta
   const who = change?.actor?.name ?? 'Someone'
   return { id: change ? `linear:undelegated:${change.id}` : `linear:undelegated:${ticket}:${observed}`, source: SOURCE, threads: origin.threads,
     actor: { source: SOURCE, id: change?.actor?.id ?? '' }, human: !!change?.actor, addressed: 'direct', at: change?.at ?? observed,
     text: `Stop requested in Linear.\n\n${who} removed the app as the delegate of ${String(identifier)}.`,
     ...origin.channel ? { channel: origin.channel } : {}, ...origin.url ? { url: origin.url } : {},
-    meta: { team, teamKey, issue, identifier, session, kind: 'undelegated', ...change ? { history: change.id } : {}, signal: 'stop' } }
+    meta: { team, teamKey, issue, identifier, session, kind: 'undelegated', ...change ? { history: change.id } : {}, signal: 'stop',
+      ...repository ? { repository } : {} } }
 }
 
 const CONTENT: Record<OutboundMessage['kind'], ActivityContent['type']> = { acknowledgement: 'thought', reply: 'response', notice: 'thought' }
@@ -160,15 +166,19 @@ export interface Round { sessions: number; prompts: number; unreadable: number; 
  * A cursor moves only past items that were all taken in; ids make a replay after a failure harmless.
  */
 export async function pollLinear(ctx: SourceContext, client: LinearClient, config: LinearConfig, signal: AbortSignal): Promise<Round> {
-  const repository = ctx.deployment.repository
   const enabled = config.teams.filter(team => team.enabled)
-  const skipped = enabled.filter(team => team.repository !== repository).map(teamName)
+  const skipped = enabled.filter(team => !servedRepository(ctx.deployment, team.repository)).map(teamName)
   // Intake does not need the team list; without it the teams are only left unverified.
   const known = await client.teams(signal).catch((error: unknown) => { if (signal.aborted) throw error; return undefined })
   const unknown = known ? enabled.filter(team => !known.some(item => sameTeam(team, item.id, item.key))).map(teamName) : []
-  // A listed team whose repository is not the GitHub Source's is left out; an unlisted one goes to receive, whose scope filters it.
-  const misrouted = (trigger: Trigger) => { const team = teamOf(config, trigger.meta); return team !== undefined && team.repository !== repository }
-  const served = (trigger: Trigger) => teamOf(config, trigger.meta)?.repository === repository
+  // A listed team whose repository the GitHub Source does not serve is left out; an unlisted one goes to receive, whose scope filters it.
+  const repositoryOf = (trigger: Trigger) => { const team = teamOf(config, trigger.meta); return team && servedRepository(ctx.deployment, team.repository) }
+  const misrouted = (trigger: Trigger) => teamOf(config, trigger.meta) !== undefined && !repositoryOf(trigger)
+  const served = (trigger: Trigger) => repositoryOf(trigger) !== undefined
+  const placed = (trigger: Trigger): Trigger => {
+    const repository = repositoryOf(trigger)
+    return repository && !sameName(repository, ctx.deployment.repository) ? { ...trigger, meta: { ...trigger.meta, repository } } : trigger
+  }
   const viewer = await client.viewer(signal)
   const now = new Date().toISOString()
   const round: Round = { sessions: 0, prompts: 0, unreadable: 0, skipped, unknown, misrouted: [], unverified: !known }
@@ -186,8 +196,9 @@ export async function pollLinear(ctx: SourceContext, client: LinearClient, confi
   let failed = false
   for (const session of sessions.items) {
     if (signal.aborted) throw new Error('The Linear Source stopped during the read')
-    const trigger = sessionTrigger(session, viewer)
-    if (!trigger) continue
+    const found = sessionTrigger(session, viewer)
+    if (!found) continue
+    const trigger = placed(found)
     if (misrouted(trigger)) { round.misrouted.push(String(trigger.meta.identifier)); continue }
     try {
       // Linear marks a session unresponsive when nothing answers within seconds; an evaluation takes longer.
@@ -212,8 +223,9 @@ export async function pollLinear(ctx: SourceContext, client: LinearClient, confi
   failed = false
   for (const prompt of prompts.items) {
     if (signal.aborted) throw new Error('The Linear Source stopped during the read')
-    const trigger = promptTrigger(prompt, viewer)
-    if (!trigger) continue
+    const found = promptTrigger(prompt, viewer)
+    if (!found) continue
+    const trigger = placed(found)
     if (misrouted(trigger)) { round.misrouted.push(String(trigger.meta.identifier)); continue }
     try {
       await ctx.receive(trigger)
@@ -235,6 +247,12 @@ function describe(ctx: SourceContext, trigger: Trigger): void {
   ctx.threads.describe(`${SOURCE}:${trigger.threads[0]!.id}`, { label: String(trigger.meta.identifier), ...trigger.url ? { url: trigger.url } : {} })
 }
 
+/** The repository and number of a GitHub Thread key: `github:12` in the primary, `github:owner/name#12` in another. */
+export function pullOf(thread: string, primary: string): { repository: string; number: string } | undefined {
+  const match = /^github:(?:([^/#]+\/[^/#]+)#)?(\d+)$/.exec(thread)
+  return match ? { repository: match[1] ?? primary, number: match[2]! } : undefined
+}
+
 /**
  * Links each pull request a ticket that started on Linear follows into its session, and completes the Issue once the ticket's own
  * pull request merged. An ended ticket gets one last look, then is dropped, unless completing its Issue still has to be retried.
@@ -248,11 +266,14 @@ async function followTickets(ctx: SourceContext, client: LinearClient, config: L
     const origin = ticket && ctx.triggers.get(ticket.origin.triggerId)
     if (!ticket || !origin) { followed.delete(id); continue }
     const session = String(origin.meta.session ?? ''), issue = String(origin.meta.issue ?? '')
+    const own = ticket.execution?.repository ?? repositoryMeta(origin) ?? ctx.deployment.repository
     for (const follow of ticket.follows ?? []) {
-      if (!follow.thread.startsWith('github:')) continue
+      const pull = pullOf(follow.thread, ctx.deployment.repository)
+      if (!pull) continue
       const url = ctx.threads.get(follow.thread)?.meta.url
       if (typeof url === 'string' && url && !ctx.state.get(KEYS.linked(session, url))) {
-        await client.addLinks(session, [{ label: `Pull request #${follow.thread.slice('github:'.length)}`, url }], signal)
+        const label = sameName(pull.repository, own) ? `Pull request #${pull.number}` : `Pull request ${pull.repository}#${pull.number}`
+        await client.addLinks(session, [{ label, url }], signal)
           .then(() => { ctx.state.set(KEYS.linked(session, url), true) }, () => { /* Retried on the next round. */ })
       }
     }
@@ -267,6 +288,7 @@ async function followTickets(ctx: SourceContext, client: LinearClient, config: L
 }
 
 /** Stops each open ticket whose Issue was delegated to the app and no longer is, reading the delegates at most every 30 seconds. */
+const repositoryMeta = (trigger: Trigger) => typeof trigger.meta.repository === 'string' && trigger.meta.repository ? trigger.meta.repository : undefined
 interface Delegation { delegated: boolean; observed?: string }
 async function followDelegation(ctx: SourceContext, client: LinearClient, viewer: string, signal: AbortSignal): Promise<void> {
   const checked = ctx.state.get<string>(KEYS.delegationChecked)
@@ -293,7 +315,7 @@ async function followDelegation(ctx: SourceContext, client: LinearClient, viewer
     ctx.state.set(KEYS.delegation, next)
     const change = await client.undelegation(issue, viewer, origin.at, signal).catch((error: unknown) => { if (signal.aborted) throw error; return undefined })
     try {
-      await ctx.receive(undelegationTrigger(origin, ticket.id, change, observed))
+      await ctx.receive(undelegationTrigger(origin, ticket.id, change, observed, ticket.execution?.repository ?? repositoryMeta(origin)))
       next[ticket.id] = { delegated: false }
     } catch (error) { if (signal.aborted) throw error }
   }
@@ -315,7 +337,7 @@ export async function watchLinear(ctx: SourceContext, client: LinearClient, sign
       try {
         const round = await pollLinear(ctx, client, config, signal)
         failures = 0
-        const skipped = round.skipped.length ? `; teams ${round.skipped.join(', ')} skipped: their repository is not the GitHub Source's` : ''
+        const skipped = round.skipped.length ? `; teams ${round.skipped.join(', ')} skipped: their repository is not one the GitHub Source serves` : ''
         const unknown = round.unknown.length ? `; teams ${round.unknown.join(', ')} not found in Linear` : round.unverified ? '; teams unverified: Linear\'s team list was not readable' : ''
         const misrouted = round.misrouted.length ? `; left out ${round.misrouted.slice(0, 10).join(', ')}${round.misrouted.length > 10 ? ' and more' : ''}` : ''
         ctx.report(HEALTH, { state: round.skipped.length || round.unknown.length ? 'error' : 'ready', at,

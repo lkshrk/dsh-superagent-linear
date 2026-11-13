@@ -4,7 +4,7 @@ import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import { LinearClient, MINT_INTERVAL_MS, SCOPE, stableUuid, type Prompt, type Session } from '../src/linear-api.ts'
-import { DELEGATION_INTERVAL_MS, KEYS, LinearConfigSchema, linearKind, pollLinear, promptTrigger, sendLinear, sessionTrigger, watchLinear, type LinearConfig } from '../src/linear.ts'
+import { DELEGATION_INTERVAL_MS, KEYS, LinearConfigSchema, pullOf, undelegationTrigger, linearKind, pollLinear, promptTrigger, sendLinear, sessionTrigger, watchLinear, type LinearConfig } from '../src/linear.ts'
 import { apply } from '../src/index.ts'
 import type { OutboundMessage, SourceContext, Ticket, Trigger } from '../src/types.ts'
 
@@ -59,13 +59,13 @@ function linear(handlers: Record<string, (variables: Record<string, unknown>) =>
 const page = (nodes: unknown[]) => ({ nodes, pageInfo: { hasNextPage: false, endCursor: null } })
 
 /** A SourceContext over plain maps, as dsh-superagent's would behave for this Source. */
-function context(fields: { tickets?: Ticket[]; triggers?: Trigger[]; threads?: Record<string, Record<string, unknown>> } = {}) {
+function context(fields: { tickets?: Ticket[]; triggers?: Trigger[]; threads?: Record<string, Record<string, unknown>>; repositories?: string[] } = {}) {
   const state = new Map<string, unknown>()
   const received: Trigger[] = []
   const triggers = new Map((fields.triggers ?? []).map(trigger => [trigger.id, trigger]))
   const receive = vi.fn(async (trigger: Trigger) => { received.push(trigger); triggers.set(trigger.id, trigger); return 'stored' })
   const ctx: SourceContext = {
-    deployment: { repository: 'acme/widgets' }, ready: Promise.resolve(), configured: () => true,
+    deployment: { repository: 'acme/widgets', ...fields.repositories ? { repositories: fields.repositories } : {} }, ready: Promise.resolve(), configured: () => true,
     config: <C>() => config() as unknown as C, receive,
     state: { get: <V>(key: string) => state.get(key) as V | undefined, set: (key, value) => { if (value === undefined) state.delete(key); else state.set(key, value) } },
     threads: { get: key => fields.threads?.[key] ? { meta: fields.threads[key]! } : undefined, describe: vi.fn() },
@@ -182,6 +182,27 @@ describe('polling', () => {
     await pollLinear(h.ctx, stub.client, config(), signal())
     expect(stub.activities).toHaveLength(1)
   })
+  it('takes in a team on an additional repository with that repository\'s canonical name, and leaves the primary\'s Triggers unchanged', async () => {
+    const stub = sources([session('s1', '2026-11-12T10:01:00.000Z'), session('s2', '2026-11-12T10:02:00.000Z', { issue: issue(OTHER_TEAM, 2) })],
+      [prompt('a1', '2026-11-12T10:04:00.000Z', { agentSession: { id: 's2', issue: issue(OTHER_TEAM, 2) } })])
+    const teams = [{ id: '', key: 'WEB', repository: 'ACME/Widgets', enabled: true }, { id: '', key: 'OPS', repository: 'acme/other', enabled: true }]
+    const h = context({ repositories: ['acme/widgets', 'Acme/Other'] })
+    h.state.set(KEYS.sessions, T0); h.state.set(KEYS.prompts, T0)
+    const round = await pollLinear(h.ctx, stub.client, config({ teams }), signal())
+    expect(round).toMatchObject({ sessions: 2, prompts: 1, skipped: [], misrouted: [] })
+    expect(h.received.map(trigger => [trigger.id, trigger.meta.repository])).toEqual([['linear:session:s1', undefined],
+      ['linear:session:s2', 'Acme/Other'], ['linear:prompt:a1', 'Acme/Other']])
+    expect(h.received[0]).toEqual(sessionTrigger(session('s1', '2026-11-12T10:01:00.000Z'), VIEWER))
+    expect(stub.activities.map(activity => activity.agentSessionId)).toEqual(['s1', 's2'])
+  })
+  it('leaves out a team whose repository the deployment does not list, and names it in health', async () => {
+    const stub = sources([session('s2', '2026-11-12T10:02:00.000Z', { issue: issue(OTHER_TEAM, 2) })])
+    const h = context({ repositories: ['acme/widgets', 'acme/third'] })
+    h.state.set(KEYS.sessions, T0); h.state.set(KEYS.prompts, T0)
+    const round = await pollLinear(h.ctx, stub.client, config(), signal())
+    expect(round).toMatchObject({ sessions: 0, skipped: ['OPS'], misrouted: ['OPS-2'] })
+    expect(h.received).toEqual([])
+  })
   it('keeps its cursors where they are after a round with nothing new', async () => {
     const stub = sources([])
     const h = context()
@@ -268,6 +289,28 @@ describe('polling', () => {
     expect(h.state.get(KEYS.followed)).toEqual([])
     open.mockRestore()
   })
+  it('labels a linked pull request by the ticket\'s repository, naming any other repository in full', async () => {
+    const updates: { input: { addedExternalUrls: { label: string }[] } }[] = []
+    const stub = linear({ agentSessions: () => ({ agentSessions: page([]) }), agentActivities: () => ({ agentActivities: page([]) }),
+      agentSessionUpdate: variables => { updates.push(variables as never); return { agentSessionUpdate: { success: true } } } })
+    const found = sessionTrigger(session('s1', T0, { issue: issue(OTHER_TEAM, 2) }), VIEWER)!
+    const origin: Trigger = { ...found, meta: { ...found.meta, repository: 'Acme/Other' } }
+    const ticket: Ticket = { id: 't1', origin: { triggerId: origin.id, triggerIds: [origin.id] }, execution: { repository: 'Acme/Other' },
+      follows: [{ thread: 'github:Acme/Other#7', own: true }, { thread: 'github:9', own: false }, { thread: 'github:ci:main', own: false }] }
+    const h = context({ tickets: [ticket], triggers: [origin],
+      repositories: ['acme/widgets', 'Acme/Other'], threads: { 'github:Acme/Other#7': { url: 'https://github.com/Acme/Other/pull/7' },
+        'github:9': { url: 'https://github.com/acme/widgets/pull/9' }, 'github:ci:main': { url: 'https://github.com/acme/widgets/actions' } } })
+    h.state.set(KEYS.sessions, T0); h.state.set(KEYS.prompts, T0)
+    await pollLinear(h.ctx, stub.client, config(), signal())
+    expect(updates.map(update => update.input.addedExternalUrls[0]!.label)).toEqual(['Pull request #7', 'Pull request acme/widgets#9'])
+    expect(pullOf('github:12', 'acme/widgets')).toEqual({ repository: 'acme/widgets', number: '12' })
+    expect(pullOf('github:ci:main', 'acme/widgets')).toBeUndefined()
+  })
+  it('puts the ticket\'s repository on an undelegation stop, and none for the primary', () => {
+    const origin = sessionTrigger(session('s1', T0), VIEWER)!
+    expect(undelegationTrigger(origin, 't1', undefined, T0, 'Acme/Other').meta.repository).toBe('Acme/Other')
+    expect(undelegationTrigger(origin, 't1', undefined, T0).meta).not.toHaveProperty('repository')
+  })
   describe('delegation', () => {
     function delegation(delegate: () => string | null, history: unknown[] = []) {
       const reads: unknown[] = []
@@ -313,6 +356,16 @@ describe('polling', () => {
       const h = running(sessionTrigger(delegated, VIEWER)!)
       await round(h, stub)
       expect(h.received.map(trigger => trigger.id)).toEqual(['linear:undelegated:h2'])
+    })
+
+    it('puts the ticket\'s repository on the stop', async () => {
+      const stub = delegation(() => null, [removal])
+      const origin = sessionTrigger(delegated, VIEWER)!
+      const ticket: Ticket = { id: 't1', origin: { triggerId: origin.id, triggerIds: [origin.id] }, execution: { repository: 'Acme/Other' } }
+      const h = context({ tickets: [ticket], triggers: [origin], repositories: ['acme/widgets', 'Acme/Other'] })
+      h.state.set(KEYS.sessions, T0); h.state.set(KEYS.prompts, T0)
+      await round(h, stub)
+      expect(h.received.map(trigger => trigger.meta.repository)).toEqual(['Acme/Other'])
     })
 
     it('still stops, unattributed, when the history does not show the change, only shows one before the ticket started, or cannot be read', async () => {
