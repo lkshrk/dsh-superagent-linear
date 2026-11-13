@@ -52,6 +52,7 @@ teams:
 ```
 
 | `pollSeconds` | Polling interval, default 10; see Rate limits |
+| `webhookSecretFile` | Absolute path of the file holding the app webhook's signing secret; empty polls only. See Webhook |
 | `completeOnMerge` | Move the Issue to its team's first completed state once the ticket's own pull request merged, unless it is completed already; default on |
 
 In the Policy, list the Linear user ids who may originate work under **Eval → On each Source → Linear**. A listed person's session is an explicit request; anyone else's is ignored with the default admission table. The app's own sessions and activities never become Triggers, and comments that do not address the app are not read.
@@ -70,13 +71,17 @@ In the Policy, list the Linear user ids who may originate work under **Eval → 
 - **Pull requests.** When a ticket that started on Linear follows a GitHub pull request, its link is added to the session's external URLs (`agentSessionUpdate`, `addedExternalUrls`), labelled `Pull request #12` in the ticket's repository and `Pull request owner/name#12` in another. Its merge ends the ticket through the GitHub Source as usual.
 - **Execution environment.** `DSH_SUPERAGENT_LINEAR_ISSUE` (such as `ENG-12`) and `DSH_SUPERAGENT_LINEAR_ISSUE_URL`. A PR body with `Fixes ENG-12` lets Linear's GitHub integration close the Issue too.
 
-Not implemented: webhooks and thread context for assessments.
+- **Webhook.** With `webhookSecretFile` set, `POST /hooks/linear` on DSH's Web server takes Linear's deliveries. A delivery whose `Linear-Signature` (HMAC-SHA256 of the body with the secret) and `webhookTimestamp` (within a minute) check out gets 200 and wakes the polling for an immediate round; the payload itself is not taken in, so intake stays the API read above. Other methods get 405, a missing secret 503, a bad signature or stale timestamp 401. The route needs no sign-in; expose only that path publicly.
+
+**Keep the app's webhook enabled with Agent session events.** Linear creates no agent sessions for an app whose webhook is off, so delegations and mentions silently stop reaching the Source even though polling still runs.
+
+Not implemented: thread context for assessments.
 
 ## Rate limits
 
 Linear allows an OAuth app 5,000 requests and 2,000,000 complexity points per hour, per app user, shared by every service that uses the same app. A round costs two queries of about 200 points each, plus a team list every ten minutes and, while tickets that started on Linear are open, one delegate query every 30 seconds. At the default 10 seconds that is about 730 requests (15%) and 140,000 points (7%) per hour, and at most 120 requests (2.4%) more while tickets run. A longer interval lowers both and delays the first answer: past about 10 seconds Linear may show a session as unresponsive until the thought arrives. When Linear rate-limits the app, the Source sends nothing until the limit resets.
 
-Linear recommends webhooks over polling. This Source polls so it needs no public endpoint; an app has one webhook URL, and a webhook intake could replace polling later.
+Linear recommends webhooks over polling. With the webhook wired up, `pollSeconds` can go up, as each delivery wakes the polling at once.
 
 A Source package's schema errors come from its own copy of zod; dsh-superagent from c8f41c3 still answers them as validation errors (400) in the panel.
 

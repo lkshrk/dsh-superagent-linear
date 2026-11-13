@@ -148,7 +148,7 @@ describe('translation', () => {
     expect(kind.policy!.rows!(config())[0]).toMatchObject({ cells: { listedUnaddressed: false, unlistedAddressed: true, unlistedUnaddressed: false } })
     expect(() => LinearConfigSchema.parse({ teams: [{ repository: 'acme/widgets' }] })).toThrow('A team id or key')
     expect(kind.find!('see WEB-12 and OPS-3')).toEqual({ threads: [], terms: ['WEB-12', 'OPS-3'] })
-    expect(kind.accountFields).toEqual(['clientIdFile', 'clientSecretFile'])
+    expect(kind.accountFields).toEqual(['clientIdFile', 'clientSecretFile', 'webhookSecretFile'])
     expect(LinearConfigSchema.safeParse({ apiUrl: 'https://evil.example/graphql' }).success).toBe(false)
   })
 })

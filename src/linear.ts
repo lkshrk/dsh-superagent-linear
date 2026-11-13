@@ -1,8 +1,8 @@
 /** The Linear Source: a Linear agent app's sessions on the listed teams become Triggers, and replies go back as agent activities. */
-import { setTimeout as delay } from 'node:timers/promises'
 import { z } from 'zod'
 import { LinearClient, LinearError, stableUuid, type ActivityContent, type Prompt, type Session, type Undelegation } from './linear-api.ts'
 import type { OutboundMessage, SourceContext, SourceKind, Trigger } from './types.ts'
+import { Waker } from './webhook.ts'
 
 export const SOURCE = 'linear'
 export const HEALTH = 'linear'
@@ -10,6 +10,7 @@ const REPOSITORY = /^[A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+$/
 export const LinearConfigSchema = z.object({
   clientIdFile: z.string().trim().refine(path => path === '' || path.startsWith('/'), 'An absolute path').default(''),
   clientSecretFile: z.string().trim().refine(path => path === '' || path.startsWith('/'), 'An absolute path').default(''),
+  webhookSecretFile: z.string().trim().refine(path => path === '' || path.startsWith('/'), 'An absolute path').default(''),
   teams: z.array(z.object({ id: z.string().trim().default(''), key: z.string().trim().default(''),
     repository: z.union([z.literal(''), z.string().trim().regex(REPOSITORY)]).default(''),
     projects: z.array(z.object({ id: z.string().trim().default(''), name: z.string().trim().default(''), repository: z.string().trim().regex(REPOSITORY) })
@@ -131,10 +132,11 @@ export function linearKind(client: LinearClient): SourceKind<LinearConfig> {
     title: { zh: 'Linear', en: 'Linear' },
     description: { zh: '接收 Linear 智能体应用在下列团队里的会话：把 Issue 指派给它或 @ 它。', en: 'Receives the Linear agent app\'s sessions on these teams: an Issue delegated to it, or a mention of it.' },
     schema: LinearConfigSchema,
-    accountFields: ['clientIdFile', 'clientSecretFile'],
+    accountFields: ['clientIdFile', 'clientSecretFile', 'webhookSecretFile'],
     fields: [
       { key: 'clientIdFile', type: 'text', label: { zh: '应用 client id 文件', en: 'App client id file' } },
       { key: 'clientSecretFile', type: 'text', label: { zh: '应用 client secret 文件', en: 'App client secret file' } },
+      { key: 'webhookSecretFile', type: 'text', optional: true, label: { zh: 'Webhook 签名密钥文件', en: 'Webhook signing secret file' }, hint: { zh: '留空则只轮询；填写后 /hooks/linear 收到的投递会立即触发轮询', en: 'Empty polls only; when set, deliveries to /hooks/linear wake the polling at once' } },
       { key: 'teams', type: 'rows', label: { zh: '接收的团队', en: 'Teams' }, hint: { zh: '团队 key（例如 ENG）或 id 填一个即可', en: 'A team key, such as ENG, or its id' }, columns: [
         { key: 'key', type: 'text', label: { zh: '团队 key', en: 'Team key' }, optional: true },
         { key: 'id', type: 'text', label: { zh: '团队 id', en: 'Team id' }, optional: true },
@@ -377,7 +379,7 @@ async function followDelegation(ctx: SourceContext, client: LinearClient, viewer
 }
 
 /** Reads every `pollSeconds` once setup finished, reporting the Source's health; three failed rounds in a row are an error. */
-export async function watchLinear(ctx: SourceContext, client: LinearClient, signal: AbortSignal): Promise<void> {
+export async function watchLinear(ctx: SourceContext, client: LinearClient, signal: AbortSignal, waker = new Waker()): Promise<void> {
   let last = ''
   const report = (health: Parameters<SourceContext['report']>[1]) => {
     ctx.report(HEALTH, health)
@@ -412,6 +414,6 @@ export async function watchLinear(ctx: SourceContext, client: LinearClient, sign
         if (!signal.aborted && (blocked || failures >= 3)) report({ state: 'error', at, detail: `${failures} failed polls in a row; last: ${String(error)}` })
       }
     }
-    await delay((config?.pollSeconds ?? 10) * 1000, undefined, { signal }).catch(() => {})
+    await waker.wait((config?.pollSeconds ?? 10) * 1000, signal)
   }
 }
