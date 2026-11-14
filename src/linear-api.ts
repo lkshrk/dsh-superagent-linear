@@ -68,6 +68,8 @@ const ISSUE_STATE = `query($id: String!) { issue(id: $id) { state { type } team 
 const ISSUES = 'query($ids: [ID!]) { issues(first: 50, filter: { id: { in: $ids } }) { nodes { id delegate { id } state { type } completedAt canceledAt } } }'
 const HISTORY = `query($id: String!) { issue(id: $id) { history(first: 50) { nodes { id createdAt actor { id name } fromDelegate { id } toDelegate { id } } } } }`
 const DELEGATION_HISTORY = `query DelegationHistory($id: String!) { issue(id: $id) { history(first: 50) { nodes { id createdAt actor { id name app } botActor { type } toDelegate { id } } } } }`
+const DELEGATED_ISSUES = `query DelegatedIssues($viewer: ID!, $since: DateTimeOrDuration!, $after: String) {
+  issues(first: 50, after: $after, filter: { delegate: { id: { eq: $viewer } }, updatedAt: { gt: $since } }) { nodes { id } pageInfo { hasNextPage endCursor } } }`
 const SET_STATE = `mutation($id: String!, $state: String!) { issueUpdate(id: $id, input: { stateId: $state }) { success } }`
 const ISSUE_CONTEXT = `query IssueContext($id: String!) { issue(id: $id) { parent { id identifier title url description }
   children(first: 30) { nodes { identifier title state { type } } pageInfo { hasNextPage } } } }`
@@ -250,12 +252,26 @@ export class LinearClient {
       .sort((a, b) => Date.parse(b.createdAt) - Date.parse(a.createdAt))[0]
     return change && { id: change.id, at: change.createdAt, ...change.actor ? { actor: { id: change.actor.id, name: change.actor.name } } : {} }
   }
-  /** The newest of the issue's last 50 changes that delegated it to `agent`, with its actor when that is a person other than `agent`. */
-  async delegation(issue: string, agent: string, signal?: AbortSignal): Promise<Delegation | undefined> {
+  /** The Issues delegated to `agent` that changed after `since`; throws rather than return part of them. */
+  async delegatedIssues(agent: string, since: string, signal?: AbortSignal): Promise<string[]> {
+    const ids: string[] = []
+    let after: string | undefined
+    for (let pages = 0; pages < 10; pages++) {
+      const page = z.object({ issues: z.object({ nodes: z.array(z.object({ id: z.string() })), pageInfo: PageInfo }) })
+        .parse(await this.request(DELEGATED_ISSUES, { viewer: agent, since, after }, signal)).issues
+      ids.push(...page.nodes.map(node => node.id))
+      if (!page.pageInfo.hasNextPage) return ids
+      if (!page.pageInfo.endCursor) break
+      after = page.pageInfo.endCursor
+    }
+    throw new LinearError('Too many Issues delegated to the app changed at once')
+  }
+  /** The newest of the issue's last 50 changes, made at or after `since`, that delegated it to `agent`, with its actor when that is a person other than `agent`. */
+  async delegation(issue: string, agent: string, since: string, signal?: AbortSignal): Promise<Delegation | undefined> {
     const entry = z.looseObject({ id: z.string(), createdAt: z.string(), actor: z.looseObject({ id: z.string(), name: z.string().nullish(), app: z.boolean().nullish() }).nullish(),
       botActor: z.looseObject({ type: z.string().nullish() }).nullish(), toDelegate: z.object({ id: z.string() }).nullish() })
     const data = z.object({ issue: z.object({ history: z.object({ nodes: z.array(entry) }) }) }).parse(await this.request(DELEGATION_HISTORY, { id: issue }, signal))
-    const change = data.issue.history.nodes.filter(node => node.toDelegate?.id === agent).sort((a, b) => Date.parse(b.createdAt) - Date.parse(a.createdAt))[0]
+    const change = data.issue.history.nodes.filter(node => node.toDelegate?.id === agent && Date.parse(node.createdAt) >= Date.parse(since)).sort((a, b) => Date.parse(b.createdAt) - Date.parse(a.createdAt))[0]
     if (!change) return undefined
     const { actor } = change
     const person = actor && actor.app === false && !change.botActor && actor.id !== agent

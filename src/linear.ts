@@ -3,7 +3,7 @@ import { z } from 'zod'
 import { LinearClient, LinearError, stableUuid, type ActivityContent, type IssueContext, type IssueStatus, type Prompt, type Session, type Undelegation } from './linear-api.ts'
 import type { OutboundMessage, SourceContext, SourceKind, Trigger } from './types.ts'
 import { Waker } from './webhook.ts'
-import { CHAIN_KEYS, advanceChains, chainOf, epicMention, epicPrompt, followDelegations, holdUnreadable, ownSession, releaseHold, startChain, unreadableText, watch, watchedIssues } from './linear-chain.ts'
+import { CHAIN_KEYS, advanceChains, chainOf, epicMention, epicPrompt, followDelegations, holdUnreadable, ownSession, releaseHold, startChain, unreadableText, watch } from './linear-chain.ts'
 
 export const SOURCE = 'linear'
 export const HEALTH = 'linear'
@@ -293,11 +293,11 @@ export async function pollLinear(ctx: SourceContext, client: LinearClient, confi
       }
       // Linear marks a session unresponsive when nothing answers within seconds; an evaluation takes longer.
       if (where.kind === 'served' && !ctx.state.get(KEYS.seen(session.id))) {
+        watch(ctx, String(trigger.meta.issue), { session: session.id, delegate: session.issue?.delegate?.id ?? null })
         await client.activity(session.id, stableUuid(`seen:${session.id}`), { type: 'thought', body: 'Received.' }, true, signal)
           .catch((error: unknown) => { if (!(error instanceof LinearError && error.gone)) throw error })
         ctx.state.set(KEYS.seen(session.id), true)
       }
-      if (where.kind === 'served') watch(ctx, String(trigger.meta.issue), session.id)
       if (where.kind === 'served' && ctx.state.get(CHAIN_KEYS.run(session.id))) continue
       // The cursor replays the newest session every round; a stored Trigger needs no second read.
       const fresh = where.kind === 'served' && !ctx.triggers.get(trigger.id)
@@ -438,19 +438,17 @@ async function followIssues(ctx: SourceContext, client: LinearClient, config: Li
   if (checked && Date.now() - Date.parse(checked) < DELEGATION_INTERVAL_MS) return
   const known = ctx.state.get<Record<string, Delegation>>(KEYS.delegation) ?? {}
   if (!running.length && Object.keys(known).length) ctx.state.set(KEYS.delegation, {})
-  const followed = (ctx.state.get<string[]>(KEYS.followed) ?? []).flatMap(id => {
-    const ticket = ctx.tickets.get(id)
-    const origin = ticket && ctx.triggers.get(ticket.origin.triggerId)
-    return origin?.source === SOURCE && typeof origin.meta.issue === 'string' ? [origin] : []
-  })
-  const watched = watchedIssues(ctx, [...running.map(item => item.origin), ...followed].map(origin => ({ issue: String(origin.meta.issue),
-    ...typeof origin.meta.session === 'string' && origin.meta.session ? { session: origin.meta.session } : {} })))
-  if (!running.length && !closing.length && !watched.length) return
   const now = new Date().toISOString()
   ctx.state.set(KEYS.delegationChecked, now)
-  const issues = await client.issues([...new Set([...running, ...closing].map(item => item.issue).concat(watched))], signal)
+  await followDelegations(ctx, client, viewer, config.chainParallel, round, signal)
+  if (!running.length && !closing.length) return
+  const issues = await client.issues([...new Set([...running, ...closing].map(item => item.issue))], signal)
   reportClosed(ctx, closing, issues)
-  await followDelegations(ctx, client, viewer, config.chainParallel, issues, round, signal)
+  // Only a delegate other than the app is kept: the delegated query above records the app.
+  for (const { origin, issue } of running) {
+    const delegate = issues.get(issue)?.delegate
+    if (delegate !== undefined && delegate !== viewer) watch(ctx, issue, { ...typeof origin.meta.session === 'string' && origin.meta.session ? { session: origin.meta.session } : {}, delegate })
+  }
   if (!running.length) return
   const next: Record<string, Delegation> = Object.fromEntries(running.map(({ ticket, origin }) =>
     [ticket.id, known[ticket.id] ?? { delegated: origin.meta.delegate === viewer }]))

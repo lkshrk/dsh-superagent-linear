@@ -7,7 +7,7 @@ import type { z } from 'zod'
 import { LinearClient, MINT_INTERVAL_MS, SCOPE, stableUuid, type IssueContext, type Prompt, type Session } from '../src/linear-api.ts'
 import { CLOSE_HORIZON_MS, DELEGATION_INTERVAL_MS, KEYS, PARENT_DESCRIPTION_LIMIT, LinearConfigSchema, pullOf, undelegationTrigger, linearKind, pollLinear, promptTrigger, sendLinear, sessionTrigger, SPLIT_LINE, watchLinear, withContext, withMode, type LinearConfig } from '../src/linear.ts'
 import { apply } from '../src/index.ts'
-import { CHAIN_KEYS, HOLD_MS, type ChainRecord } from '../src/linear-chain.ts'
+import { ADOPT_MS, CHAIN_KEYS, HOLD_MS, type ChainRecord } from '../src/linear-chain.ts'
 import type { OutboundMessage, SourceContext, Ticket, Trigger } from '../src/types.ts'
 
 const VIEWER = 'app-user', OWNER = 'owner-1', TEAM = 'team-web', OTHER_TEAM = 'team-ops'
@@ -47,7 +47,8 @@ function linear(handlers: Record<string, (variables: Record<string, unknown>) =>
     if (limited) return Response.json({ errors: [{ message: 'Rate limit exceeded', extensions: { code: 'RATELIMITED' } }] }, { status: 400, headers: { 'x-ratelimit-requests-reset': String(limited) } })
     const bearer = String((init.headers as Record<string, string>).authorization).slice('Bearer '.length)
     if (!valid.has(bearer)) return Response.json({ errors: [{ message: 'Authentication required', extensions: { code: 'AUTHENTICATION_ERROR' } }] }, { status: 401 })
-    const operation = Object.keys(handlers).find(name => query.includes(name))
+    if (query.includes('DelegatedIssues') && !handlers.DelegatedIssues) return Response.json({ data: { issues: page([]) } })
+    const operation = Object.keys(handlers).find(name => query.startsWith(`query ${name}(`)) ?? Object.keys(handlers).find(name => query.includes(name))
     if (query.includes('viewer') && !operation) return Response.json({ data: { viewer: { id: VIEWER } } })
     if (query.includes('teams(') && !operation) return Response.json({ data: { teams: page(Object.entries(KEYS_OF).map(([id, key]) => ({ id, key }))) } })
     if (query.includes('IssueContext') && !operation) return Response.json({ data: { issue: { parent: null, children: { nodes: [], pageInfo: { hasNextPage: false } } } } })
@@ -908,7 +909,7 @@ describe('split mode', () => {
 describe('chain', () => {
   const T0 = '2026-11-12T10:00:00.000Z'
   type Kid = { id: string; identifier: string; state: string; order: number | null; blockedBy: string[]; labels: string[]; epic: string; team: string; assignee?: string }
-  type Epic = { id: string; identifier: string; state: string; delegate: string | null; more: boolean }
+  type Epic = { id: string; identifier: string; state: string; delegate: string | null; more: boolean; updatedAt?: string }
   const chainSession = (id: string, epic: Epic, at: string) => session(id, at, { issue: { id: epic.id, identifier: epic.identifier, title: 'The epic',
     description: 'Do it all.', url: `https://linear.app/x/issue/${epic.identifier}`, team: { id: TEAM, key: 'WEB' }, ...epic.delegate ? { delegate: { id: epic.delegate } } : {} } })
 
@@ -922,7 +923,7 @@ describe('chain', () => {
     const failures: Record<string, number> = {}
     const hooks: { complete?: (id: string) => void } = {}
     const history = new Map<string, Record<string, unknown>[]>()
-    const delegateReads: string[][] = [], historyReads: string[] = []
+    const delegateReads: string[][] = [], historyReads: string[] = [], delegatedReads: string[] = []
     let relationsMore = false
     const failing = (operation: string) => { if (failures[operation]) { failures[operation]--; throw new Error('Internal error') } }
     const kidsOf = (epic: string) => [...kids.values()].filter(kid => kid.epic === epic)
@@ -986,19 +987,26 @@ describe('chain', () => {
         delegateReads.push(ids)
         return { issues: { nodes: ids.flatMap(id => { const item = epics.get(id) ?? kids.get(id); return item ? [{ id, delegate: 'delegate' in item && item.delegate ? { id: item.delegate } : null }] : [] }) } }
       },
-      DelegationHistory: variables => { historyReads.push(String(variables.id)); return { issue: { history: { nodes: history.get(String(variables.id)) ?? [] } } } },
+      DelegatedIssues: variables => {
+        failing('DelegatedIssues')
+        delegatedReads.push(String(variables.since))
+        return { issues: page([...epics.values()].filter(epic => epic.delegate === VIEWER && epic.updatedAt && epic.updatedAt > String(variables.since)).map(epic => ({ id: epic.id }))) }
+      },
+      DelegationHistory: variables => { failing('DelegationHistory'); historyReads.push(String(variables.id)); return { issue: { history: { nodes: history.get(String(variables.id)) ?? [] } } } },
     })
     const h = context()
     h.ctx.tickets.open = () => tickets.filter(ticket => !ticket.ended)
     h.ctx.tickets.get = id => tickets.find(ticket => ticket.id === id)
     h.state.set(KEYS.sessions, T0); h.state.set(KEYS.prompts, T0)
+    h.state.set(CHAIN_KEYS.delegated, new Date(Date.now() - 60_000).toISOString())
     let minute = 0
     const at = () => `2026-11-12T10:${String(++minute).padStart(2, '0')}:00.000Z`
     const w = {
-      ...h, stub, kids, epics, foreign, sessions, prompts, tickets, created, activities, completed, failures, hooks, history, delegateReads, historyReads, autoTicket: true,
+      ...h, stub, kids, epics, foreign, sessions, prompts, tickets, created, activities, completed, failures, hooks, history, delegateReads, historyReads, delegatedReads, autoTicket: true,
       redelegate(id: string, actor: Record<string, unknown> | null = { id: OWNER, name: 'Owner', app: false }, epic = 'epic-1', botActor: Record<string, unknown> | null = null) {
-        epics.get(epic)!.delegate = VIEWER
-        history.set(epic, [...history.get(epic) ?? [], { id, createdAt: at(), actor, botActor, toDelegate: { id: VIEWER } }])
+        const now = new Date().toISOString()
+        Object.assign(epics.get(epic)!, { delegate: VIEWER, updatedAt: now })
+        history.set(epic, [...history.get(epic) ?? [], { id, createdAt: now, actor, botActor, toDelegate: { id: VIEWER } }])
       },
       epic(id = 'epic-1', identifier = 'WEB-10') { const epic: Epic = { id, identifier, state: 'started', delegate: VIEWER, more: false }; epics.set(id, epic); return epic },
       kid(n: number, fields: Partial<Kid> = {}) {
@@ -1578,6 +1586,7 @@ describe('chain', () => {
 
   describe('re-delegation', () => {
     const plans = (w: ReturnType<typeof world>) => w.activities.filter(activity => activity.body.startsWith('Working through'))
+    const settle = (w: ReturnType<typeof world>, ago = 10 * 60_000) => { for (const epic of w.epics.values()) if (epic.updatedAt) epic.updatedAt = new Date(Date.now() - ago).toISOString() }
     async function stoppedChain() {
       const w = world()
       w.epic(); w.kid(2); w.kid(3)
@@ -1598,18 +1607,35 @@ describe('chain', () => {
       expect(w.chainTriggers().map(trigger => [trigger.id, trigger.actor.id])).toEqual([['linear:chain:es1:kid-2', OWNER], ['linear:chain:es1:kid-3', OWNER],
         ['linear:chain:h1:kid-2', OWNER], ['linear:chain:h1:kid-3', OWNER]])
       expect(plans(w).map(activity => activity.session)).toEqual(['es1', 'es1'])
+      settle(w)
       await w.round(); await w.round()
       w.prompt('p1', 'epic-1', { signal: 'stop', content: { body: '' } })
       await w.round()
       expect(w.record()).toMatchObject({ run: 'h1', status: 'stopped' })
       w.end(2); w.end(3)
-      const watched = w.state.get(CHAIN_KEYS.watched) as Record<string, { delegate?: string | null }>
-      w.state.set(CHAIN_KEYS.watched, { ...watched, 'epic-1': { ...watched['epic-1']!, delegate: null } })
-      await w.round(); await w.round()
+      w.state.set(CHAIN_KEYS.delegated, new Date(Date.now() - 60_000).toISOString())
+      settle(w, 30_000)
+      await w.round()
+      settle(w)
+      await w.round()
       expect(w.record()).toMatchObject({ run: 'h1', status: 'stopped' })
       expect(plans(w)).toHaveLength(2)
       expect(w.chainTriggers()).toHaveLength(4)
       expect(w.historyReads).toEqual(['epic-1', 'epic-1'])
+    })
+
+    it('retries a re-delegation whose history read failed on the next check, and starts once', async () => {
+      const w = await stoppedChain()
+      w.state.set(CHAIN_KEYS.delegated, new Date(Date.now() - 60_000).toISOString())
+      w.redelegate('h1')
+      settle(w, 30_000)
+      w.failures.DelegationHistory = 1
+      expect((await w.round()).chainFailed).toBe(1)
+      expect(w.record()!.run).toBe('es1')
+      await w.round(); await w.round()
+      expect(w.record()).toMatchObject({ run: 'h1', status: 'running' })
+      expect(plans(w)).toHaveLength(2)
+      expect(w.historyReads).toEqual(['epic-1'])
     })
 
     it('does nothing when the epic is delegated again while its chain runs', async () => {
@@ -1627,14 +1653,25 @@ describe('chain', () => {
     })
 
     it('starts nothing when the app itself or no person delegated the epic, and does not read that change again', async () => {
-      for (const [actor, bot] of [[{ id: VIEWER, name: 'dsh', app: true }, null], [{ id: VIEWER, name: 'dsh', app: false }, null], [{ id: 'bot-1', name: 'Agent', app: true }, null], [null, { type: 'workflow' }],
-        [{ id: OWNER, name: 'Owner', app: false }, { type: 'integration' }]] as const) {
+      for (const [actor, bot] of [[{ id: VIEWER, name: 'dsh', app: true }, null], [{ id: VIEWER, name: 'dsh', app: false }, null], [{ id: 'bot-1', name: 'Agent', app: true }, null],
+        [null, { type: 'workflow' }], [{ id: OWNER, name: 'Owner', app: false }, { type: 'integration' }]] as const) {
         const w = await stoppedChain()
         w.redelegate('h1', actor, 'epic-1', bot)
-        await w.round(); await w.round()
+        expect((await w.round()).chainFailed).toBe(0)
+        settle(w)
+        await w.round()
         expect(w.record()).toMatchObject({ run: 'es1', status: 'stopped' })
         expect(w.historyReads).toEqual(['epic-1'])
       }
+    })
+
+    it('starts nothing for a delegation older than the last check', async () => {
+      const w = await stoppedChain()
+      w.redelegate('h1')
+      w.history.get('epic-1')![0]!.createdAt = new Date(Date.now() - 10 * 60_000).toISOString()
+      await w.round()
+      expect(w.record()).toMatchObject({ run: 'es1', status: 'stopped' })
+      expect(w.historyReads).toEqual(['epic-1'])
     })
 
     it('starts nothing on an Issue without open sub-issues', async () => {
@@ -1646,31 +1683,53 @@ describe('chain', () => {
       expect(w.chainTriggers()).toHaveLength(2)
     })
 
-    it('watches an Issue only from a session it saw, and starts nothing on the first sight of one delegated already', async () => {
+    it('starts from a session it saw on an undelegated Issue, and reads no history for an Issue it never knew', async () => {
       const w = world()
-      w.epic(); w.kid(2)
+      w.epic().delegate = null; w.kid(2)
       w.epic('epic-2', 'WEB-20'); w.kid(5, { epic: 'epic-2' })
       w.delegate('m1', 'epic-1', { id: OWNER }, { comment: { id: 'c1', body: '@dsh status?' } })
-      await w.round(); await w.round()
-      expect(w.delegateReads.flat()).not.toContain('epic-2')
-      expect(w.delegateReads.flat()).toContain('epic-1')
-      expect(w.record()).toBeUndefined()
-      expect(w.historyReads).toEqual([])
-      w.epics.get('epic-1')!.delegate = null
       await w.round()
+      w.redelegate('h2', undefined, 'epic-2')
+      await w.round()
+      expect(w.record('epic-2')).toBeUndefined()
+      expect(w.historyReads).toEqual([])
       w.redelegate('h1')
       await w.round()
       expect(w.record()).toMatchObject({ run: 'h1', session: 'm1', status: 'running' })
       expect(plans(w).map(activity => activity.session)).toEqual(['m1'])
       expect(w.startedKids()).toEqual(['WEB-2'])
-      expect(w.record('epic-2')).toBeUndefined()
+      expect(w.historyReads).toEqual(['epic-1'])
+    })
+
+    it('reads the history of an Issue it knew as undelegated once, and not for its later changes', async () => {
+      const w = world()
+      w.epic().delegate = null; w.kid(2)
+      w.delegate('m1', 'epic-1', { id: OWNER }, { comment: { id: 'c1', body: '@dsh status?' } })
+      await w.round()
+      w.redelegate('h1', { id: 'bot-1', name: 'Agent', app: true })
+      await w.round()
+      settle(w)
+      w.epics.get('epic-1')!.updatedAt = new Date().toISOString()
+      await w.round()
+      expect(w.record()).toBeUndefined()
+      expect(w.historyReads).toEqual(['epic-1'])
+    })
+
+    it('starts nothing from a change on an Issue it last saw delegated to the app', async () => {
+      const w = world()
+      w.epic(); w.kid(2)
+      w.delegate('m1', 'epic-1', { id: OWNER }, { comment: { id: 'c1', body: '@dsh status?' } })
+      await w.round()
+      w.redelegate('h1')
+      await w.round()
+      expect(w.record()).toBeUndefined()
+      expect(w.historyReads).toEqual([])
     })
 
     it('starts the run without posting when no session of the Issue is known', async () => {
       const w = world()
       w.epic().delegate = null; w.kid(2)
-      w.state.set(CHAIN_KEYS.watched, { 'epic-1': { at: new Date().toISOString() } })
-      await w.round()
+      w.state.set(CHAIN_KEYS.watched, { 'epic-1': { at: new Date().toISOString(), delegate: null } })
       w.redelegate('h1')
       await w.round()
       expect(w.record()).toMatchObject({ run: 'h1', session: '', status: 'running' })
@@ -1682,13 +1741,44 @@ describe('chain', () => {
       expect(w.completed).toEqual(['epic-1'])
     })
 
+    it('adopts a session that arrives right after a delegation started the run, and starts a new run from a later one', async () => {
+      const w = await stoppedChain()
+      w.redelegate('h1')
+      await w.round()
+      w.delegate('es2')
+      await w.round(); await w.round()
+      expect(w.record()).toMatchObject({ run: 'h1', session: 'es2', status: 'running' })
+      expect(w.state.get(CHAIN_KEYS.run('es2'))).toBe('epic-1')
+      expect(plans(w)).toHaveLength(2)
+      expect(w.chainTriggers()).toHaveLength(4)
+      const record = w.record()!
+      w.state.set(CHAIN_KEYS.chain('epic-1'), { ...record, delegation: { at: new Date(Date.now() - ADOPT_MS).toISOString() } })
+      w.delegate('es3')
+      await w.round()
+      expect(w.record()).toMatchObject({ run: 'es3', session: 'es3' })
+    })
+
+    it('costs one request a check when nothing changed, and moves the check time only after a successful read', async () => {
+      const w = world()
+      w.epic().delegate = null; w.kid(2)
+      await w.round()
+      const before = w.stub.calls.length
+      await w.round()
+      expect(w.stub.calls.slice(before).filter(call => call.query && !/agentSessions|agentActivities|teams\(/.test(call.query)).map(call => call.query!.match(/query (\w+)/)?.[1]))
+        .toEqual(['DelegatedIssues'])
+      const checked = new Date(Date.now() - 60_000).toISOString()
+      w.state.set(CHAIN_KEYS.delegated, checked)
+      w.failures.DelegatedIssues = 1
+      await w.round()
+      expect(w.state.get(CHAIN_KEYS.delegated)).toBe(checked)
+    })
+
     it('forgets a watched Issue after the close horizon', async () => {
       const w = world()
       w.epic(); w.kid(2)
       w.state.set(CHAIN_KEYS.watched, { 'epic-1': { at: new Date(Date.now() - CLOSE_HORIZON_MS).toISOString(), delegate: null } })
       await w.round()
       expect(w.state.get(CHAIN_KEYS.watched)).toBeUndefined()
-      expect(w.delegateReads).toEqual([])
     })
   })
 

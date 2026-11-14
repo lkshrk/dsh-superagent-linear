@@ -10,7 +10,10 @@ export const CHAIN_KEYS = {
   run: (session: string) => `linear-chain-run:${session}`,
   held: (session: string) => `linear-chain-held:${session}`,
   watched: 'linear-watched',
+  delegated: 'linear-delegated-checked',
 }
+/** How long after a delegation started a run a new session on the epic joins it instead of starting another. */
+export const ADOPT_MS = 2 * 60_000
 export const CHAIN_INTERVAL_MS = 30_000
 export const CHAIN_WAIT_MS = 30 * 60_000
 export const HOLD_MS = 10 * 60_000
@@ -20,6 +23,7 @@ export interface ChainRecord {
   run: string; session: string; delegator: { id: string; name?: string }; status: 'running' | 'stopped' | 'done'; reason?: string
   team: string; teamKey: string; project?: string; projectName?: string; identifier: string; url: string
   delegated: boolean; started: Record<string, Started>; children?: { id: string; identifier: string }[]; checked?: string
+  delegation?: { at: string }
 }
 type Child = Chain['children']['nodes'][number]
 interface Env { ctx: SourceContext; client: LinearClient; config: LinearConfig; viewer: string; round: Round; signal: AbortSignal }
@@ -57,7 +61,7 @@ export function releaseHold(ctx: SourceContext, key: string): void {
 export const unreadableText = (identifier: string) => `Could not read the sub-issues of ${identifier}; write "start" in this session to retry.`
 const closed = (state: { type: string } | null | undefined) => state?.type === 'completed' || state?.type === 'canceled'
 
-interface Start { run: string; session: string; issue: Issue; delegator: { id: string; name?: string | null } }
+interface Start { run: string; session: string; issue: Issue; delegator: { id: string; name?: string | null }; delegation?: boolean }
 /** Starts a fresh run, replacing any earlier one; the children that run started and are still busy carry over. Idempotent per `run`. */
 async function startRun(ctx: SourceContext, client: LinearClient, start: Start, context: IssueContext, viewer: string, parallel: number,
   signal: AbortSignal): Promise<void> {
@@ -67,18 +71,27 @@ async function startRun(ctx: SourceContext, client: LinearClient, start: Start, 
     const carried = before?.status === 'running' ? [...busy(ctx, before)].flatMap(id => before.started[id] ? [[id, before.started[id]] as const] : []) : []
     save(ctx, issue.id, { run, session, delegator: { id: delegator.id, ...delegator.name ? { name: delegator.name } : {} },
       status: 'running', team: issue.team.id, teamKey: issue.team.key, ...issue.project ? { project: issue.project.id, ...issue.project.name ? { projectName: issue.project.name } : {} } : {},
-      identifier: issue.identifier, url: issue.url, delegated: issue.delegate?.id === viewer, started: Object.fromEntries(carried) })
+      identifier: issue.identifier, url: issue.url, delegated: issue.delegate?.id === viewer, started: Object.fromEntries(carried),
+      ...start.delegation ? { delegation: { at: new Date().toISOString() } } : {} })
   }
   setActive(ctx, issue.id, true)
   const list = context.children.nodes.map(child => `${child.identifier}${closed(child.state) ? ' (done)' : ''}`).join(', ')
   const more = context.children.pageInfo.hasNextPage ? ' and more' : ''
-  watch(ctx, issue.id, session || undefined)
+  watch(ctx, issue.id, { session })
   await tell(client, session, `chain-plan:${run}`, { type: 'thought',
     body: `Working through the sub-issues of ${issue.identifier} in the order their blocking relations allow, at most ${parallel} at a time: ${list}${more}.` }, signal)
   ctx.state.set(CHAIN_KEYS.run(run), issue.id)
 }
 export async function startChain(ctx: SourceContext, client: LinearClient, session: Session, context: IssueContext, viewer: string, parallel: number,
   signal: AbortSignal): Promise<void> {
+  const record = chainOf(ctx, session.issue!.id)
+  if (record?.status === 'running' && record.delegation && Date.now() - Date.parse(record.delegation.at) < ADOPT_MS) {
+    record.session = session.id
+    save(ctx, session.issue!.id, record)
+    watch(ctx, session.issue!.id, { session: session.id })
+    ctx.state.set(CHAIN_KEYS.run(session.id), session.issue!.id)
+    return
+  }
   await startRun(ctx, client, { run: session.id, session: session.id, issue: session.issue!, delegator: session.creator! }, context, viewer, parallel, signal)
 }
 
@@ -355,48 +368,55 @@ async function finish(env: Env, epic: string, record: ChainRecord): Promise<void
   setActive(ctx, epic, false)
 }
 
-/** An Issue whose delegate is read with the open tickets': its last session known to the plugin, when it was last relevant, and its delegate at the last read. */
+/** What the Source last knew of an Issue: its last session seen, when, and its delegate when known. */
 export interface Watch { session?: string; at: string; delegate?: string | null }
+export const DELEGATION_OVERLAP_MS = 5000
 const watches = (ctx: SourceContext) => ctx.state.get<Record<string, Watch>>(CHAIN_KEYS.watched) ?? {}
-export function watch(ctx: SourceContext, issue: string, session?: string): void {
+export function watch(ctx: SourceContext, issue: string, fields: { session?: string; delegate?: string | null }): void {
   const all = watches(ctx)
-  ctx.state.set(CHAIN_KEYS.watched, { ...all, [issue]: { ...all[issue], ...session ? { session } : {}, at: new Date().toISOString() } })
+  ctx.state.set(CHAIN_KEYS.watched, { ...all, [issue]: { ...all[issue], ...fields.session ? { session: fields.session } : {},
+    ...fields.delegate !== undefined ? { delegate: fields.delegate } : {}, at: new Date().toISOString() } })
 }
-/** Refreshes the Issues of `relevant` tickets and running chains, drops the rest after CLOSE_HORIZON_MS, and returns the watched Issues. */
-export function watchedIssues(ctx: SourceContext, relevant: { issue: string; session?: string }[]): string[] {
-  for (const { issue, session } of relevant) watch(ctx, issue, session)
-  for (const epic of active(ctx)) watch(ctx, epic, chainOf(ctx, epic)?.session || undefined)
+function prune(ctx: SourceContext): void {
   const now = Date.now()
-  const kept = Object.entries(watches(ctx)).filter(([, entry]) => now - Date.parse(entry.at) < CLOSE_HORIZON_MS)
-  ctx.state.set(CHAIN_KEYS.watched, kept.length ? Object.fromEntries(kept) : undefined)
-  return kept.map(([issue]) => issue)
+  const all = Object.entries(watches(ctx))
+  const kept = all.filter(([, entry]) => now - Date.parse(entry.at) < CLOSE_HORIZON_MS)
+  if (kept.length !== all.length) ctx.state.set(CHAIN_KEYS.watched, kept.length ? Object.fromEntries(kept) : undefined)
 }
 
 /**
- * Starts a chain on each watched Issue a person delegated to the app since the last read, when no chain runs for it and it has open
- * sub-issues: Linear reuses the Issue's session then, so no new one arrives. A first read only records the delegate.
+ * Starts a chain on each Issue a person delegated to the app since the last check, read in one query, when the Source knew it
+ * as not delegated to the app or it has a chain that is not running, and it has open sub-issues: Linear reuses the Issue's
+ * session then, so no new one arrives. The check time moves only once every candidate was handled.
  */
-export async function followDelegations(ctx: SourceContext, client: LinearClient, viewer: string, parallel: number, statuses: Map<string, IssueStatus>,
-  round: Round, signal: AbortSignal): Promise<void> {
-  for (const [issue, entry] of Object.entries(watches(ctx))) {
+export async function followDelegations(ctx: SourceContext, client: LinearClient, viewer: string, parallel: number, round: Round, signal: AbortSignal): Promise<void> {
+  prune(ctx)
+  const checked = ctx.state.get<string>(CHAIN_KEYS.delegated)
+  const now = new Date().toISOString()
+  if (!checked) { ctx.state.set(CHAIN_KEYS.delegated, now); return }
+  const since = new Date(Date.parse(checked) - DELEGATION_OVERLAP_MS).toISOString()
+  let ids: string[]
+  try { ids = await client.delegatedIssues(viewer, since, signal) }
+  catch (error) { if (signal.aborted) throw error; round.chainFailed++; return }
+  let failed = false
+  for (const issue of ids) {
     if (signal.aborted) throw new Error('The Linear Source stopped during the delegations')
-    const status = statuses.get(issue)
-    if (!status) continue
-    if (entry.delegate !== undefined && entry.delegate !== viewer && status.delegate === viewer && chainOf(ctx, issue)?.status !== 'running') {
-      // The delegate stays as it was, so the next read tries again.
-      try { await redelegated(ctx, client, issue, entry, viewer, parallel, signal) }
-      catch (error) { if (signal.aborted) throw error; round.chainFailed++; continue }
+    const record = chainOf(ctx, issue)
+    const known = watches(ctx)[issue]?.delegate
+    if (record?.status !== 'running' && (record || (known !== undefined && known !== viewer))) {
+      try { await redelegated(ctx, client, issue, viewer, since, parallel, signal) }
+      catch (error) { if (signal.aborted) throw error; round.chainFailed++; failed = true; continue }
     }
-    const all = watches(ctx)
-    if (all[issue]) ctx.state.set(CHAIN_KEYS.watched, { ...all, [issue]: { ...all[issue], delegate: status.delegate } })
+    if (watches(ctx)[issue]) watch(ctx, issue, { delegate: viewer })
   }
+  if (!failed) ctx.state.set(CHAIN_KEYS.delegated, now)
 }
-async function redelegated(ctx: SourceContext, client: LinearClient, issue: string, entry: Watch, viewer: string, parallel: number, signal: AbortSignal): Promise<void> {
-  const change = await client.delegation(issue, viewer, signal)
+async function redelegated(ctx: SourceContext, client: LinearClient, issue: string, viewer: string, since: string, parallel: number, signal: AbortSignal): Promise<void> {
+  const change = await client.delegation(issue, viewer, since, signal)
   if (!change?.person || ctx.state.get(CHAIN_KEYS.run(change.id))) return
   const context = await client.issueContext(issue, signal)
   if (!context.children.nodes.some(child => !closed(child.state))) return
   const details = await client.issue(issue, signal)
-  const session = chainOf(ctx, issue)?.session || entry.session || ''
-  await startRun(ctx, client, { run: change.id, session, issue: details, delegator: change.person }, context, viewer, parallel, signal)
+  const session = chainOf(ctx, issue)?.session || watches(ctx)[issue]?.session || ''
+  await startRun(ctx, client, { run: change.id, session, issue: details, delegator: change.person, delegation: true }, context, viewer, parallel, signal)
 }
