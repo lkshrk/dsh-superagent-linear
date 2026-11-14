@@ -3,7 +3,7 @@ import { z } from 'zod'
 import { LinearClient, LinearError, READ_PAGES, stableUuid, type ActivityContent, type IssueContext, type IssueStatus, type Prompt, type Read, type Session, type Undelegation } from './linear-api.ts'
 import type { OutboundMessage, SourceContext, SourceKind, Trigger } from './types.ts'
 import { Waker } from './webhook.ts'
-import { CHAIN_KEYS, advanceChains, epicMention, epicPrompt, followDelegations, holdUnreadable, mayControl, ownSession, releaseHold, startChain, unreadableText, watch } from './linear-chain.ts'
+import { CHAIN_KEYS, advanceChains, epicMention, epicPrompt, followDelegations, holdUnreadable, mayControl, ownSession, refuseDelegation, releaseHold, startChain, unreadableText, watch } from './linear-chain.ts'
 
 export const SOURCE = 'linear'
 export const HEALTH = 'linear'
@@ -324,10 +324,12 @@ export async function pollLinear(ctx: SourceContext, client: LinearClient, confi
       if (context) releaseHold(ctx, session.id)
       // An Issue with sub-issues is worked through them; it never gets a worker of its own.
       if (context?.children.nodes.length) {
-        if (found.human && session.issue?.delegate?.id === viewer && !session.comment && mayControl(ctx, found.actor.id)) {
+        const delegation = found.human && session.issue?.delegate?.id === viewer && !session.comment
+        if (delegation && mayControl(ctx, found.actor.id)) {
           await startChain(ctx, client, session, context, viewer, config.chainParallel, signal)
           round.sessions++
-        } else if (found.human) await epicMention(ctx, client, session, signal)
+        } else if (delegation) await refuseDelegation(ctx, client, session, signal)
+        else if (found.human) await epicMention(ctx, client, session, signal)
         continue
       }
       // Unknown sub-issues could make the Issue an epic, which never gets a worker of its own; it waits for a readable round.

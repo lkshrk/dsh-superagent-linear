@@ -1330,7 +1330,7 @@ describe('chain', () => {
     expect(w.received).toEqual([])
     expect(w.record()).toBeUndefined()
     expect(w.activities.map(activity => [activity.session, activity.body])).toEqual([['es1',
-      'Not working on WEB-10. To start a chain, delegate the issue to the app; if it is delegated already, write "start" in its session.']])
+      'Not working on WEB-10. To start a chain, delegate the issue to the app; if it is delegated already, write exactly "start" in its session.']])
     const labelled = world()
     labelled.epic(); labelled.kids.clear()
     labelled.prompts.push(prompt('p2', '2026-11-12T10:01:00.000Z', { agentSession: { id: 'es9', issue: { ...issue(), labels: { nodes: [{ name: 'EPIC' }] } } } }))
@@ -1713,6 +1713,14 @@ describe('chain', () => {
     open.close(2); open.epics.get('epic-1')!.state = 'completed'
     await open.round()
     expect(open.record()).toMatchObject({ status: 'stopped', reason: 'WEB-10 was completed' })
+    const undelegated = world()
+    undelegated.epic(); undelegated.kid(2)
+    undelegated.delegate('es1')
+    await undelegated.round()
+    undelegated.close(2); Object.assign(undelegated.epics.get('epic-1')!, { state: 'completed', delegate: null })
+    await undelegated.round()
+    expect(undelegated.record()).toMatchObject({ status: 'done' })
+    expect(undelegated.activities.at(-1)!.body).toMatch(/^All sub-issues of WEB-10 are done\./)
   })
 
   it('restarts a stopped chain only from a prompt that says start, and answers any other prompt with the status', async () => {
@@ -1725,7 +1733,7 @@ describe('chain', () => {
     w.prompt('p1', 'epic-1', { content: { body: 'what is going on?' } })
     await w.round()
     expect(w.record()).toMatchObject({ run: 'es1', status: 'stopped' })
-    expect(w.activities.at(-1)!.body).toMatch(/^Not working on WEB-10 \(stopped: WEB-3 ended without being completed\)\..*write "start" in its session\.$/)
+    expect(w.activities.at(-1)!.body).toMatch(/^Not working on WEB-10 \(stopped: WEB-3 ended without being completed\)\..*write exactly "start" in its session\.$/)
     w.prompt('p2', 'epic-1', { content: { body: '  Start \n' } })
     await w.round()
     expect(w.record()).toMatchObject({ run: 'p2', status: 'running' })
@@ -1776,7 +1784,9 @@ describe('chain', () => {
     expect(w.record()).toMatchObject({ status: 'stopped', reason: 'stalled: WEB-2 waits for an issue the app cannot read' })
   })
 
-  it('lets only a user the policy allows stop a chain; anyone else gets the status and the chain runs on', async () => {
+  const REFUSED = 'Only users on the Linear Source\'s allowed list can start or stop a chain of sub-issues.'
+  const NO_POLICY = 'This dsh-superagent version cannot check the Linear policy, so nobody can start or stop a chain of sub-issues.'
+  it('lets only a user the policy allows stop a chain; anyone else is told so and the chain runs on', async () => {
     const w = world()
     w.epic(); w.kid(2); w.kid(3)
     w.delegate('es1')
@@ -1785,26 +1795,31 @@ describe('chain', () => {
     await w.round()
     expect(w.record()).toMatchObject({ status: 'running' })
     expect(w.received.filter(trigger => trigger.meta.kind === 'chain-stop')).toEqual([])
-    expect(w.activities.at(-1)).toEqual({ session: 'es1', type: 'thought', body: 'Working on WEB-2, WEB-3 of WEB-10. A stop in this session ends the chain.' })
+    expect(w.activities.at(-1)).toEqual({ session: 'es1', type: 'thought', body: REFUSED })
     w.prompt('p2', 'epic-1', { signal: 'stop', content: { body: '' } })
     await w.round()
     expect(w.record()).toMatchObject({ status: 'stopped', reason: 'stop requested in Linear' })
     expect(vi.mocked(w.ctx.admits!).mock.calls).toContainEqual([{ id: 'stranger', human: true }])
   })
 
-  it('lets only a user the policy allows start a chain by delegation, re-delegation or a start prompt', async () => {
+  it('lets only a user the policy allows start a chain by delegation, re-delegation or a start prompt, and tells anyone else once', async () => {
     const delegated = world()
     delegated.epic(); delegated.kid(2)
     delegated.delegate('es1', 'epic-1', { id: 'stranger', name: 'Stranger' })
     await delegated.round()
     expect(delegated.record()).toBeUndefined()
     expect(delegated.received).toEqual([])
-    expect(delegated.activities.at(-1)!.body).toMatch(/^Not working on WEB-10\./)
+    expect(delegated.activities.at(-1)).toEqual({ session: 'es1', type: 'thought', body: REFUSED })
+    await delegated.round()
+    expect(delegated.activities.filter(activity => activity.body === REFUSED)).toHaveLength(1)
     const prompted = world()
     prompted.epic(); prompted.kid(2)
     prompted.prompt('p1', 'epic-1', { content: { body: 'start' }, user: { id: 'stranger', name: 'Stranger' } })
     await prompted.round()
     expect(prompted.record()).toBeUndefined()
+    expect(prompted.activities.at(-1)!.body).toBe(REFUSED)
+    prompted.prompt('p2', 'epic-1', { content: { body: 'how is it going?' }, user: { id: 'stranger', name: 'Stranger' } })
+    await prompted.round()
     expect(prompted.activities.at(-1)!.body).toMatch(/^Not working on WEB-10\./)
     const redelegated = world()
     redelegated.epic().delegate = null; redelegated.kid(2)
@@ -1812,6 +1827,10 @@ describe('chain', () => {
     redelegated.redelegate('h1', { id: 'stranger', name: 'Stranger', app: false })
     await redelegated.round()
     expect(redelegated.record()).toBeUndefined()
+    expect(redelegated.activities).toEqual([{ session: 'es1', type: 'thought', body: REFUSED }])
+    redelegated.redelegate('h2', { id: 'stranger', name: 'Stranger', app: false })
+    await redelegated.round()
+    expect(redelegated.activities).toHaveLength(2)
   })
 
   it('lets nobody start or stop a chain on a host without the policy accessor, and says so in health', async () => {
@@ -1822,7 +1841,7 @@ describe('chain', () => {
     const round = await w.round()
     expect(round.noPolicyAccessor).toBe(true)
     expect(w.record()).toBeUndefined()
-    expect(w.activities.at(-1)!.body).toMatch(/^Not working on WEB-10\./)
+    expect(w.activities.at(-1)!.body).toBe(NO_POLICY)
     const running = world()
     running.epic(); running.kid(2); running.kid(3)
     running.delegate('es1')
@@ -1831,6 +1850,7 @@ describe('chain', () => {
     running.prompt('p1', 'epic-1', { signal: 'stop', content: { body: '' } })
     await running.round()
     expect(running.record()).toMatchObject({ status: 'running' })
+    expect(running.activities.at(-1)!.body).toBe(NO_POLICY)
     const stub = linear({ agentSessions: () => ({ agentSessions: page([]) }), agentActivities: () => ({ agentActivities: page([]) }) })
     const h = context()
     delete h.ctx.admits
@@ -1877,7 +1897,7 @@ describe('chain', () => {
     expect(stuck.record()).toBeUndefined()
     expect(stuck.received).toEqual([])
     expect(stuck.state.has(CHAIN_KEYS.held('p1'))).toBe(false)
-    expect(stuck.activities.at(-1)).toEqual({ session: 'es1', type: 'error', body: 'Could not read the sub-issues of WEB-10; write "start" in this session to retry.' })
+    expect(stuck.activities.at(-1)).toEqual({ session: 'es1', type: 'error', body: 'Could not read the sub-issues of WEB-10; write exactly "start" in this session to retry.' })
     await stuck.round()
     expect(stuck.state.has(CHAIN_KEYS.held('p1'))).toBe(false)
     expect(stuck.activities.filter(activity => activity.type === 'error')).toHaveLength(1)
@@ -1911,7 +1931,7 @@ describe('chain', () => {
     expect(w.received).toEqual([])
     expect(w.record()).toBeUndefined()
     expect(w.state.get(KEYS.sessions)).not.toBe(T0)
-    expect(w.activities.at(-1)).toEqual({ session: 'es1', type: 'error', body: 'Could not read the sub-issues of WEB-10; write "start" in this session to retry.' })
+    expect(w.activities.at(-1)).toEqual({ session: 'es1', type: 'error', body: 'Could not read the sub-issues of WEB-10; write exactly "start" in this session to retry.' })
     await w.round()
     expect(w.activities.filter(activity => activity.type === 'error')).toHaveLength(1)
     w.failures.IssueContext = 0
@@ -1937,7 +1957,7 @@ describe('chain', () => {
       await w.round()
       expect(w.received).toEqual([])
       expect(w.record()).toBeUndefined()
-      expect(w.activities.at(-1)).toEqual({ session: 'm1', type: 'thought', body: 'Not working on WEB-10. To start a chain, delegate the issue to dsh; if it is delegated already, write "start" in its session.' })
+      expect(w.activities.at(-1)).toEqual({ session: 'm1', type: 'thought', body: 'Not working on WEB-10. To start a chain, delegate the issue to dsh; if it is delegated already, write exactly "start" in its session.' })
     }
     const w = world()
     w.epic(); w.kid(2)
