@@ -1,0 +1,22 @@
+pre-commit:
+  parallel: true
+  commands:
+    gitleaks:
+      run: gitleaks git --staged --redact --no-banner
+    actionlint:
+      glob: ".github/workflows/*.{yml,yaml}"
+      run: actionlint {staged_files}
+    json:
+      glob: "*.json"
+      run: 'command -v jq >/dev/null || { echo "jq not installed, skipping JSON check"; exit 0; }; for f in {staged_files}; do jq empty "$f" || { echo "$f is not valid JSON"; exit 1; }; done'
+    yaml:
+      glob: "*.{yaml,yml}"
+      run: 'for f in {staged_files}; do yq "." "$f" >/dev/null || { echo "$f is not valid YAML"; exit 1; }; done'
+    typecheck:
+      glob: "{*.ts,tsconfig*.json}"
+      run: 'pnpm typecheck || { echo "fix the type errors above (pnpm typecheck)"; exit 1; }'
+
+pre-push:
+  commands:
+    check:
+      run: 'pnpm check || { echo "pnpm check failed: fix it before pushing"; exit 1; }'
