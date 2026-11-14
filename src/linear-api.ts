@@ -17,6 +17,10 @@ export class LinearError extends Error {
   get gone(): boolean { return this.codes.some(code => /not.?found/i.test(code)) || /entity not found|could not find/i.test(this.message) }
   get unauthenticated(): boolean { return this.status === 401 || this.codes.some(code => /authenticat/i.test(code)) }
   get throttled(): boolean { return this.codes.includes('MINT_THROTTLED') || this.codes.includes('RATELIMITED') }
+  /** The API refused an argument, such as a page cursor it no longer knows ("Argument Validation Error", INVALID_INPUT). */
+  get invalidInput(): boolean {
+    return this.status !== undefined && this.status < 500 && (this.codes.some(code => /invalid.?input/i.test(code)) || /argument validation|pagination cursor/i.test(this.message))
+  }
 }
 
 export interface Credentials { clientIdFile: string; clientSecretFile: string }
@@ -107,9 +111,8 @@ export interface Read<T> { items: T[]; unreadable: number; next?: string }
 export interface ActivityContent { type: 'thought' | 'response' | 'error'; body: string }
 
 /** Which error paths a read can take part of its data with; the nodes they name come back null. */
-type Partial = (path: unknown[]) => boolean
-const anyNested: Partial = () => true
-const blockerOnly: Partial = path => path.at(-1) === 'issue' && path.includes('inverseRelations')
+type PartialOk = (path: unknown[]) => boolean
+const anyNested: PartialOk = () => true
 
 export class LinearClient {
   private token?: { value: string; expires: number }
@@ -157,7 +160,7 @@ export class LinearClient {
   }
 
   /** Runs a GraphQL request, minting a new token once when Linear no longer accepts the cached one. */
-  async request<T>(query: string, variables: Record<string, unknown>, signal?: AbortSignal, partial?: Partial): Promise<T> {
+  async request<T>(query: string, variables: Record<string, unknown>, signal?: AbortSignal, partial?: PartialOk): Promise<T> {
     try { return await this.once<T>(query, variables, signal, partial) }
     catch (error) {
       if (!(error instanceof LinearError) || !error.unauthenticated) throw error
@@ -165,7 +168,7 @@ export class LinearClient {
       return await this.once<T>(query, variables, signal, partial)
     }
   }
-  private async once<T>(query: string, variables: Record<string, unknown>, signal?: AbortSignal, partial?: Partial): Promise<T> {
+  private async once<T>(query: string, variables: Record<string, unknown>, signal?: AbortSignal, partial?: PartialOk): Promise<T> {
     if (Date.now() < this.limitedUntil) throw new LinearError(`Linear's rate limit holds requests until ${new Date(this.limitedUntil).toISOString()}`, 429, ['RATELIMITED'])
     const token = await this.bearer(signal)
     const response = await this.fetcher(this.endpoints.apiUrl, { method: 'POST', signal: withTimeout(signal),
@@ -316,7 +319,7 @@ export class LinearClient {
   }
   /** An epic's delegate and state, and its sub-issues with their states, order and blockers. */
   async chainRead(epic: string, signal?: AbortSignal): Promise<Chain> {
-    return z.object({ issue: ChainSchema }).parse(await this.request(CHAIN_READ, { id: epic }, signal, blockerOnly)).issue
+    return z.object({ issue: ChainSchema }).parse(await this.request(CHAIN_READ, { id: epic }, signal)).issue
   }
   async issue(id: string, signal?: AbortSignal): Promise<Issue> {
     return z.object({ issue: Issue }).parse(await this.request(CHAIN_CHILD, { id }, signal)).issue

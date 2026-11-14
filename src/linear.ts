@@ -74,14 +74,14 @@ export const threadOf = (issue: string) => `issue:${issue}`
 const cursorAfter = (since: string, newest: string | undefined) =>
   newest === undefined ? since : new Date(Math.max(Date.parse(since), Date.parse(newest) - 5000)).toISOString()
 interface Backlog { after: string; newest?: string }
-/** Reads on from a stored backlog; one Linear no longer continues is dropped, and the read starts again from the newest page. */
+/** Reads on from a stored backlog; one whose page cursor Linear refuses is dropped, and the read starts again from the newest page. */
 async function readOn<T>(ctx: SourceContext, backlogKey: string, read: (after?: string) => Promise<Read<T>>): Promise<{ read: Read<T>; backlog?: Backlog }> {
   const backlog = ctx.state.get<Backlog>(backlogKey)
   if (!backlog) return { read: await read() }
   try {
     return { read: await read(backlog.after), backlog }
   } catch (error) {
-    if (!(error instanceof LinearError) || error.throttled) throw error
+    if (!(error instanceof LinearError) || !error.invalidInput) throw error
     console.log(`dsh-superagent-linear: could not read ${backlogKey} on from its last page (${String(error)}); reading from the newest again`)
     ctx.state.set(backlogKey, undefined)
     return { read: await read() }

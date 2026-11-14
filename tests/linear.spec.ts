@@ -33,12 +33,13 @@ const prompt = (id: string, at: string, fields: Partial<Prompt> = {}): Prompt =>
 /** A stand-in Linear: the token endpoint and GraphQL by the operation each request names. */
 function linear(handlers: Record<string, (variables: Record<string, unknown>) => unknown> = {}) {
   const calls: { url: string; init: RequestInit; query?: string; variables?: Record<string, unknown> }[] = []
-  let token = 0, limited = 0
+  let token = 0, limited = 0, down = false
   const valid = new Set<string>()
   const fetcher = vi.fn(async (url: string | URL | Request, init: RequestInit = {}) => {
     const target = String(url)
     if (target.endsWith('/oauth/token')) {
       calls.push({ url: target, init })
+      if (down) throw new TypeError('fetch failed')
       const value = `token-${++token}`
       valid.add(value)
       return Response.json({ access_token: value, expires_in: 30 * 86_400 })
@@ -60,7 +61,7 @@ function linear(handlers: Record<string, (variables: Record<string, unknown>) =>
     catch (error) { return Response.json({ errors: [{ message: String((error as Error).message), extensions: { code: (error as { code?: string }).code } }] }) }
   })
   const client = new LinearClient(() => config(), { tokenUrl: 'https://linear.test/oauth/token', apiUrl: 'https://linear.test/graphql' }, fetcher as typeof fetch)
-  return { client, fetcher, calls, revoke: () => valid.clear(), limit: (reset: number) => { limited = reset } }
+  return { client, fetcher, calls, revoke: () => valid.clear(), limit: (reset: number) => { limited = reset }, down: (value: boolean) => { down = value } }
 }
 const page = (nodes: unknown[]) => ({ nodes, pageInfo: { hasNextPage: false, endCursor: null } })
 
@@ -143,7 +144,7 @@ describe('token', () => {
       message: 'The Linear token endpoint did not answer within 30 s 0 min ago; the next token request waits 15 min' })
     expect(stub.mints()).toBe(1)
   })
-  it('takes partial data only in context and blocker reads, with errors on nested nodes, and rejects the rest', async () => {
+  it('takes partial data only in the context read, with errors on nested nodes, and rejects the rest', async () => {
     const answer = (body: unknown) => {
       const fetcher = vi.fn(async (url: string | URL | Request) => String(url).endsWith('/oauth/token') ? tokenOk() : Response.json(body))
       return new LinearClient(() => config(), { tokenUrl: 'https://linear.test/oauth/token', apiUrl: 'https://linear.test/graphql' }, fetcher as typeof fetch)
@@ -164,7 +165,7 @@ describe('token', () => {
       children: { nodes: [{ id: 'k', identifier: 'WEB-2', title: 'Part', state: { type: 'started' }, assignee: null, subIssueSortOrder: 1,
         inverseRelations: { nodes: [{ type: 'blocks', issue: null }], pageInfo: { hasNextPage: false } } }], pageInfo: { hasNextPage: false } } } },
       errors: [{ message: 'Forbidden', path }] })
-    await expect(answer(chain(['issue', 'children', 'nodes', 0, 'inverseRelations', 'nodes', 0, 'issue'])).chainRead('e')).resolves.toMatchObject({ identifier: 'WEB-10' })
+    await expect(answer(chain(['issue', 'children', 'nodes', 0, 'inverseRelations', 'nodes', 0, 'issue'])).chainRead('e')).rejects.toThrow('Forbidden')
     await expect(answer(chain(['issue', 'children', 'nodes', 0, 'assignee'])).chainRead('e')).rejects.toThrow('Forbidden')
     log.mockRestore()
   })
@@ -509,6 +510,28 @@ describe('polling', () => {
     expect(new Set(h.received.map(trigger => trigger.id)).size).toBe(300)
     expect(h.state.get(KEYS.sessions)).toBe(new Date(Date.parse(at(300)) - 5000).toISOString())
     log.mockRestore()
+  })
+  it('keeps a backlog when the token cannot be renewed in the middle of it', async () => {
+    const all = Array.from({ length: 300 }, (_, n) => session(`s${n}`, at(n + 1)))
+    const reads: (string | undefined)[] = []
+    const read = paged(() => [...all].reverse(), reads)
+    const stub = linear({ agentSessions: variables => ({ agentSessions: read(variables) }), agentActivities: () => ({ agentActivities: page([]) }),
+      agentActivityCreate: () => ({ agentActivityCreate: { success: true } }) })
+    const h = context()
+    h.state.set(KEYS.sessions, T0); h.state.set(KEYS.prompts, T0)
+    const log = vi.spyOn(console, 'log').mockImplementation(() => {})
+    await pollLinear(h.ctx, stub.client, config(), signal())
+    const backlog = h.state.get(KEYS.sessionsBacklog)
+    expect(backlog).toMatchObject({ after: 's50' })
+    stub.revoke()
+    await expect(pollLinear(h.ctx, stub.client, config(), signal())).rejects.toMatchObject({ codes: ['MINT_THROTTLED'] })
+    expect(h.state.get(KEYS.sessionsBacklog)).toEqual(backlog)
+    vi.spyOn(Date, 'now').mockReturnValue(Date.now() + MINT_INTERVAL_MS + 1000)
+    stub.down(true)
+    await expect(pollLinear(h.ctx, stub.client, config(), signal())).rejects.toThrow('The Linear token endpoint was not reachable')
+    expect(h.state.get(KEYS.sessionsBacklog)).toEqual(backlog)
+    expect(log).not.toHaveBeenCalledWith(expect.stringContaining('could not read linear-sessions-backlog'))
+    vi.restoreAllMocks()
   })
   it('counts the replayed newest session and prompt only the first time', async () => {
     const stub = sources([session('s1', '2026-11-12T10:01:00.000Z')], [prompt('a1', '2026-11-12T10:02:00.000Z')])
