@@ -279,6 +279,8 @@ pnpm check
 
 Tests stub `fetch`. They never call Linear.
 
+Pushing a tag `vX.Y.Z` equal to `v` plus the `version` in `package.json` runs `pnpm check` and attaches `dsh-superagent-linear-X.Y.Z.tgz` to the GitHub release for that tag.
+
 ## License
 
 MIT. See [LICENSE](LICENSE).
