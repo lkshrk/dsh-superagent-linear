@@ -103,6 +103,52 @@ describe('token', () => {
     expect(stub.calls.filter(call => call.url.endsWith('/oauth/token'))).toHaveLength(2)
     vi.restoreAllMocks()
   })
+  function tokenEndpoint(answers: (() => Response | Promise<Response>)[]) {
+    let minted = 0
+    const fetcher = vi.fn(async (url: string | URL | Request) => {
+      if (String(url).endsWith('/oauth/token')) return await answers[Math.min(minted++, answers.length - 1)]!()
+      return Response.json({ data: { viewer: { id: VIEWER } } })
+    })
+    return { fetcher, client: new LinearClient(() => config(), { tokenUrl: 'https://linear.test/oauth/token', apiUrl: 'https://linear.test/graphql' }, fetcher as typeof fetch),
+      mints: () => fetcher.mock.calls.filter(([url]) => String(url).endsWith('/oauth/token')).length }
+  }
+  const tokenOk = () => Response.json({ access_token: 'token', expires_in: 30 * 86_400 })
+  it('asks for a token again next round after a transport error or unreadable credential files, without the 15-minute wait', async () => {
+    const stub = tokenEndpoint([() => { throw new TypeError('fetch failed') }, tokenOk])
+    await expect(stub.client.request('query { viewer { id } }', {})).rejects.toThrow('The Linear token endpoint was not reachable (TypeError: fetch failed); the next round tries again')
+    await expect(stub.client.request('query { viewer { id } }', {})).resolves.toEqual({ viewer: { id: VIEWER } })
+    expect(stub.mints()).toBe(2)
+    const files = tokenEndpoint([tokenOk])
+    rmSync(join(dir, 'client-secret'))
+    await expect(files.client.request('query { viewer { id } }', {})).rejects.toThrow('The Linear app credential files are not readable; the next round tries again')
+    await expect(files.client.request('query { viewer { id } }', {})).rejects.not.toMatchObject({ codes: ['MINT_THROTTLED'] })
+    writeFileSync(join(dir, 'client-secret'), 'secret\n')
+    await expect(files.client.request('query { viewer { id } }', {})).resolves.toEqual({ viewer: { id: VIEWER } })
+    expect(files.mints()).toBe(1)
+  })
+  it('waits 15 minutes after the token endpoint answered with an error, and says what it answered', async () => {
+    const stub = tokenEndpoint([() => new Response('busy', { status: 503 }), tokenOk])
+    await expect(stub.client.request('query { viewer { id } }', {})).rejects.toThrow('The Linear token endpoint answered 503')
+    await expect(stub.client.request('query { viewer { id } }', {})).rejects.toMatchObject({ codes: ['MINT_THROTTLED'],
+      message: 'The Linear token endpoint answered 503 0 min ago; the next token request waits 15 min' })
+    expect(stub.mints()).toBe(1)
+  })
+  it('takes partial data with errors on nested nodes, and rejects errors on a top-level field or without data', async () => {
+    const answer = (body: unknown) => {
+      const fetcher = vi.fn(async (url: string | URL | Request) => String(url).endsWith('/oauth/token') ? tokenOk() : Response.json(body))
+      return new LinearClient(() => config(), { tokenUrl: 'https://linear.test/oauth/token', apiUrl: 'https://linear.test/graphql' }, fetcher as typeof fetch)
+    }
+    const log = vi.spyOn(console, 'log').mockImplementation(() => {})
+    const partial = { data: { issue: { parent: null, children: { nodes: [], pageInfo: { hasNextPage: false } } } },
+      errors: [{ message: 'Entity not found: parent', path: ['issue', 'parent'] }] }
+    await expect(answer(partial).issueContext('issue-1')).resolves.toMatchObject({ parent: null })
+    expect(log).toHaveBeenCalledWith('dsh-superagent-linear: Linear answered in part: Entity not found: parent')
+    await expect(answer({ data: { issue: null }, errors: [{ message: 'Entity not found', path: ['issue'] }] }).request('query { issue { id } }', {}))
+      .rejects.toThrow('Entity not found')
+    await expect(answer({ data: null, errors: [{ message: 'Broken', path: ['issue', 'parent'] }] }).request('query { issue { id } }', {})).rejects.toThrow('Broken')
+    await expect(answer({ data: { issue: { id: 'x' } }, errors: [{ message: 'No path' }] }).request('query { issue { id } }', {})).rejects.toThrow('No path')
+    log.mockRestore()
+  })
   it('holds every request until a rate limit resets', async () => {
     const stub = linear()
     await stub.client.viewer()

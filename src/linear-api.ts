@@ -105,7 +105,7 @@ export interface ActivityContent { type: 'thought' | 'response' | 'error'; body:
 
 export class LinearClient {
   private token?: { value: string; expires: number }
-  private minted = 0
+  private minted?: { at: number; refused: string }
   private limitedUntil = 0
   private viewerId?: string
   private teamList?: { items: { id: string; key: string }[]; until: number }
@@ -113,22 +113,32 @@ export class LinearClient {
 
   /** Requests an app token with the fixed scope; the request body is written out by hand so the scope reaches Linear byte for byte. */
   private async mint(signal?: AbortSignal): Promise<string> {
-    const wait = this.minted + MINT_INTERVAL_MS - Date.now()
-    if (wait > 0) throw new LinearError(`Linear refused the token minted ${Math.round((Date.now() - this.minted) / 60_000)} min ago; the next token request waits ${Math.ceil(wait / 60_000)} min`, 401, ['MINT_THROTTLED'])
-    this.minted = Date.now()
+    const wait = this.minted ? this.minted.at + MINT_INTERVAL_MS - Date.now() : 0
+    if (this.minted && wait > 0) {
+      throw new LinearError(`${this.minted.refused} ${Math.round((Date.now() - this.minted.at) / 60_000)} min ago; the next token request waits ${Math.ceil(wait / 60_000)} min`, 401, ['MINT_THROTTLED'])
+    }
     const { clientIdFile, clientSecretFile } = this.credentials()
     let id: string, secret: string
     try {
       id = readFileSync(clientIdFile, 'utf8').trim()
       secret = readFileSync(clientSecretFile, 'utf8').trim()
-    } catch { throw new LinearError('The Linear app credential files are not readable') }
-    const response = await this.fetcher(this.endpoints.tokenUrl, { method: 'POST', signal: withTimeout(signal),
-      headers: { authorization: `Basic ${Buffer.from(`${id}:${secret}`).toString('base64')}`, 'content-type': 'application/x-www-form-urlencoded' },
-      body: `grant_type=client_credentials&scope=${SCOPE}` })
+    } catch { throw new LinearError('The Linear app credential files are not readable; the next round tries again') }
+    let response: Response
+    try {
+      response = await this.fetcher(this.endpoints.tokenUrl, { method: 'POST', signal: withTimeout(signal),
+        headers: { authorization: `Basic ${Buffer.from(`${id}:${secret}`).toString('base64')}`, 'content-type': 'application/x-www-form-urlencoded' },
+        body: `grant_type=client_credentials&scope=${SCOPE}` })
+    } catch (error) {
+      if (signal?.aborted) throw error
+      throw new LinearError(`The Linear token endpoint was not reachable (${String(error)}); the next round tries again`)
+    }
+    this.minted = { at: Date.now(), refused: `The Linear token endpoint answered ${response.status}` }
     if (!response.ok) throw new LinearError(`The Linear token endpoint answered ${response.status}`, response.status)
-    const body = z.looseObject({ access_token: z.string().min(1), expires_in: z.number().optional() }).parse(await response.json())
-    this.token = { value: body.access_token, expires: Date.now() + (body.expires_in ?? 30 * 86_400) * 1000 - TOKEN_SKEW_MS }
-    return body.access_token
+    const body = z.looseObject({ access_token: z.string().min(1), expires_in: z.number().optional() }).safeParse(await response.json().catch(() => undefined))
+    if (!body.success) { this.minted.refused = 'The Linear token endpoint answered without a token'; throw new LinearError(this.minted.refused, response.status) }
+    this.minted.refused = 'Linear refused the token minted'
+    this.token = { value: body.data.access_token, expires: Date.now() + (body.data.expires_in ?? 30 * 86_400) * 1000 - TOKEN_SKEW_MS }
+    return body.data.access_token
   }
   private async bearer(signal?: AbortSignal): Promise<string> {
     return this.token && Date.now() < this.token.expires ? this.token.value : await this.mint(signal)
@@ -148,7 +158,7 @@ export class LinearClient {
     const token = await this.bearer(signal)
     const response = await this.fetcher(this.endpoints.apiUrl, { method: 'POST', signal: withTimeout(signal),
       headers: { authorization: `Bearer ${token}`, 'content-type': 'application/json' }, body: JSON.stringify({ query, variables }) })
-    const body = await response.json().catch(() => ({})) as { data?: T; errors?: { message?: string; extensions?: { code?: string; type?: string } }[] }
+    const body = await response.json().catch(() => ({})) as { data?: T; errors?: { message?: string; path?: unknown; extensions?: { code?: string; type?: string } }[] }
     const codes = (body.errors ?? []).flatMap(error => [error.extensions?.code, error.extensions?.type].filter((code): code is string => !!code))
     if (response.status === 429 || codes.includes('RATELIMITED')) {
       const reset = Number(response.headers.get('x-ratelimit-requests-reset') ?? response.headers.get('x-ratelimit-endpoint-requests-reset'))
@@ -156,7 +166,13 @@ export class LinearClient {
       throw new LinearError('Linear rate-limited this app', response.status, [...new Set([...codes, 'RATELIMITED'])])
     }
     if (!response.ok) throw new LinearError(body.errors?.[0]?.message ?? `Linear answered ${response.status}`, response.status, codes)
-    if (body.errors?.length) throw new LinearError(body.errors.map(error => error.message ?? 'error').join('; '), response.status, codes)
+    if (body.errors?.length) {
+      const message = body.errors.map(error => error.message ?? 'error').join('; ')
+      // An error below a top-level field nulls only that node; one at the top or without a path nulls the field the caller needs.
+      const partial = body.data !== null && typeof body.data === 'object' && body.errors.every(error => Array.isArray(error.path) && error.path.length > 1)
+      if (!partial) throw new LinearError(message, response.status, codes)
+      console.log(`dsh-superagent-linear: Linear answered in part: ${message}`)
+    }
     if (body.data === undefined) throw new LinearError('Linear answered without data', response.status)
     return body.data
   }
