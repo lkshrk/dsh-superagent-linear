@@ -21,6 +21,7 @@ More detail:
 ## Requirements
 
 - dsh `^0.2.1-alpha.2 || ^0.2.2-0` with the dsh-superagent plugin. The Source registers through dsh-superagent's `orchestrator` service.
+- For chain mode: dsh-superagent from commit `e16b265` (lkshrk/dsh-superagent), whose Source context offers `admits`. On an older one, nobody can start or stop a chain, and health says so.
 - Node.js `^22.19.0 || >=24.0.0`.
 - A Linear OAuth app that uses the client credentials grant and acts as an app user. See [The Linear app](docs/linear-integration.md#the-linear-app).
 - dsh-superagent's GitHub Source, configured with every repository the Linear teams work in.
@@ -85,7 +86,7 @@ managed:
 
 [Configuration](docs/configuration.md) explains each key in full.
 
-Only people in the Policy's `allowed` list originate work. With the default admission table, a session from anyone else is ignored.
+Only people in the Policy's `allowed` list originate work. With the default admission table, a session from anyone else is ignored. Only they can start or stop a chain of sub-issues.
 
 The Source stays `paused` until both credential files and at least one enabled team are set.
 
@@ -111,7 +112,9 @@ Each polling round runs these steps in order:
 4. At most every 30 seconds: check re-delegated Issues, then the delegate and state of the Issues of those tickets.
 5. Advance active chains.
 
-Both cursors persist in the Source's state. The very first round, with no cursor stored yet, only sets both to now: older sessions are not work for it. After the Source is paused or switched off and on again, the next round reads everything since the stored cursors. Each query reads at most 10 pages of 25, so at most 250 sessions and 250 prompts; older items past that are not read.
+Both cursors persist in the Source's state. The very first round, with no cursor stored yet, only sets both to now: older sessions are not work for it. After the Source is paused or switched off and on again, the next round reads everything since the stored cursors.
+
+A round reads at most 10 pages of 25 per query. When more items arrived since the cursor, the Source stores where it stopped (`linear-sessions-backlog`, `linear-prompts-backlog`) and does not move the cursor. The next round reads on from there, until it reaches the cursor; then the cursor moves past the newest item seen. A backlog survives token and server outages. It is dropped only when Linear refuses its page cursor; the read then starts again from the newest page.
 
 A signed webhook delivery ends the wait between rounds early. See [Webhook](#webhook).
 
@@ -148,7 +151,9 @@ Each activity id derives from the message id, so a retry never posts twice. A me
 An Issue works in its project's repository when the team lists that project, else in the team's repository. The repository must be one the GitHub Source serves.
 
 - A team or project on a repository the GitHub Source does not list is skipped. Health names it.
+- An Issue whose repository the GitHub Source does not serve is not taken in. Its session gets one `error` activity, such as "Not taken in: ENG-12 works in acme/legacy, which this deployment does not serve."
 - An Issue with no repository at all is not taken in. Its session gets one `error` activity, such as "Not taken in: team ENG names no repository for project Design."
+- A prompt routed either way gets the same kind of `error` activity, once per prompt.
 - A prompt on an Issue with an open ticket follows that ticket's repository, even after the Issue moved to another project or team.
 
 ### Stop and undelegation
@@ -175,7 +180,7 @@ A new session on an Issue labelled `epic` (any case) that has no sub-issues gets
 Mode: split (plan this epic into sub-issues; no code)
 ```
 
-The worker sees `DSH_SUPERAGENT_LINEAR_MODE=split`. The Source does not create sub-issues itself. The worker creates them through the `linear` MCP server's `save_issue`, so workers need that MCP server. dsh-superagent admits Linear tools only to a split worker, and its `save_issue` only for sub-issues of that epic (see dsh-superagent's deployment docs).
+The worker sees `DSH_SUPERAGENT_LINEAR_MODE=split`. The Source does not create sub-issues itself. The worker creates them through the `linear` MCP server's `save_issue`, so workers need that MCP server. dsh-superagent gives `save_issue` only to a split worker, and only for sub-issues of that epic (see dsh-superagent's deployment docs).
 
 ### Chain mode
 
@@ -185,24 +190,28 @@ A person delegates an Issue with sub-issues to the app. The Issue never gets a w
 2. The Source opens an app session on each ready sub-issue and takes it in as a chain Trigger from the person who delegated the epic. A sub-issue is ready when each of its `blocks` blockers is completed or canceled.
 3. Ready sub-issues start in sub-issue order, while fewer than `chainParallel` run across all chains.
 4. A sub-issue assigned to a person is left alone. The chain waits for it.
-5. Once every sub-issue is completed or canceled, the Source completes the epic and lists the sub-issues and their pull requests in its session.
+5. Once every sub-issue is completed or canceled, the Source completes the epic and lists the sub-issues and their pull requests in its session. This also holds when Linear closed the epic with its last sub-issue, or removed the app as its delegate as it did.
+
+When nothing can start and the only open sub-issues are assigned to someone else, the epic's session gets one notice: "Waiting for ENG-13, assigned to someone else; the chain goes on once they close." A `blocks` blocker the app cannot read counts as open.
 
 The Source completes only the epic. Each sub-issue must be closed by `completeOnMerge`, by Linear's GitHub integration (`Fixes ENG-12` in the pull request), or by a person. A sub-issue whose ticket ends while it is still open stops the chain with "ENG-12 ended without being completed".
 
 Other ways to start a chain:
 
-- Write a message such as "start" in the session of a delegated epic that has open sub-issues and no running chain.
-- Delegate an epic the Source already knows to the app again. Linear reuses the old session, so the Source finds the re-delegation in the Issue's history. A delegation made by an automation or integration does not start a chain; write "start" instead.
+- Write exactly `start` (any case) in the session of a delegated epic that has open sub-issues and no running chain. Any other message gets the chain's status.
+- Delegate an epic the Source already knows to the app again. Linear reuses the old session, so the Source finds the re-delegation in the Issue's history. A delegation made by an automation or integration does not start a chain; write `start` instead.
 
 A mention of an epic, or a prompt while a chain runs, gets a thought with the chain's status. A stop in the epic's session ends the chain.
+
+Only users on the Linear Source's allowed list can start or stop a chain: by delegating, re-delegating, writing `start`, or sending a stop. The Source asks dsh-superagent through `admits`. Anyone else gets "Only users on the Linear Source's allowed list can start or stop a chain of sub-issues." Without `admits`, nobody can, and health says "nobody can start or stop a sub-issue chain: this dsh-superagent version cannot check the Linear policy".
 
 A chain stops when:
 
 - a sub-issue's ticket ended while the sub-issue is still open;
 - a sub-issue got no ticket within 30 minutes;
-- nothing running can unblock the rest, such as a cycle or a blocker outside the epic ("stalled: ENG-13 waits for ENG-12");
-- the epic was delegated to the app and no longer is;
-- the epic was completed or canceled, or has no sub-issues left;
+- nothing running can unblock the rest, such as a cycle, a blocker outside the epic, or a blocker the app cannot read ("stalled: ENG-13 waits for ENG-12");
+- the epic was delegated to the app and no longer is, while sub-issues are still open;
+- the epic was completed or canceled while sub-issues are still open, or has no sub-issues left;
 - the epic has more than 30 sub-issues, or a sub-issue more than 20 relations;
 - a sub-issue works in no repository the deployment serves, or the admission table filters it;
 - a person sends a stop in the epic's session.
@@ -231,17 +240,28 @@ The Source reports one health entry, `linear`. Its detail lists the round's coun
 | `teams unverified: Linear's team list was not readable` | The team list could not be read. Intake goes on. |
 | `left out …` | These Issues' repository is not one the GitHub Source serves. |
 | `no repository for …` | Map the Issue's project, or give the team a `repository`. |
-| `parent and sub-issues unreadable: n` | Context reads failed. Sessions on Issues not delegated to the app were taken in without context. |
+| `parent and sub-issues unreadable: n` | Context reads failed. The sessions are held; see below. A chain sub-issue whose context read failed is taken in without context. |
 | `sub-issue chains not advanced: n` | A chain or re-delegation read failed. It retries next round. |
-| `n failed polls in a row; last: <error>` | Three rounds failed in a row, or a refused token or rate limit blocks every request. Health is `error`. |
+| `pull request links or Issue completions failing: n` | A follow-up failed. It retries each round for up to 24 hours after its first failure, then gives up with a log line. |
+| `nobody can start or stop a sub-issue chain: …` | dsh-superagent is older than `e16b265` and has no `admits`. |
+| `n failed polls in a row; last: <error>` | Three rounds failed in a row, or a refused token or rate limit blocks every request. Health is `error`. When held sessions failed the round, the detail ends with `; parent and sub-issues unreadable: n`. |
 
 Common causes:
 
 - **No sessions arrive.** Check that the app's webhook is enabled with agent session events, and that the person is in the Policy's `allowed` list.
-- **"Linear refused the token minted n min ago".** The Source asks for at most one token per 15 minutes, so it does not evict other services' tokens. The 15 minutes start when it tries, before it reads the credential files or Linear answers. A wrong client id or secret therefore shows as "refused the token minted 0 min ago": Linear answers 401, and the retry that follows hits the 15-minute limit. Check the credentials and the scope other services request with the same app. A fix takes effect up to 15 minutes later.
-- **"The Linear app credential files are not readable".** Check the paths and file permissions. The next try waits the same 15 minutes.
+- **"… n min ago; the next token request waits m min".** The Source asks for at most one token per 15 minutes, so it does not evict other services' tokens. The 15 minutes start only once the token endpoint answered or timed out. The message names that answer:
+  - "The Linear token endpoint answered 401 0 min ago": the client id or secret is wrong. Linear answered 401, and the retry that follows hits the wait.
+  - "The Linear token endpoint did not answer within 30 s": the endpoint timed out.
+  - "The Linear token endpoint answered without a token": the answer had no `access_token`.
+  - "Linear refused the token minted": Linear issued a token, then refused it.
+
+  Check the credentials and the scope other services request with the same app. A fix takes effect when the wait ends, up to 15 minutes later.
+- **"The Linear app credential files are not readable; the next round tries again".** Check the paths and file permissions. There is no wait.
+- **"The Linear token endpoint was not reachable (…); the next round tries again".** A network error before Linear answered. There is no wait.
 - **"Linear's rate limit holds requests until …".** The app hit Linear's rate limit. Requests resume after the reset. Raise `pollSeconds`, or configure the webhook and then raise it.
-- **A delegated Issue does nothing, and polls fail.** When the sub-issues of a delegated Issue cannot be read, the Source holds its session or start prompt for up to 10 minutes by failing the round, so the cursor stays put. After three rounds health is `error` with "last: Error: A Linear session or prompt was not taken in; the next round reads it again". After 10 minutes the session gets an error activity and the cursor moves on. Write "start" in the session to retry.
+- **A session does nothing, and polls fail.** When the parent and sub-issues of a new session's Issue cannot be read, the Source cannot tell whether it is an epic. It holds the session, delegation or mention alike, for up to 10 minutes by failing the round, so the cursor stays put. A `start` prompt whose read fails is held the same way. After three rounds health is `error` with "last: Error: A Linear session or prompt was not taken in; the next round reads it again; parent and sub-issues unreadable: n". After 10 minutes the session gets an error activity and the cursor moves on. Its text says what to do: write exactly "start" in the session (a delegation), or mention the app again (a mention).
+
+The log gets a "poll failed" line per failed round, except that a token wait or rate limit holding for many rounds logs it once. The health line is logged again only when its cause changes; for a token wait or rate limit, not as its minutes count down.
 
 ## Development
 

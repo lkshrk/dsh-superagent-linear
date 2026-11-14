@@ -83,7 +83,7 @@ sequenceDiagram
   alt no cursor stored yet
     P->>P: set both cursors to now, end the round
   end
-  P->>L: agentSessions, pages until the cursor
+  P->>L: agentSessions, up to 10 pages until the cursor, from the backlog if one is stored
   loop each new session
     P->>L: agentActivityCreate "Received." (ephemeral)
     P->>L: IssueContext (parent, sub-issues)
@@ -93,7 +93,7 @@ sequenceDiagram
       P->>H: receive(session Trigger)
     end
   end
-  P->>L: agentActivities, prompts created after the cursor
+  P->>L: agentActivities, prompts created after the cursor, from the backlog if one is stored
   loop each new prompt
     P->>H: receive(prompt Trigger), unless an epic answers it
   end
@@ -102,6 +102,7 @@ sequenceDiagram
   P->>H: receive(undelegation stop), issueClosed
   P->>L: ChainRead per active epic, every 30 s
   P->>H: receive(chain Triggers)
+  P->>P: hourly, prune old markers
 ```
 
 ### Sessions
@@ -109,20 +110,24 @@ sequenceDiagram
 For each session after the cursor, the round:
 
 1. Skips sessions the chain opened itself, and sessions the app created.
-2. Routes the Issue to a repository (see [Routing](#routing)). A misrouted Issue is left out. An unmapped one gets one `error` activity.
+2. Routes the Issue to a repository (see [Routing](#routing)). A misrouted or unmapped Issue gets one `error` activity and is left out.
 3. Posts the ephemeral "Received." thought once per session.
 4. Reads the Issue context (parent and up to 30 sub-issues) once per new Trigger.
-5. For an Issue with sub-issues: a person's delegation, without a comment, starts a chain. A person's mention gets the chain status. Nothing else follows.
-6. For an Issue delegated to the app, or with a chain record, whose context could not be read: holds the session for up to 10 minutes by failing its take-in, then posts an error. Other Issues go on without context.
+5. For an Issue with sub-issues: a person's delegation, without a comment, starts a chain when `admits` lets that person; otherwise it gets the refusal. A person's mention gets the chain status. Nothing else follows.
+6. For a new session whose context could not be read: holds it for up to 10 minutes by failing its take-in, then posts an error and drops it. Unknown sub-issues could make the Issue an epic, which never gets a worker of its own.
 7. Otherwise adds the context header, applies split mode, and calls `receive`.
 
 ### Prompts
 
-For each prompt after the cursor, the round finds an open ticket on the same Issue. With one, the prompt follows that ticket's team and repository. Without one, it is routed like a session. A routed prompt on an epic goes to the chain logic first, which may start a run, stop one, or answer with the status instead of a Trigger.
+For each prompt after the cursor, the round finds an open ticket on the same Issue. With one, the prompt follows that ticket's team and repository. Without one, it is routed like a session; a misrouted or unmapped prompt gets one `error` activity. A routed prompt on an epic goes to the chain logic first. An exact `start` from an admitted person may start a run, a stop from one ends it, and anything else gets the status or the refusal instead of a Trigger.
+
+A `receive` that answers `duplicate` is not counted in the round's sessions or prompts.
 
 ### Cursors
 
-A cursor holds back only when taking in an item threw: `receive` failed, an activity post failed, or a hold for unreadable sub-issues. Items that are skipped on purpose (own sessions, misrouted, unmapped or unlisted Issues) do not hold it. The next cursor is five seconds before the newest item read, to catch writes Linear records late, and never moves back. Fixed Trigger ids make the overlap harmless. A round in which an item was not taken in throws after finishing the other steps, so the next round reads it again.
+A cursor holds back only when taking in an item threw: `receive` failed, an activity post failed, or a hold for unreadable sub-issues. Items that are skipped on purpose (own sessions, misrouted, unmapped or unlisted Issues) do not hold it.
+
+Each query reads at most 10 pages of 25. When the read stops at that limit with older pages left, the round stores a backlog `{ after, newest }` instead of moving the cursor. The next round reads on from `after` with the same cursor. Once a read reaches the cursor, the backlog is cleared and the cursor moves past the newest item of all those reads. A backlog is dropped only when Linear refuses its page cursor as invalid input; the read then starts from the newest page again. Other errors, such as a token wait or a server error, leave it in place. The next cursor is five seconds before the newest item read, to catch writes Linear records late, and never moves back. Fixed Trigger ids make the overlap harmless. A round in which an item was not taken in throws after finishing the other steps, so the next round reads it again.
 
 ### Routing
 
@@ -131,8 +136,8 @@ A cursor holds back only when taking in an item threw: `receive` failed, an acti
 | Result | When | Effect |
 | --- | --- | --- |
 | `unlisted` | No enabled team matches. | Passed to `receive`. The scope filter in dsh-superagent drops it. |
-| `unmapped` | The team matches, but neither the project entry nor the team names a repository. | Not taken in. One `error` activity on a new session. |
-| `misrouted` | The named repository is not one the GitHub Source serves. | Not taken in. Listed in health as "left out". |
+| `unmapped` | The team matches, but neither the project entry nor the team names a repository. | Not taken in. One `error` activity per session or prompt. |
+| `misrouted` | The named repository is not one the GitHub Source serves. | Not taken in. One `error` activity per session or prompt. Listed in health as "left out". |
 | `served` | The repository is served. | Taken in. A non-primary repository goes into `meta.repository`. |
 
 ## Chains
@@ -153,18 +158,21 @@ A chain record per epic is stored under `linear-chain:<epic id>`:
 | `delegated` | The epic was delegated to the app. Only then does losing the delegation stop the chain. |
 | `children` | The sub-issues seen at the last read. |
 | `delegation` | When a re-delegation started the run. A new session on the epic within 2 minutes joins that run. |
+| `waiting` | The sub-issues the last "Waiting for …" notice named. |
 
 ```mermaid
 stateDiagram-v2
   [*] --> running: delegation, start prompt, re-delegation
   running --> running: start ready sub-issues
-  running --> done: all sub-issues closed
+  running --> done: all sub-issues closed, also if the epic closed or lost its delegate with them
   running --> stopped: stop condition
   done --> [*]: epic completed, summary posted
   stopped --> running: new run
 ```
 
 `advanceChains` reads each running epic at most every 30 seconds, or at once when a sub-issue's ticket ended. `chainParallel` caps started sub-issues across all chains. A started sub-issue counts while it has an open ticket, a Trigger without a ticket yet, or an ended ticket whose Issue is still being completed.
+
+When nothing is running or ready and only sub-issues assigned to someone else are open, the epic's session gets one "Waiting for …" notice per distinct set (stored in the record's `waiting`). A `blocks` relation whose blocker Linear does not return counts as an open blocker.
 
 A chain record is written as `done` before the epic is completed. A crash in between completes it on the next round.
 
@@ -175,7 +183,10 @@ All keys live in the Source context's state store.
 | Key | Holds |
 | --- | --- |
 | `linear-sessions-cursor`, `linear-prompts-cursor` | Intake cursors. |
-| `linear-seen:<session>` | The session was answered. |
+| `linear-seen:<session or prompt>` | The session was answered, or the misrouted or unmapped session or prompt was refused. |
+| `linear-sessions-backlog`, `linear-prompts-backlog` | Where a read cut at the page limit continues. |
+| `linear-follow-failed:<ticket>:<what>` | First failure time and count of a pull request link or Issue completion. |
+| `linear-pruned` | The last pruning. |
 | `linear-linked:<session>:<url>` | The pull request link was added. |
 | `linear-completed:<ticket>` | The Issue was completed after a merge. |
 | `linear-followed-tickets` | Tickets whose pull requests are followed. |
@@ -184,9 +195,11 @@ All keys live in the Source context's state store.
 | `linear-chain:<epic>`, `linear-chains` | Chain records and the active list. |
 | `linear-chain-sessions` | Sessions the chain opened, kept 14 days. |
 | `linear-chain-run:<id>` | A session, prompt or history entry was handled by the chain logic. |
-| `linear-chain-held:<id>` | When an unreadable delegated session or prompt was first held. |
+| `linear-chain-held:<id>` | When a session or prompt with unreadable sub-issues was first held. |
 | `linear-watched` | Issues the Source saw a session or ticket on, kept 14 days. |
 | `linear-delegated-checked` | The last re-delegation check. |
+
+Once an hour, the round drops `linear-seen:`, `linear-chain-run:`, `linear-completed:`, `linear-chain-held:`, `linear-follow-failed:` and `linear-linked:` markers older than 14 days. Markers of tickets still followed are kept. A marker stored without a time gets the current time and ages from then. Pruning needs a host whose state store lists keys (`state.keys`).
 
 ## Integration with dsh-superagent
 
@@ -198,4 +211,5 @@ The kind uses these parts of dsh-superagent's Source interface:
 - `policy`: the allowed list of Linear user ids, and one admission row per enabled team, marked "Sessions only".
 - `environment`: the variables listed in [Configuration](configuration.md#execution-environment).
 - `accountFields`: the three file paths. Only the panel and the plugin configuration may change them.
+- `admits`: optional, from dsh-superagent `e16b265`. Whether the Policy lists a person; it gates starting and stopping chains. Without it nobody can.
 - `tickets.issueClosed`: optional. On a host without it, the Source does not watch Issues for closes.

@@ -115,7 +115,7 @@ Seconds between polling rounds. A longer interval costs fewer requests and delay
 | Default | `true` |
 | Panel | "Complete the Issue once its pull request merges" (advanced) |
 
-Once the ticket's own pull request merged, move its Issue to the team's first completed state (lowest `position`), unless the Issue is completed or canceled already. A failed update is retried on later rounds. Pull requests the ticket only follows do not count.
+Once the ticket's own pull request merged, move its Issue to the team's first completed state (lowest `position`), unless the Issue is completed or canceled already. A failed update is retried each round for up to 24 hours after its first failure, and counted in health as "pull request links or Issue completions failing". After that the Source gives up and logs it. An Issue Linear no longer has counts as done. Pull requests the ticket only follows do not count.
 
 Chains complete the epic regardless of this setting, but never its sub-issues. A chain needs each sub-issue closed by this setting, by Linear's GitHub integration or by a person. A sub-issue whose ticket ends while it is still open stops the chain with "ENG-12 ended without being completed". Turning this off with chains in use means closing sub-issues another way.
 
@@ -143,14 +143,16 @@ Each enabled team has an admission row, labelled "Sessions only". Only the "not 
 
 Chain Triggers carry the person who delegated the epic as their actor.
 
+The allowed list also gates chains. Only a listed person can start a chain (by delegating, re-delegating or writing `start`) or stop one. The Source asks dsh-superagent's `admits`, available from dsh-superagent `e16b265`. Without it, nobody can start or stop a chain, and health says so.
+
 ## Execution environment
 
-The Source sets these variables for workers. They are empty when the ticket did not start on Linear.
+The Source sets these variables for workers. They are empty when the ticket did not start on Linear, and when the value is not well-formed.
 
 | Variable | Value |
 | --- | --- |
-| `DSH_SUPERAGENT_LINEAR_ISSUE` | The Issue identifier, such as `ENG-12`. |
-| `DSH_SUPERAGENT_LINEAR_ISSUE_URL` | The Issue's page, not its agent session. |
+| `DSH_SUPERAGENT_LINEAR_ISSUE` | The Issue identifier, such as `ENG-12`. Set only when it matches `^[A-Z0-9]+-\d+$`. |
+| `DSH_SUPERAGENT_LINEAR_ISSUE_URL` | The Issue's page, not its agent session. Set only when it starts with `https://linear.app/`. |
 | `DSH_SUPERAGENT_LINEAR_MODE` | `split` when the ticket plans an epic into sub-issues; empty otherwise. |
 
 A pull request body with `Fixes ENG-12` lets Linear's own GitHub integration close the Issue as well.
