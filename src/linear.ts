@@ -3,7 +3,7 @@ import { z } from 'zod'
 import { LinearClient, LinearError, stableUuid, type ActivityContent, type IssueContext, type IssueStatus, type Prompt, type Session, type Undelegation } from './linear-api.ts'
 import type { OutboundMessage, SourceContext, SourceKind, Trigger } from './types.ts'
 import { Waker } from './webhook.ts'
-import { CHAIN_KEYS, advanceChains, chainOf, epicMention, epicPrompt, holdUnreadable, ownSession, releaseHold, startChain, unreadableText } from './linear-chain.ts'
+import { CHAIN_KEYS, advanceChains, chainOf, epicMention, epicPrompt, followDelegations, holdUnreadable, ownSession, releaseHold, startChain, unreadableText, watch, watchedIssues } from './linear-chain.ts'
 
 export const SOURCE = 'linear'
 export const HEALTH = 'linear'
@@ -297,6 +297,7 @@ export async function pollLinear(ctx: SourceContext, client: LinearClient, confi
           .catch((error: unknown) => { if (!(error instanceof LinearError && error.gone)) throw error })
         ctx.state.set(KEYS.seen(session.id), true)
       }
+      if (where.kind === 'served') watch(ctx, String(trigger.meta.issue), session.id)
       if (where.kind === 'served' && ctx.state.get(CHAIN_KEYS.run(session.id))) continue
       // The cursor replays the newest session every round; a stored Trigger needs no second read.
       const fresh = where.kind === 'served' && !ctx.triggers.get(trigger.id)
@@ -364,7 +365,7 @@ export async function pollLinear(ctx: SourceContext, client: LinearClient, confi
   if (!failed) ctx.state.set(KEYS.prompts, cursorAfter(promptsSince, prompts.items.at(-1)?.createdAt))
 
   await followTickets(ctx, client, config, signal)
-  await followIssues(ctx, client, viewer, signal)
+  await followIssues(ctx, client, config, viewer, round, signal)
   await advanceChains(ctx, client, config, viewer, round, signal)
   if (failed || sessionsFailed) throw new Error('A Linear session or prompt was not taken in; the next round reads it again')
   return round
@@ -422,11 +423,11 @@ async function followTickets(ctx: SourceContext, client: LinearClient, config: L
 const repositoryMeta = (trigger: Trigger) => typeof trigger.meta.repository === 'string' && trigger.meta.repository ? trigger.meta.repository : undefined
 interface Delegation { delegated: boolean; observed?: string }
 /**
- * Reads, at most every 30 seconds and in one batch, the Issues of open tickets that started on Linear and of those tickets
- * whose Issue is not yet known to be closed: stops each open ticket whose Issue was delegated to the app and no longer is, and
- * reports each Issue that moved to a completed or canceled state.
+ * Reads, at most every 30 seconds and in one batch, the Issues of open tickets that started on Linear, of those tickets whose
+ * Issue is not yet known to be closed, and the watched Issues: stops each open ticket whose Issue was delegated to the app and
+ * no longer is, reports each Issue that moved to a completed or canceled state, and starts chains on re-delegated Issues.
  */
-async function followIssues(ctx: SourceContext, client: LinearClient, viewer: string, signal: AbortSignal): Promise<void> {
+async function followIssues(ctx: SourceContext, client: LinearClient, config: LinearConfig, viewer: string, round: Round, signal: AbortSignal): Promise<void> {
   const running = ctx.tickets.open().flatMap(ticket => {
     const origin = ctx.triggers.get(ticket.origin.triggerId)
     return origin?.source === SOURCE && typeof origin.meta.issue === 'string' ? [{ ticket, origin, issue: origin.meta.issue }] : []
@@ -437,11 +438,19 @@ async function followIssues(ctx: SourceContext, client: LinearClient, viewer: st
   if (checked && Date.now() - Date.parse(checked) < DELEGATION_INTERVAL_MS) return
   const known = ctx.state.get<Record<string, Delegation>>(KEYS.delegation) ?? {}
   if (!running.length && Object.keys(known).length) ctx.state.set(KEYS.delegation, {})
-  if (!running.length && !closing.length) return
+  const followed = (ctx.state.get<string[]>(KEYS.followed) ?? []).flatMap(id => {
+    const ticket = ctx.tickets.get(id)
+    const origin = ticket && ctx.triggers.get(ticket.origin.triggerId)
+    return origin?.source === SOURCE && typeof origin.meta.issue === 'string' ? [origin] : []
+  })
+  const watched = watchedIssues(ctx, [...running.map(item => item.origin), ...followed].map(origin => ({ issue: String(origin.meta.issue),
+    ...typeof origin.meta.session === 'string' && origin.meta.session ? { session: origin.meta.session } : {} })))
+  if (!running.length && !closing.length && !watched.length) return
   const now = new Date().toISOString()
   ctx.state.set(KEYS.delegationChecked, now)
-  const issues = await client.issues([...new Set([...running, ...closing].map(item => item.issue))], signal)
+  const issues = await client.issues([...new Set([...running, ...closing].map(item => item.issue).concat(watched))], signal)
   reportClosed(ctx, closing, issues)
+  await followDelegations(ctx, client, viewer, config.chainParallel, issues, round, signal)
   if (!running.length) return
   const next: Record<string, Delegation> = Object.fromEntries(running.map(({ ticket, origin }) =>
     [ticket.id, known[ticket.id] ?? { delegated: origin.meta.delegate === viewer }]))

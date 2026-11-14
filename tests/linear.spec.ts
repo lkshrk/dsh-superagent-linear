@@ -921,6 +921,8 @@ describe('chain', () => {
     const completed: string[] = []
     const failures: Record<string, number> = {}
     const hooks: { complete?: (id: string) => void } = {}
+    const history = new Map<string, Record<string, unknown>[]>()
+    const delegateReads: string[][] = [], historyReads: string[] = []
     let relationsMore = false
     const failing = (operation: string) => { if (failures[operation]) { failures[operation]--; throw new Error('Internal error') } }
     const kidsOf = (epic: string) => [...kids.values()].filter(kid => kid.epic === epic)
@@ -957,6 +959,8 @@ describe('chain', () => {
               pageInfo: { hasNextPage: relationsMore } } })), pageInfo: { hasNextPage: epic.more } } } }
       },
       ChainChild: variables => {
+        const epic = epics.get(String(variables.id))
+        if (epic) return { issue: { ...chainSession('x', epic, T0).issue!, labels: { nodes: [] } } }
         const kid = kids.get(String(variables.id))!
         return { issue: { id: kid.id, identifier: kid.identifier, title: `Part ${kid.identifier}`, description: 'Make the part.', url: `https://linear.app/x/issue/${kid.identifier}`,
           team: { id: kid.team, key: KEYS_OF[kid.team] }, delegate: null, project: null, labels: { nodes: kid.labels.map(name => ({ name })) } } }
@@ -977,7 +981,12 @@ describe('chain', () => {
         target.state = 'completed'
         return { issueUpdate: { success: true } }
       },
-      'issues(': () => ({ issues: { nodes: [] } }),
+      'issues(': variables => {
+        const ids = variables.ids as string[]
+        delegateReads.push(ids)
+        return { issues: { nodes: ids.flatMap(id => { const item = epics.get(id) ?? kids.get(id); return item ? [{ id, delegate: 'delegate' in item && item.delegate ? { id: item.delegate } : null }] : [] }) } }
+      },
+      DelegationHistory: variables => { historyReads.push(String(variables.id)); return { issue: { history: { nodes: history.get(String(variables.id)) ?? [] } } } },
     })
     const h = context()
     h.ctx.tickets.open = () => tickets.filter(ticket => !ticket.ended)
@@ -986,7 +995,11 @@ describe('chain', () => {
     let minute = 0
     const at = () => `2026-11-12T10:${String(++minute).padStart(2, '0')}:00.000Z`
     const w = {
-      ...h, stub, kids, epics, foreign, sessions, prompts, tickets, created, activities, completed, failures, hooks, autoTicket: true,
+      ...h, stub, kids, epics, foreign, sessions, prompts, tickets, created, activities, completed, failures, hooks, history, delegateReads, historyReads, autoTicket: true,
+      redelegate(id: string, actor: Record<string, unknown> | null = { id: OWNER, name: 'Owner', app: false }, epic = 'epic-1', botActor: Record<string, unknown> | null = null) {
+        epics.get(epic)!.delegate = VIEWER
+        history.set(epic, [...history.get(epic) ?? [], { id, createdAt: at(), actor, botActor, toDelegate: { id: VIEWER } }])
+      },
       epic(id = 'epic-1', identifier = 'WEB-10') { const epic: Epic = { id, identifier, state: 'started', delegate: VIEWER, more: false }; epics.set(id, epic); return epic },
       kid(n: number, fields: Partial<Kid> = {}) {
         const kid: Kid = { id: `kid-${n}`, identifier: `WEB-${n}`, state: 'unstarted', order: n, blockedBy: [], labels: [], epic: 'epic-1', team: TEAM, ...fields }
@@ -1016,6 +1029,7 @@ describe('chain', () => {
         for (const ticket of tickets.filter(ticket => h.ctx.triggers.get(ticket.origin.triggerId)?.meta.issue === `kid-${n}` && !ticket.ended)) ticket.ended = { at: new Date().toISOString() }
       },
       async round(fields: { parallel?: number; throttle?: boolean } = {}) {
+        h.state.set(KEYS.delegationChecked, undefined)
         if (!fields.throttle) for (const epic of epics.keys()) { const record = w.record(epic); if (record) h.state.set(CHAIN_KEYS.chain(epic), { ...record, checked: undefined }) }
         const result = await pollLinear(h.ctx, stub.client, config({ chainParallel: fields.parallel ?? parallel }), signal())
         for (const trigger of h.received) {
@@ -1088,7 +1102,7 @@ describe('chain', () => {
     expect(w.received).toEqual([])
     expect(w.record()).toBeUndefined()
     expect(w.activities.map(activity => [activity.session, activity.body])).toEqual([['es1',
-      'Not working on WEB-10. To start a chain, delegate the issue to the app, then write "start" in its session.']])
+      'Not working on WEB-10. To start a chain, delegate the issue to the app; if it is delegated already, write "start" in its session.']])
     const labelled = world()
     labelled.epic(); labelled.kids.clear()
     labelled.prompts.push(prompt('p2', '2026-11-12T10:01:00.000Z', { agentSession: { id: 'es9', issue: { ...issue(), labels: { nodes: [{ name: 'EPIC' }] } } } }))
@@ -1550,7 +1564,7 @@ describe('chain', () => {
       await w.round()
       expect(w.received).toEqual([])
       expect(w.record()).toBeUndefined()
-      expect(w.activities.at(-1)).toEqual({ session: 'm1', type: 'thought', body: 'Not working on WEB-10. To start a chain, delegate the issue to dsh, then write "start" in its session.' })
+      expect(w.activities.at(-1)).toEqual({ session: 'm1', type: 'thought', body: 'Not working on WEB-10. To start a chain, delegate the issue to dsh; if it is delegated already, write "start" in its session.' })
     }
     const w = world()
     w.epic(); w.kid(2)
@@ -1560,6 +1574,122 @@ describe('chain', () => {
     await w.round()
     expect(w.record()!.run).toBe('es1')
     expect(w.activities.at(-1)).toEqual({ session: 'm2', type: 'thought', body: 'Working on WEB-2 of WEB-10. A stop in this session ends the chain.' })
+  })
+
+  describe('re-delegation', () => {
+    const plans = (w: ReturnType<typeof world>) => w.activities.filter(activity => activity.body.startsWith('Working through'))
+    async function stoppedChain() {
+      const w = world()
+      w.epic(); w.kid(2); w.kid(3)
+      w.delegate('es1')
+      await w.round()
+      w.epics.get('epic-1')!.delegate = null
+      await w.round()
+      expect(w.record()).toMatchObject({ status: 'stopped', reason: 'WEB-10 is no longer delegated to the app' })
+      w.end(2); w.end(3)
+      return w
+    }
+
+    it('starts a new run when a person delegates the epic to the app again after its chain stopped, once, also across replays', async () => {
+      const w = await stoppedChain()
+      w.redelegate('h1')
+      await w.round()
+      expect(w.record()).toMatchObject({ run: 'h1', session: 'es1', status: 'running', delegator: { id: OWNER, name: 'Owner' } })
+      expect(w.chainTriggers().map(trigger => [trigger.id, trigger.actor.id])).toEqual([['linear:chain:es1:kid-2', OWNER], ['linear:chain:es1:kid-3', OWNER],
+        ['linear:chain:h1:kid-2', OWNER], ['linear:chain:h1:kid-3', OWNER]])
+      expect(plans(w).map(activity => activity.session)).toEqual(['es1', 'es1'])
+      await w.round(); await w.round()
+      w.prompt('p1', 'epic-1', { signal: 'stop', content: { body: '' } })
+      await w.round()
+      expect(w.record()).toMatchObject({ run: 'h1', status: 'stopped' })
+      w.end(2); w.end(3)
+      const watched = w.state.get(CHAIN_KEYS.watched) as Record<string, { delegate?: string | null }>
+      w.state.set(CHAIN_KEYS.watched, { ...watched, 'epic-1': { ...watched['epic-1']!, delegate: null } })
+      await w.round(); await w.round()
+      expect(w.record()).toMatchObject({ run: 'h1', status: 'stopped' })
+      expect(plans(w)).toHaveLength(2)
+      expect(w.chainTriggers()).toHaveLength(4)
+      expect(w.historyReads).toEqual(['epic-1', 'epic-1'])
+    })
+
+    it('does nothing when the epic is delegated again while its chain runs', async () => {
+      const w = world()
+      w.epic(); w.kid(2); w.kid(3); w.kid(4)
+      w.delegate('es1')
+      await w.round()
+      w.epics.get('epic-1')!.delegate = null
+      await w.round({ throttle: true })
+      w.redelegate('h1')
+      await w.round()
+      expect(w.record()).toMatchObject({ run: 'es1', status: 'running' })
+      expect(w.historyReads).toEqual([])
+      expect(plans(w)).toHaveLength(1)
+    })
+
+    it('starts nothing when the app itself or no person delegated the epic, and does not read that change again', async () => {
+      for (const [actor, bot] of [[{ id: VIEWER, name: 'dsh', app: true }, null], [{ id: VIEWER, name: 'dsh', app: false }, null], [{ id: 'bot-1', name: 'Agent', app: true }, null], [null, { type: 'workflow' }],
+        [{ id: OWNER, name: 'Owner', app: false }, { type: 'integration' }]] as const) {
+        const w = await stoppedChain()
+        w.redelegate('h1', actor, 'epic-1', bot)
+        await w.round(); await w.round()
+        expect(w.record()).toMatchObject({ run: 'es1', status: 'stopped' })
+        expect(w.historyReads).toEqual(['epic-1'])
+      }
+    })
+
+    it('starts nothing on an Issue without open sub-issues', async () => {
+      const w = await stoppedChain()
+      w.close(2); w.close(3)
+      w.redelegate('h1')
+      await w.round()
+      expect(w.record()).toMatchObject({ run: 'es1', status: 'stopped' })
+      expect(w.chainTriggers()).toHaveLength(2)
+    })
+
+    it('watches an Issue only from a session it saw, and starts nothing on the first sight of one delegated already', async () => {
+      const w = world()
+      w.epic(); w.kid(2)
+      w.epic('epic-2', 'WEB-20'); w.kid(5, { epic: 'epic-2' })
+      w.delegate('m1', 'epic-1', { id: OWNER }, { comment: { id: 'c1', body: '@dsh status?' } })
+      await w.round(); await w.round()
+      expect(w.delegateReads.flat()).not.toContain('epic-2')
+      expect(w.delegateReads.flat()).toContain('epic-1')
+      expect(w.record()).toBeUndefined()
+      expect(w.historyReads).toEqual([])
+      w.epics.get('epic-1')!.delegate = null
+      await w.round()
+      w.redelegate('h1')
+      await w.round()
+      expect(w.record()).toMatchObject({ run: 'h1', session: 'm1', status: 'running' })
+      expect(plans(w).map(activity => activity.session)).toEqual(['m1'])
+      expect(w.startedKids()).toEqual(['WEB-2'])
+      expect(w.record('epic-2')).toBeUndefined()
+    })
+
+    it('starts the run without posting when no session of the Issue is known', async () => {
+      const w = world()
+      w.epic().delegate = null; w.kid(2)
+      w.state.set(CHAIN_KEYS.watched, { 'epic-1': { at: new Date().toISOString() } })
+      await w.round()
+      w.redelegate('h1')
+      await w.round()
+      expect(w.record()).toMatchObject({ run: 'h1', session: '', status: 'running' })
+      expect(w.startedKids()).toEqual(['WEB-2'])
+      expect(w.activities.filter(activity => activity.session === '')).toEqual([])
+      w.close(2)
+      await w.round()
+      expect(w.record()!.status).toBe('done')
+      expect(w.completed).toEqual(['epic-1'])
+    })
+
+    it('forgets a watched Issue after the close horizon', async () => {
+      const w = world()
+      w.epic(); w.kid(2)
+      w.state.set(CHAIN_KEYS.watched, { 'epic-1': { at: new Date(Date.now() - CLOSE_HORIZON_MS).toISOString(), delegate: null } })
+      await w.round()
+      expect(w.state.get(CHAIN_KEYS.watched)).toBeUndefined()
+      expect(w.delegateReads).toEqual([])
+    })
   })
 
   it('offers chainParallel between 1 and 8, 2 by default, in the panel', () => {

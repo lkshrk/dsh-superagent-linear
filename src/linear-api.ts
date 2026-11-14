@@ -67,6 +67,7 @@ const ADD_URLS = `mutation($id: String!, $input: AgentSessionUpdateInput!) { age
 const ISSUE_STATE = `query($id: String!) { issue(id: $id) { state { type } team { states { nodes { id type position } } } } }`
 const ISSUES = 'query($ids: [ID!]) { issues(first: 50, filter: { id: { in: $ids } }) { nodes { id delegate { id } state { type } completedAt canceledAt } } }'
 const HISTORY = `query($id: String!) { issue(id: $id) { history(first: 50) { nodes { id createdAt actor { id name } fromDelegate { id } toDelegate { id } } } } }`
+const DELEGATION_HISTORY = `query DelegationHistory($id: String!) { issue(id: $id) { history(first: 50) { nodes { id createdAt actor { id name app } botActor { type } toDelegate { id } } } } }`
 const SET_STATE = `mutation($id: String!, $state: String!) { issueUpdate(id: $id, input: { stateId: $state }) { success } }`
 const ISSUE_CONTEXT = `query IssueContext($id: String!) { issue(id: $id) { parent { id identifier title url description }
   children(first: 30) { nodes { identifier title state { type } } pageInfo { hasNextPage } } } }`
@@ -97,6 +98,7 @@ export type Issue = z.infer<typeof Issue>
 /** An Issue's delegate, and when it closed (moved to a completed or canceled state), if it is closed. */
 export interface IssueStatus { delegate: string | null; closedAt?: string }
 export interface Undelegation { id: string; at: string; actor?: { id: string; name?: string | null } }
+export interface Delegation { id: string; at: string; person?: { id: string; name?: string | null } }
 export interface ActivityContent { type: 'thought' | 'response' | 'error'; body: string }
 
 export class LinearClient {
@@ -247,6 +249,17 @@ export class LinearClient {
       .filter(node => node.fromDelegate?.id === agent && node.toDelegate?.id !== agent && Date.parse(node.createdAt) >= Date.parse(since))
       .sort((a, b) => Date.parse(b.createdAt) - Date.parse(a.createdAt))[0]
     return change && { id: change.id, at: change.createdAt, ...change.actor ? { actor: { id: change.actor.id, name: change.actor.name } } : {} }
+  }
+  /** The newest of the issue's last 50 changes that delegated it to `agent`, with its actor when that is a person other than `agent`. */
+  async delegation(issue: string, agent: string, signal?: AbortSignal): Promise<Delegation | undefined> {
+    const entry = z.looseObject({ id: z.string(), createdAt: z.string(), actor: z.looseObject({ id: z.string(), name: z.string().nullish(), app: z.boolean().nullish() }).nullish(),
+      botActor: z.looseObject({ type: z.string().nullish() }).nullish(), toDelegate: z.object({ id: z.string() }).nullish() })
+    const data = z.object({ issue: z.object({ history: z.object({ nodes: z.array(entry) }) }) }).parse(await this.request(DELEGATION_HISTORY, { id: issue }, signal))
+    const change = data.issue.history.nodes.filter(node => node.toDelegate?.id === agent).sort((a, b) => Date.parse(b.createdAt) - Date.parse(a.createdAt))[0]
+    if (!change) return undefined
+    const { actor } = change
+    const person = actor && actor.app === false && !change.botActor && actor.id !== agent
+    return { id: change.id, at: change.createdAt, ...person ? { person: { id: actor.id, name: actor.name } } : {} }
   }
   async issueContext(issue: string, signal?: AbortSignal): Promise<IssueContext> {
     return z.object({ issue: IssueContextSchema }).parse(await this.request(ISSUE_CONTEXT, { id: issue }, signal)).issue

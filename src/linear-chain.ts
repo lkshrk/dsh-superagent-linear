@@ -1,5 +1,5 @@
 /** Chains: a person's session on an Issue with sub-issues works through them, each in a session of its own, in the order their `blocks` relations allow. */
-import { LinearError, stableUuid, type Chain, type Issue, type IssueContext, type LinearClient, type Prompt, type Session } from './linear-api.ts'
+import { LinearError, stableUuid, type ActivityContent, type Chain, type Issue, type IssueContext, type IssueStatus, type LinearClient, type Prompt, type Session } from './linear-api.ts'
 import { CLOSE_HORIZON_MS, KEYS, SOURCE, channel, meta, placed, routeOf, threadOf, withContext, type LinearConfig, type Round } from './linear.ts'
 import type { SourceContext, Ticket, Trigger } from './types.ts'
 
@@ -9,6 +9,7 @@ export const CHAIN_KEYS = {
   chains: 'linear-chains',
   run: (session: string) => `linear-chain-run:${session}`,
   held: (session: string) => `linear-chain-held:${session}`,
+  watched: 'linear-watched',
 }
 export const CHAIN_INTERVAL_MS = 30_000
 export const CHAIN_WAIT_MS = 30 * 60_000
@@ -40,6 +41,10 @@ function addOwnSession(ctx: SourceContext, id: string): void {
   ctx.state.set(CHAIN_KEYS.sessions, Object.fromEntries([...kept, [id, new Date(now).toISOString()]]))
 }
 const ignoreGone = (error: unknown) => { if (!(error instanceof LinearError && error.gone)) throw error }
+/** Posts to a session once per id; a run started without a known session posts nothing. */
+async function tell(client: LinearClient, session: string, id: string, content: ActivityContent, signal: AbortSignal): Promise<void> {
+  if (session) await client.activity(session, stableUuid(id), content, false, signal).catch(ignoreGone)
+}
 /** Throws while `key` has been held for less than HOLD_MS, so the round reads it again; returns once the hold ran out. */
 export function holdUnreadable(ctx: SourceContext, key: string): void {
   const held = ctx.state.get<string>(CHAIN_KEYS.held(key))
@@ -67,9 +72,9 @@ async function startRun(ctx: SourceContext, client: LinearClient, start: Start, 
   setActive(ctx, issue.id, true)
   const list = context.children.nodes.map(child => `${child.identifier}${closed(child.state) ? ' (done)' : ''}`).join(', ')
   const more = context.children.pageInfo.hasNextPage ? ' and more' : ''
-  await client.activity(session, stableUuid(`chain-plan:${run}`), { type: 'thought',
-    body: `Working through the sub-issues of ${issue.identifier} in the order their blocking relations allow, at most ${parallel} at a time: ${list}${more}.` }, false, signal)
-    .catch(ignoreGone)
+  watch(ctx, issue.id, session || undefined)
+  await tell(client, session, `chain-plan:${run}`, { type: 'thought',
+    body: `Working through the sub-issues of ${issue.identifier} in the order their blocking relations allow, at most ${parallel} at a time: ${list}${more}.` }, signal)
   ctx.state.set(CHAIN_KEYS.run(run), issue.id)
 }
 export async function startChain(ctx: SourceContext, client: LinearClient, session: Session, context: IssueContext, viewer: string, parallel: number,
@@ -127,7 +132,7 @@ export async function epicMention(ctx: SourceContext, client: LinearClient, sess
 
 function statusText(ctx: SourceContext, record: ChainRecord | undefined, identifier: string, app: string): string {
   if (record?.status !== 'running') {
-    return `Not working on ${identifier}${record?.reason ? ` (stopped: ${record.reason})` : ''}. To start a chain, delegate the issue to ${app}, then write "start" in its session.`
+    return `Not working on ${identifier}${record?.reason ? ` (stopped: ${record.reason})` : ''}. To start a chain, delegate the issue to ${app}; if it is delegated already, write "start" in its session.`
   }
   const working = [...busy(ctx, record)].map(id => identifierOf(record, id))
   return `Working on ${working.length ? working.join(', ') : 'the next sub-issues'} of ${identifier}. A stop in this session ends the chain.`
@@ -326,7 +331,7 @@ export async function stopChain(ctx: SourceContext, client: LinearClient, epic: 
     const origin = started?.trigger && !started.ticket && !stopped.has(child) ? ctx.triggers.get(started.trigger) : undefined
     if (origin) await ctx.receive(stopTrigger(origin, child, typeof origin.meta.repository === 'string' ? origin.meta.repository : undefined))
   }
-  await client.activity(record.session, stableUuid(`chain-stop:${record.run}`), { type: 'response', body: `Stopped: ${reason}.` }, false, signal).catch(ignoreGone)
+  await tell(client, record.session, `chain-stop:${record.run}`, { type: 'response', body: `Stopped: ${reason}.` }, signal)
   record.status = 'stopped'
   record.reason = reason
   save(ctx, epic, record)
@@ -345,7 +350,53 @@ async function finish(env: Env, epic: string, record: ChainRecord): Promise<void
     })
   }
   const lines = (record.children ?? []).map(child => `- ${child.identifier}${pulls(child.id).map(url => ` ${url}`).join('')}`)
-  await client.activity(record.session, stableUuid(`chain-done:${record.run}`), { type: 'response',
-    body: `All sub-issues of ${record.identifier} are done.\n\n${lines.join('\n')}` }, false, signal).catch(ignoreGone)
+  await tell(client, record.session, `chain-done:${record.run}`, { type: 'response',
+    body: `All sub-issues of ${record.identifier} are done.\n\n${lines.join('\n')}` }, signal)
   setActive(ctx, epic, false)
+}
+
+/** An Issue whose delegate is read with the open tickets': its last session known to the plugin, when it was last relevant, and its delegate at the last read. */
+export interface Watch { session?: string; at: string; delegate?: string | null }
+const watches = (ctx: SourceContext) => ctx.state.get<Record<string, Watch>>(CHAIN_KEYS.watched) ?? {}
+export function watch(ctx: SourceContext, issue: string, session?: string): void {
+  const all = watches(ctx)
+  ctx.state.set(CHAIN_KEYS.watched, { ...all, [issue]: { ...all[issue], ...session ? { session } : {}, at: new Date().toISOString() } })
+}
+/** Refreshes the Issues of `relevant` tickets and running chains, drops the rest after CLOSE_HORIZON_MS, and returns the watched Issues. */
+export function watchedIssues(ctx: SourceContext, relevant: { issue: string; session?: string }[]): string[] {
+  for (const { issue, session } of relevant) watch(ctx, issue, session)
+  for (const epic of active(ctx)) watch(ctx, epic, chainOf(ctx, epic)?.session || undefined)
+  const now = Date.now()
+  const kept = Object.entries(watches(ctx)).filter(([, entry]) => now - Date.parse(entry.at) < CLOSE_HORIZON_MS)
+  ctx.state.set(CHAIN_KEYS.watched, kept.length ? Object.fromEntries(kept) : undefined)
+  return kept.map(([issue]) => issue)
+}
+
+/**
+ * Starts a chain on each watched Issue a person delegated to the app since the last read, when no chain runs for it and it has open
+ * sub-issues: Linear reuses the Issue's session then, so no new one arrives. A first read only records the delegate.
+ */
+export async function followDelegations(ctx: SourceContext, client: LinearClient, viewer: string, parallel: number, statuses: Map<string, IssueStatus>,
+  round: Round, signal: AbortSignal): Promise<void> {
+  for (const [issue, entry] of Object.entries(watches(ctx))) {
+    if (signal.aborted) throw new Error('The Linear Source stopped during the delegations')
+    const status = statuses.get(issue)
+    if (!status) continue
+    if (entry.delegate !== undefined && entry.delegate !== viewer && status.delegate === viewer && chainOf(ctx, issue)?.status !== 'running') {
+      // The delegate stays as it was, so the next read tries again.
+      try { await redelegated(ctx, client, issue, entry, viewer, parallel, signal) }
+      catch (error) { if (signal.aborted) throw error; round.chainFailed++; continue }
+    }
+    const all = watches(ctx)
+    if (all[issue]) ctx.state.set(CHAIN_KEYS.watched, { ...all, [issue]: { ...all[issue], delegate: status.delegate } })
+  }
+}
+async function redelegated(ctx: SourceContext, client: LinearClient, issue: string, entry: Watch, viewer: string, parallel: number, signal: AbortSignal): Promise<void> {
+  const change = await client.delegation(issue, viewer, signal)
+  if (!change?.person || ctx.state.get(CHAIN_KEYS.run(change.id))) return
+  const context = await client.issueContext(issue, signal)
+  if (!context.children.nodes.some(child => !closed(child.state))) return
+  const details = await client.issue(issue, signal)
+  const session = chainOf(ctx, issue)?.session || entry.session || ''
+  await startRun(ctx, client, { run: change.id, session, issue: details, delegator: change.person }, context, viewer, parallel, signal)
 }
