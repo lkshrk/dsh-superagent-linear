@@ -990,6 +990,7 @@ describe('chain', () => {
     const failing = (operation: string) => { if (failures[operation]) { failures[operation]--; throw new Error('Internal error') } }
     const kidsOf = (epic: string) => [...kids.values()].filter(kid => kid.epic === epic)
     const lookup = (id: string) => {
+      if (id === 'unreadable') return null
       const kid = kids.get(id)
       if (kid) return { id: kid.id, identifier: kid.identifier, state: { type: kid.state }, parent: { id: kid.epic } }
       const other = foreign.get(id)!
@@ -1539,6 +1540,86 @@ describe('chain', () => {
     expect(w.completed).toEqual(['epic-1'])
   })
 
+  it('finishes a chain whose epic Linear closed together with its last sub-issue', async () => {
+    const w = world()
+    w.epic(); w.kid(2); w.kid(3)
+    w.delegate('es1')
+    await w.round()
+    w.close(2); w.close(3); w.epics.get('epic-1')!.state = 'completed'
+    await w.round()
+    expect(w.record()).toMatchObject({ status: 'done' })
+    expect(w.record()).not.toHaveProperty('reason')
+    expect(w.activities.at(-1)).toEqual({ session: 'es1', type: 'response', body: 'All sub-issues of WEB-10 are done.\n\n- WEB-2\n- WEB-3' })
+    const open = world()
+    open.epic(); open.kid(2); open.kid(3)
+    open.delegate('es1')
+    await open.round()
+    open.close(2); open.epics.get('epic-1')!.state = 'completed'
+    await open.round()
+    expect(open.record()).toMatchObject({ status: 'stopped', reason: 'WEB-10 was completed' })
+  })
+
+  it('restarts a stopped chain only from a prompt that says start, and answers any other prompt with the status', async () => {
+    const w = world()
+    w.epic(); w.kid(2); w.kid(3)
+    w.delegate('es1')
+    await w.round(); await w.round()
+    w.close(2); w.end(3); await w.round()
+    expect(w.record()!.status).toBe('stopped')
+    w.prompt('p1', 'epic-1', { content: { body: 'what is going on?' } })
+    await w.round()
+    expect(w.record()).toMatchObject({ run: 'es1', status: 'stopped' })
+    expect(w.activities.at(-1)!.body).toMatch(/^Not working on WEB-10 \(stopped: WEB-3 ended without being completed\)\..*write "start" in its session\.$/)
+    w.prompt('p2', 'epic-1', { content: { body: '  Start \n' } })
+    await w.round()
+    expect(w.record()).toMatchObject({ run: 'p2', status: 'running' })
+  })
+
+  it('answers a stop prompt once, though the cursor replays it every round', async () => {
+    const w = world()
+    w.epic(); w.kid(2); w.kid(3)
+    w.delegate('es1')
+    await w.round()
+    w.prompt('p1', 'epic-1', { signal: 'stop', content: { body: '' } })
+    const before = w.activities.length
+    await w.round(); await w.round(); await w.round()
+    expect(w.activities.slice(before)).toEqual([{ session: 'es1', type: 'response', body: 'Stopped: stop requested in Linear.' }])
+    const status = world()
+    status.epic(); status.kid(2)
+    status.delegate('es1')
+    await status.round()
+    status.prompt('p1', 'epic-1')
+    const ahead = status.activities.length
+    await status.round(); await status.round()
+    expect(status.activities.slice(ahead)).toHaveLength(1)
+  })
+
+  it('says once in the epic\'s session when only sub-issues assigned to someone else are left, and goes on waiting', async () => {
+    const w = world()
+    w.epic(); w.kid(2, { assignee: 'other' }); w.kid(3, { assignee: 'someone' }); w.kid(4)
+    w.delegate('es1')
+    await w.round()
+    w.close(4)
+    await w.round(); await w.round(); await w.round()
+    const notices = w.activities.filter(activity => activity.body.startsWith('Waiting for'))
+    expect(notices).toEqual([{ session: 'es1', type: 'thought', body: 'Waiting for WEB-2, WEB-3, assigned to someone else; the chain goes on once they close.' }])
+    expect(w.record()!.status).toBe('running')
+    w.kids.get('kid-2')!.state = 'completed'
+    await w.round()
+    expect(w.activities.filter(activity => activity.body.startsWith('Waiting for')).map(activity => activity.body)).toEqual([notices[0]!.body,
+      'Waiting for WEB-3, assigned to someone else; the chain goes on once they close.'])
+  })
+
+  it('treats a blocker the app cannot read as blocking, and names it in the stall', async () => {
+    const w = world()
+    w.epic(); w.kid(2, { blockedBy: ['unreadable'] }); w.kid(3)
+    w.delegate('es1')
+    await w.round()
+    expect(w.startedKids()).toEqual(['WEB-3'])
+    w.close(3); await w.round()
+    expect(w.record()).toMatchObject({ status: 'stopped', reason: 'stalled: WEB-2 waits for an issue the app cannot read' })
+  })
+
   it('holds a delegated session whose sub-issues could not be read, and starts the chain once they can be', async () => {
     const w = world()
     w.epic(); w.kid(2)
@@ -1584,14 +1665,14 @@ describe('chain', () => {
   it('reads the sub-issues of a delegated Issue once for a prompt, without a second epic check', async () => {
     const w = world()
     w.epic()
-    w.prompt('p1', 'epic-1')
+    w.prompt('p1', 'epic-1', { content: { body: 'start' } })
     await w.round()
     expect(w.received.map(trigger => trigger.meta.kind)).toEqual(['prompt'])
     expect(w.stub.calls.filter(call => call.query?.includes('IssueContext'))).toHaveLength(1)
     expect(w.stub.calls.filter(call => call.query?.includes('EpicCheck'))).toHaveLength(0)
     const closedKids = world()
     closedKids.epic(); closedKids.kid(2, { state: 'completed' })
-    closedKids.prompt('p1', 'epic-1')
+    closedKids.prompt('p1', 'epic-1', { content: { body: 'start' } })
     await closedKids.round()
     expect(closedKids.received).toEqual([])
     expect(closedKids.stub.calls.filter(call => call.query?.includes('EpicCheck'))).toHaveLength(0)

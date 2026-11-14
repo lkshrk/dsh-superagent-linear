@@ -23,9 +23,10 @@ export interface ChainRecord {
   run: string; session: string; delegator: { id: string; name?: string }; status: 'running' | 'stopped' | 'done'; reason?: string
   team: string; teamKey: string; project?: string; projectName?: string; identifier: string; url: string
   delegated: boolean; started: Record<string, Started>; children?: { id: string; identifier: string }[]; checked?: string
-  delegation?: { at: string }
+  delegation?: { at: string }; waiting?: string
 }
 type Child = Chain['children']['nodes'][number]
+const UNREADABLE_BLOCKER = { id: '', identifier: 'an issue the app cannot read', state: null }
 interface Env { ctx: SourceContext; client: LinearClient; config: LinearConfig; viewer: string; round: Round; signal: AbortSignal }
 
 export const chainOf = (ctx: SourceContext, epic: string): ChainRecord | undefined => {
@@ -58,7 +59,8 @@ export function holdUnreadable(ctx: SourceContext, key: string): void {
 export function releaseHold(ctx: SourceContext, key: string): void {
   if (ctx.state.get(CHAIN_KEYS.held(key))) ctx.state.set(CHAIN_KEYS.held(key), undefined)
 }
-export const unreadableText = (identifier: string) => `Could not read the sub-issues of ${identifier}; write "start" in this session to retry.`
+export const unreadableText = (identifier: string, delegated = true) =>
+  `Could not read the sub-issues of ${identifier}; ${delegated ? 'write "start" in this session' : 'mention the app again'} to retry.`
 const closed = (state: { type: string } | null | undefined) => state?.type === 'completed' || state?.type === 'canceled'
 
 interface Start { run: string; session: string; issue: Issue; delegator: { id: string; name?: string | null }; delegation?: boolean }
@@ -107,7 +109,7 @@ export async function epicPrompt(ctx: SourceContext, client: LinearClient, promp
   const stop = trigger.meta.signal === 'stop'
   const identifier = String(trigger.meta.identifier)
   let context: IssueContext | undefined
-  if (!stop && record?.status !== 'running' && trigger.meta.delegate === viewer) {
+  if (!stop && isStart(prompt) && record?.status !== 'running' && trigger.meta.delegate === viewer) {
     try {
       context = await client.issueContext(epic, signal)
     } catch (error) {
@@ -131,12 +133,14 @@ export async function epicPrompt(ctx: SourceContext, client: LinearClient, promp
     && !(context ? context.children.nodes.length > 0 : await client.hasChildren(epic, signal))) return false
   if (record?.status === 'running' && stop) {
     await stopChain(ctx, client, epic, record, 'stop requested in Linear', { id: trigger.actor.id }, signal)
-    return true
+  } else {
+    await client.activity(String(trigger.meta.session), stableUuid(`epic-prompt:${String(trigger.meta.activity)}`),
+      { type: 'thought', body: statusText(ctx, record, identifier, 'the app') }, false, signal).catch(ignoreGone)
   }
-  await client.activity(String(trigger.meta.session), stableUuid(`epic-prompt:${String(trigger.meta.activity)}`),
-    { type: 'thought', body: statusText(ctx, record, identifier, 'the app') }, false, signal).catch(ignoreGone)
+  ctx.state.set(CHAIN_KEYS.run(prompt.id), epic)
   return true
 }
+const isStart = (prompt: Prompt) => (prompt.content.body ?? '').trim().toLowerCase() === 'start'
 
 /** Answers a mention on an Issue with sub-issues: only a delegation starts a chain. */
 export async function epicMention(ctx: SourceContext, client: LinearClient, session: Session, signal: AbortSignal): Promise<void> {
@@ -219,9 +223,11 @@ async function advance(env: Env, epic: string, record: ChainRecord): Promise<voi
 
   if (chain.delegate?.id === viewer) record.delegated = true
   else if (record.delegated) return await stop(`${record.identifier} is no longer delegated to the app`)
-  if (closed(chain.state)) return await stop(`${record.identifier} was ${chain.state!.type}`)
   const children = chain.children.nodes
-  if (chain.children.pageInfo.hasNextPage || children.some(child => child.inverseRelations.pageInfo.hasNextPage)) {
+  // Linear can close a parent together with its last sub-issue.
+  const finished = children.length > 0 && !chain.children.pageInfo.hasNextPage && children.every(child => closed(child.state))
+  if (closed(chain.state) && !finished) return await stop(`${record.identifier} was ${chain.state!.type}`)
+  if (!finished && (chain.children.pageInfo.hasNextPage || children.some(child => child.inverseRelations.pageInfo.hasNextPage))) {
     return await stop('too many sub-issues or relations to read (at most 30 sub-issues and 20 relations on each)')
   }
   if (!children.length) return await stop(`${record.identifier} has no sub-issues`)
@@ -249,7 +255,7 @@ async function advance(env: Env, epic: string, record: ChainRecord): Promise<voi
     return await finish(env, epic, record)
   }
 
-  const blockers = (child: Child) => child.inverseRelations.nodes.flatMap(relation => relation.type === 'blocks' && relation.issue ? [relation.issue] : [])
+  const blockers = (child: Child) => child.inverseRelations.nodes.flatMap(relation => relation.type === 'blocks' ? [relation.issue ?? UNREADABLE_BLOCKER] : [])
   const elsewhere = children.filter(child => !done(child.id) && !running.has(child.id) && !record.started[child.id]
     && !!child.assignee && child.assignee.id !== viewer)
   const ready = children.filter(child => !done(child.id) && !running.has(child.id) && !record.started[child.id] && !elsewhere.includes(child)
@@ -261,6 +267,12 @@ async function advance(env: Env, epic: string, record: ChainRecord): Promise<voi
       return waiting.length ? `${child.identifier} waits for ${waiting.join(', ')}` : child.identifier
     })
     return await stop(`stalled: ${waits.join('; ')}`)
+  }
+  const waiting = !running.size && !ready.length ? elsewhere.map(child => child.identifier).join(', ') : ''
+  if (waiting && record.waiting !== waiting) {
+    await tell(client, record.session, `chain-waiting:${record.run}:${waiting}`, { type: 'thought',
+      body: `Waiting for ${waiting}, assigned to someone else; the chain goes on once they close.` }, signal)
+    record.waiting = waiting
   }
 
   for (const child of children) {
