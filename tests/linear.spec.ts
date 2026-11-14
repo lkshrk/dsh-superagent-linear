@@ -167,8 +167,8 @@ describe('translation', () => {
       actor: { source: 'linear', id: OWNER }, human: true, addressed: 'direct', text: 'WEB-1: Fix the footer\n\nIt overlaps.',
       channel: { source: 'linear', thread: 'linear:issue:issue-1', address: { session: 's1', issue: 'issue-1', team: TEAM, teamKey: 'WEB', identifier: 'WEB-1' } },
       meta: { team: TEAM, identifier: 'WEB-1', session: 's1', kind: 'session' } })
-    expect(sessionTrigger(session('s1', '2026-11-12T10:00:00.000Z', { comment: { id: 'c1', body: '@daedalus please fix' } }), VIEWER)!.text)
-      .toBe('@daedalus please fix\n\n(WEB-1: Fix the footer)')
+    expect(sessionTrigger(session('s1', '2026-11-12T10:00:00.000Z', { comment: { id: 'c1', body: '@agent please fix' } }), VIEWER)!.text)
+      .toBe('@agent please fix\n\n(WEB-1: Fix the footer)')
     expect(promptTrigger(prompt('a1', '2026-11-12T10:01:00.000Z'), VIEWER)).toMatchObject({ id: 'linear:prompt:a1', text: 'Also the header',
       threads: [{ id: 'issue:issue-1' }], meta: { session: 's1', activity: 'a1', kind: 'prompt' } })
     expect(trigger.meta).not.toHaveProperty('labels')

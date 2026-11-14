@@ -3,7 +3,7 @@ import { createHash } from 'node:crypto'
 import { readFileSync } from 'node:fs'
 import { z } from 'zod'
 
-/** Every app token of the Daedalus app is requested with this exact scope; another scope string revokes the app's other tokens. */
+/** Every app token of the agent app is requested with this exact scope; another scope string revokes the app's other tokens. */
 export const SCOPE = 'read,write,app:assignable,app:mentionable'
 const TOKEN_SKEW_MS = 60 * 60_000
 const TIMEOUT_MS = 30_000
