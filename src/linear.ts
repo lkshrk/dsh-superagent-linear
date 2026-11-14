@@ -3,7 +3,7 @@ import { z } from 'zod'
 import { LinearClient, LinearError, stableUuid, type ActivityContent, type IssueContext, type IssueStatus, type Prompt, type Session, type Undelegation } from './linear-api.ts'
 import type { OutboundMessage, SourceContext, SourceKind, Trigger } from './types.ts'
 import { Waker } from './webhook.ts'
-import { CHAIN_KEYS, HOLD_MS, advanceChains, chainOf, epicMention, epicPrompt, ownSession, startChain } from './linear-chain.ts'
+import { CHAIN_KEYS, advanceChains, chainOf, epicMention, epicPrompt, holdUnreadable, ownSession, releaseHold, startChain, unreadableText } from './linear-chain.ts'
 
 export const SOURCE = 'linear'
 export const HEALTH = 'linear'
@@ -303,6 +303,7 @@ export async function pollLinear(ctx: SourceContext, client: LinearClient, confi
       const context = fresh
         ? await client.issueContext(String(trigger.meta.issue), signal).catch((error: unknown) => { if (signal.aborted) throw error; round.contextFailed++; return undefined })
         : undefined
+      if (context) releaseHold(ctx, session.id)
       // An Issue with sub-issues is worked through them; it never gets a worker of its own.
       if (context?.children.nodes.length) {
         if (found.human && session.issue?.delegate?.id === viewer && !session.comment) {
@@ -313,14 +314,11 @@ export async function pollLinear(ctx: SourceContext, client: LinearClient, confi
       }
       // Unknown sub-issues on a delegated Issue could make it a chain; it waits for a readable round.
       if (fresh && !context && (session.issue?.delegate?.id === viewer || chainOf(ctx, String(trigger.meta.issue)))) {
-        const held = ctx.state.get<string>(CHAIN_KEYS.held(session.id))
-        if (!held) ctx.state.set(CHAIN_KEYS.held(session.id), new Date().toISOString())
-        if (!held || Date.now() - Date.parse(held) < HOLD_MS) throw new Error('The sub-issues of a delegated Issue were not readable')
-        await client.activity(session.id, stableUuid(`unreadable:${session.id}`), { type: 'error',
-          body: `Could not read the sub-issues of ${String(found.meta.identifier)}; delegate it again to retry.` }, false, signal)
+        holdUnreadable(ctx, session.id)
+        await client.activity(session.id, stableUuid(`unreadable:${session.id}`), { type: 'error', body: unreadableText(String(found.meta.identifier)) }, false, signal)
           .catch((error: unknown) => { if (!(error instanceof LinearError && error.gone)) throw error })
         ctx.state.set(CHAIN_KEYS.run(session.id), String(trigger.meta.issue))
-        ctx.state.set(CHAIN_KEYS.held(session.id), undefined)
+        releaseHold(ctx, session.id)
         continue
       }
       await ctx.receive(where.kind === 'served' ? withMode(withContext(trigger, context), context) : trigger)

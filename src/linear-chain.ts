@@ -40,6 +40,16 @@ function addOwnSession(ctx: SourceContext, id: string): void {
   ctx.state.set(CHAIN_KEYS.sessions, Object.fromEntries([...kept, [id, new Date(now).toISOString()]]))
 }
 const ignoreGone = (error: unknown) => { if (!(error instanceof LinearError && error.gone)) throw error }
+/** Throws while `key` has been held for less than HOLD_MS, so the round reads it again; returns once the hold ran out. */
+export function holdUnreadable(ctx: SourceContext, key: string): void {
+  const held = ctx.state.get<string>(CHAIN_KEYS.held(key))
+  if (!held) ctx.state.set(CHAIN_KEYS.held(key), new Date().toISOString())
+  if (!held || Date.now() - Date.parse(held) < HOLD_MS) throw new Error('The sub-issues of a delegated Issue were not readable')
+}
+export function releaseHold(ctx: SourceContext, key: string): void {
+  if (ctx.state.get(CHAIN_KEYS.held(key))) ctx.state.set(CHAIN_KEYS.held(key), undefined)
+}
+export const unreadableText = (identifier: string) => `Could not read the sub-issues of ${identifier}; write "start" in this session to retry.`
 const closed = (state: { type: string } | null | undefined) => state?.type === 'completed' || state?.type === 'canceled'
 
 interface Start { run: string; session: string; issue: Issue; delegator: { id: string; name?: string | null } }
@@ -74,8 +84,21 @@ export async function epicPrompt(ctx: SourceContext, client: LinearClient, promp
   if (ctx.state.get(CHAIN_KEYS.run(prompt.id))) return true
   const record = chainOf(ctx, epic)
   const stop = trigger.meta.signal === 'stop'
+  const identifier = String(trigger.meta.identifier)
+  let context: IssueContext | undefined
   if (!stop && record?.status !== 'running' && trigger.meta.delegate === viewer) {
-    const context = await client.issueContext(epic, signal)
+    try {
+      context = await client.issueContext(epic, signal)
+    } catch (error) {
+      if (signal.aborted) throw error
+      holdUnreadable(ctx, prompt.id)
+      await client.activity(prompt.agentSession.id, stableUuid(`unreadable:${prompt.id}`), { type: 'error', body: unreadableText(identifier) }, false, signal)
+        .catch(ignoreGone)
+      ctx.state.set(CHAIN_KEYS.run(prompt.id), epic)
+      releaseHold(ctx, prompt.id)
+      return true
+    }
+    releaseHold(ctx, prompt.id)
     if (context.children.nodes.some(child => !closed(child.state))) {
       await startRun(ctx, client, { run: prompt.id, session: prompt.agentSession.id, issue: prompt.agentSession.issue!, delegator: prompt.user! },
         context, viewer, parallel, signal)
@@ -83,8 +106,8 @@ export async function epicPrompt(ctx: SourceContext, client: LinearClient, promp
     }
   }
   const labels = Array.isArray(trigger.meta.labels) ? trigger.meta.labels : []
-  if (!record && !labels.some(label => String(label).toLowerCase() === 'epic') && !await client.hasChildren(epic, signal)) return false
-  const identifier = String(trigger.meta.identifier)
+  if (!record && !labels.some(label => String(label).toLowerCase() === 'epic')
+    && !(context ? context.children.nodes.length > 0 : await client.hasChildren(epic, signal))) return false
   if (record?.status === 'running' && stop) {
     await stopChain(ctx, client, epic, record, 'stop requested in Linear', { id: trigger.actor.id }, signal)
     return true

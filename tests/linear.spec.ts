@@ -1462,8 +1462,51 @@ describe('chain', () => {
     await expect(w.round()).rejects.toThrow('not taken in')
     expect(w.received).toEqual([])
     expect(w.record()).toBeUndefined()
+    expect(w.state.get(CHAIN_KEYS.held('es1'))).toBeDefined()
     await w.round()
     expect(w.startedKids()).toEqual(['WEB-2'])
+    expect(w.state.has(CHAIN_KEYS.held('es1'))).toBe(false)
+  })
+
+  it('retries a start prompt whose sub-issue read failed, holds it for 10 minutes at most, and releases the hold once the read works', async () => {
+    const w = world()
+    w.epic(); w.kid(2)
+    w.prompt('p1', 'epic-1', { content: { body: 'start' } })
+    w.failures.IssueContext = 1
+    await expect(w.round()).rejects.toThrow('not taken in')
+    expect(w.state.get(KEYS.prompts)).toBe(T0)
+    expect(w.state.get(CHAIN_KEYS.held('p1'))).toBeDefined()
+    await w.round()
+    expect(w.record()).toMatchObject({ run: 'p1', status: 'running' })
+    expect(w.state.has(CHAIN_KEYS.held('p1'))).toBe(false)
+    const stuck = world()
+    stuck.epic(); stuck.kid(2)
+    stuck.prompt('p1', 'epic-1', { content: { body: 'start' } })
+    stuck.failures.IssueContext = 99
+    await expect(stuck.round()).rejects.toThrow('not taken in')
+    stuck.state.set(CHAIN_KEYS.held('p1'), new Date(Date.now() - HOLD_MS - 1000).toISOString())
+    await stuck.round()
+    expect(stuck.state.get(KEYS.prompts)).not.toBe(T0)
+    expect(stuck.record()).toBeUndefined()
+    expect(stuck.received).toEqual([])
+    expect(stuck.state.has(CHAIN_KEYS.held('p1'))).toBe(false)
+    expect(stuck.activities.at(-1)).toEqual({ session: 'es1', type: 'error', body: 'Could not read the sub-issues of WEB-10; write "start" in this session to retry.' })
+  })
+
+  it('reads the sub-issues of a delegated Issue once for a prompt, without a second epic check', async () => {
+    const w = world()
+    w.epic()
+    w.prompt('p1', 'epic-1')
+    await w.round()
+    expect(w.received.map(trigger => trigger.meta.kind)).toEqual(['prompt'])
+    expect(w.stub.calls.filter(call => call.query?.includes('IssueContext'))).toHaveLength(1)
+    expect(w.stub.calls.filter(call => call.query?.includes('EpicCheck'))).toHaveLength(0)
+    const closedKids = world()
+    closedKids.epic(); closedKids.kid(2, { state: 'completed' })
+    closedKids.prompt('p1', 'epic-1')
+    await closedKids.round()
+    expect(closedKids.received).toEqual([])
+    expect(closedKids.stub.calls.filter(call => call.query?.includes('EpicCheck'))).toHaveLength(0)
   })
 
   it('stops holding a delegated session whose sub-issues stay unreadable for 10 minutes, says so once, and moves the cursor on', async () => {
@@ -1478,9 +1521,14 @@ describe('chain', () => {
     expect(w.received).toEqual([])
     expect(w.record()).toBeUndefined()
     expect(w.state.get(KEYS.sessions)).not.toBe(T0)
-    expect(w.activities.at(-1)).toEqual({ session: 'es1', type: 'error', body: 'Could not read the sub-issues of WEB-10; delegate it again to retry.' })
+    expect(w.activities.at(-1)).toEqual({ session: 'es1', type: 'error', body: 'Could not read the sub-issues of WEB-10; write "start" in this session to retry.' })
     await w.round()
     expect(w.activities.filter(activity => activity.type === 'error')).toHaveLength(1)
+    w.failures.IssueContext = 0
+    w.prompt('p1', 'epic-1', { content: { body: 'start' } })
+    await w.round()
+    expect(w.record()).toMatchObject({ run: 'p1', session: 'es1', status: 'running' })
+    expect(w.startedKids()).toEqual(['WEB-2'])
   })
 
   it('retries a child in progress that is unassigned or assigned to the app, and leaves one assigned to a person alone', async () => {
