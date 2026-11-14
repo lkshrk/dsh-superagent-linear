@@ -1,7 +1,8 @@
 {
   $schema: "https://docs.renovatebot.com/renovate-schema.json",
-  extends: [
-    "github>lkshrk/gh-ops//renovate/presets/app-library.json5",
-    "helpers:pinGitHubActionDigests",
-  ],
+  extends: ["github>lkshrk/gh-ops//renovate/presets/app-library.json5"],
+  // CI runs on pull requests, not on Renovate branches, so branch automerge would skip it.
+  lockFileMaintenance: {
+    automergeType: "pr",
+  },
 }
