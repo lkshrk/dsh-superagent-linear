@@ -106,6 +106,11 @@ export interface Delegation { id: string; at: string; person?: { id: string; nam
 export interface Read<T> { items: T[]; unreadable: number; next?: string }
 export interface ActivityContent { type: 'thought' | 'response' | 'error'; body: string }
 
+/** Which error paths a read can take part of its data with; the nodes they name come back null. */
+type Partial = (path: unknown[]) => boolean
+const anyNested: Partial = () => true
+const blockerOnly: Partial = path => path.at(-1) === 'issue' && path.includes('inverseRelations')
+
 export class LinearClient {
   private token?: { value: string; expires: number }
   private minted?: { at: number; refused: string }
@@ -133,6 +138,10 @@ export class LinearClient {
         body: `grant_type=client_credentials&scope=${SCOPE}` })
     } catch (error) {
       if (signal?.aborted) throw error
+      if (error instanceof Error && error.name === 'TimeoutError') {
+        this.minted = { at: Date.now(), refused: `The Linear token endpoint did not answer within ${TIMEOUT_MS / 1000} s` }
+        throw new LinearError(this.minted.refused)
+      }
       throw new LinearError(`The Linear token endpoint was not reachable (${String(error)}); the next round tries again`)
     }
     this.minted = { at: Date.now(), refused: `The Linear token endpoint answered ${response.status}` }
@@ -148,15 +157,15 @@ export class LinearClient {
   }
 
   /** Runs a GraphQL request, minting a new token once when Linear no longer accepts the cached one. */
-  async request<T>(query: string, variables: Record<string, unknown>, signal?: AbortSignal): Promise<T> {
-    try { return await this.once<T>(query, variables, signal) }
+  async request<T>(query: string, variables: Record<string, unknown>, signal?: AbortSignal, partial?: Partial): Promise<T> {
+    try { return await this.once<T>(query, variables, signal, partial) }
     catch (error) {
       if (!(error instanceof LinearError) || !error.unauthenticated) throw error
       this.token = undefined
-      return await this.once<T>(query, variables, signal)
+      return await this.once<T>(query, variables, signal, partial)
     }
   }
-  private async once<T>(query: string, variables: Record<string, unknown>, signal?: AbortSignal): Promise<T> {
+  private async once<T>(query: string, variables: Record<string, unknown>, signal?: AbortSignal, partial?: Partial): Promise<T> {
     if (Date.now() < this.limitedUntil) throw new LinearError(`Linear's rate limit holds requests until ${new Date(this.limitedUntil).toISOString()}`, 429, ['RATELIMITED'])
     const token = await this.bearer(signal)
     const response = await this.fetcher(this.endpoints.apiUrl, { method: 'POST', signal: withTimeout(signal),
@@ -171,9 +180,9 @@ export class LinearClient {
     if (!response.ok) throw new LinearError(body.errors?.[0]?.message ?? `Linear answered ${response.status}`, response.status, codes)
     if (body.errors?.length) {
       const message = body.errors.map(error => error.message ?? 'error').join('; ')
-      // An error below a top-level field nulls only that node; one at the top or without a path nulls the field the caller needs.
-      const partial = body.data !== null && typeof body.data === 'object' && body.errors.every(error => Array.isArray(error.path) && error.path.length > 1)
-      if (!partial) throw new LinearError(message, response.status, codes)
+      const usable = !!partial && body.data !== null && typeof body.data === 'object'
+        && body.errors.every(error => Array.isArray(error.path) && error.path.length > 1 && partial(error.path))
+      if (!usable) throw new LinearError(message, response.status, codes)
       console.log(`dsh-superagent-linear: Linear answered in part: ${message}`)
     }
     if (body.data === undefined) throw new LinearError('Linear answered without data', response.status)
@@ -298,7 +307,7 @@ export class LinearClient {
     return { id: change.id, at: change.createdAt, ...person ? { person: { id: actor.id, name: actor.name } } : {} }
   }
   async issueContext(issue: string, signal?: AbortSignal): Promise<IssueContext> {
-    return z.object({ issue: IssueContextSchema }).parse(await this.request(ISSUE_CONTEXT, { id: issue }, signal)).issue
+    return z.object({ issue: IssueContextSchema }).parse(await this.request(ISSUE_CONTEXT, { id: issue }, signal, anyNested)).issue
   }
   /** Whether the issue has at least one sub-issue. */
   async hasChildren(issue: string, signal?: AbortSignal): Promise<boolean> {
@@ -307,7 +316,7 @@ export class LinearClient {
   }
   /** An epic's delegate and state, and its sub-issues with their states, order and blockers. */
   async chainRead(epic: string, signal?: AbortSignal): Promise<Chain> {
-    return z.object({ issue: ChainSchema }).parse(await this.request(CHAIN_READ, { id: epic }, signal)).issue
+    return z.object({ issue: ChainSchema }).parse(await this.request(CHAIN_READ, { id: epic }, signal, blockerOnly)).issue
   }
   async issue(id: string, signal?: AbortSignal): Promise<Issue> {
     return z.object({ issue: Issue }).parse(await this.request(CHAIN_CHILD, { id }, signal)).issue

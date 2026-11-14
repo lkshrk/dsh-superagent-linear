@@ -136,7 +136,14 @@ describe('token', () => {
       message: 'The Linear token endpoint answered 503 0 min ago; the next token request waits 15 min' })
     expect(stub.mints()).toBe(1)
   })
-  it('takes partial data with errors on nested nodes, and rejects errors on a top-level field or without data', async () => {
+  it('waits 15 minutes after a token request that got no answer in time', async () => {
+    const stub = tokenEndpoint([() => { throw new DOMException('The operation timed out.', 'TimeoutError') }, tokenOk])
+    await expect(stub.client.request('query { viewer { id } }', {})).rejects.toThrow('The Linear token endpoint did not answer within 30 s')
+    await expect(stub.client.request('query { viewer { id } }', {})).rejects.toMatchObject({ codes: ['MINT_THROTTLED'],
+      message: 'The Linear token endpoint did not answer within 30 s 0 min ago; the next token request waits 15 min' })
+    expect(stub.mints()).toBe(1)
+  })
+  it('takes partial data only in context and blocker reads, with errors on nested nodes, and rejects the rest', async () => {
     const answer = (body: unknown) => {
       const fetcher = vi.fn(async (url: string | URL | Request) => String(url).endsWith('/oauth/token') ? tokenOk() : Response.json(body))
       return new LinearClient(() => config(), { tokenUrl: 'https://linear.test/oauth/token', apiUrl: 'https://linear.test/graphql' }, fetcher as typeof fetch)
@@ -150,6 +157,15 @@ describe('token', () => {
       .rejects.toThrow('Entity not found')
     await expect(answer({ data: null, errors: [{ message: 'Broken', path: ['issue', 'parent'] }] }).request('query { issue { id } }', {})).rejects.toThrow('Broken')
     await expect(answer({ data: { issue: { id: 'x' } }, errors: [{ message: 'No path' }] }).request('query { issue { id } }', {})).rejects.toThrow('No path')
+    const nulled = { data: { agentSessions: { nodes: [{ ...session('s1', '2026-11-12T10:01:00.000Z'), issue: null }], pageInfo: { hasNextPage: false, endCursor: null } } },
+      errors: [{ message: 'Forbidden', path: ['agentSessions', 'nodes', 0, 'issue'] }] }
+    await expect(answer(nulled).sessions('2026-11-12T10:00:00.000Z')).rejects.toThrow('Forbidden')
+    const chain = (path: unknown[]) => ({ data: { issue: { id: 'e', identifier: 'WEB-10', state: { type: 'started' }, delegate: { id: VIEWER },
+      children: { nodes: [{ id: 'k', identifier: 'WEB-2', title: 'Part', state: { type: 'started' }, assignee: null, subIssueSortOrder: 1,
+        inverseRelations: { nodes: [{ type: 'blocks', issue: null }], pageInfo: { hasNextPage: false } } }], pageInfo: { hasNextPage: false } } } },
+      errors: [{ message: 'Forbidden', path }] })
+    await expect(answer(chain(['issue', 'children', 'nodes', 0, 'inverseRelations', 'nodes', 0, 'issue'])).chainRead('e')).resolves.toMatchObject({ identifier: 'WEB-10' })
+    await expect(answer(chain(['issue', 'children', 'nodes', 0, 'assignee'])).chainRead('e')).rejects.toThrow('Forbidden')
     log.mockRestore()
   })
   it('holds every request until a rate limit resets', async () => {
