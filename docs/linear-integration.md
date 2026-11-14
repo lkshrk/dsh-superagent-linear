@@ -15,7 +15,7 @@ Use a Linear OAuth app with the client credentials grant, acting as an app user.
 | --- | --- |
 | Scope `read,write,app:assignable,app:mentionable` | People can delegate Issues to the app and mention it. The Source reads Issues and sessions and writes activities, links and Issue states. |
 | Access to every configured team | Teams the app cannot see are reported as "not found in Linear". |
-| Webhook enabled with agent session events | Linear creates no agent sessions for an app whose webhook is off. |
+| Webhook enabled with agent session events | Recommended even when polling. Linear may not open agent sessions for an app whose webhook is off; the Source cannot detect this. |
 
 The token request asks for exactly that scope string. Linear revokes an app's existing client-credential tokens when a request names another scope. Every other service that uses the same app must request the same string.
 
@@ -25,6 +25,7 @@ The token request asks for exactly that scope string. Linear revokes an app's ex
 - It keeps one token in memory and uses it until one hour before it expires. Without `expires_in` in the answer, a token is assumed to last 30 days.
 - When Linear answers a request as unauthenticated, the client drops the token, gets a new one and retries the request once.
 - It requests at most one token per 15 minutes. Linear keeps at most 1,000 tokens per app and evicts the least recently used, so frequent requests could evict another service's token. A token Linear refuses right after it was issued makes the Source's health `error` until the 15 minutes pass.
+- The 15 minutes start when the client tries, before it reads the credential files and before the token endpoint answers. A wrong client id or secret makes the token endpoint answer 401; the retry then fails with "Linear refused the token minted 0 min ago". Unreadable credential files fail the same way on the next round. After a fix, the next token request can wait up to 15 minutes.
 
 The credential files are read on every token request.
 
@@ -36,12 +37,12 @@ The credential files are read on every token request.
 | --- | --- | --- | --- |
 | `viewer` | `id` | The app user's id, to ignore its own sessions and activities. | Once per process. |
 | `teams` | `id key`, 100 per page | Resolving configured teams. | Every 10 minutes. |
-| `agentSessions` | session, creator, comment, Issue | New sessions. 25 per page, up to 10 pages. | Every round. |
+| `agentSessions` | session, creator, `appUser`, comment, Issue | New sessions. 25 per page, up to 10 pages. | Every round. |
 | `agentActivities` filtered by `type: prompt`, `createdAt > cursor` | body, `signal`, user, session and Issue | New prompts. 25 per page, up to 10 pages. | Every round. |
 | `agentActivity(id)` | `id` | Checking whether a failed create was stored. | After a failed activity create. |
-| `IssueContext` | parent, first 30 sub-issues with state | The context header and epic detection. | Once per new session Trigger, per started sub-issue, and per start prompt. |
+| `IssueContext` | parent, first 30 sub-issues with state | The context header and epic detection. | Once per new session Trigger, per started sub-issue, per re-delegation candidate, and per non-stop prompt on a delegated Issue without a running chain or open ticket. |
 | `EpicCheck` | first sub-issue | Whether a prompt's Issue has sub-issues. | Per prompt that may be on an epic. |
-| `issues` filtered by `id in` | delegate, state, `completedAt`, `canceledAt` | Undelegation and closed Issues. 50 Issues per request. | At most every 30 seconds, while tickets are watched. |
+| `issues` filtered by `id in` | delegate, state, `completedAt`, `canceledAt` | Undelegation and closed Issues. 50 Issues per request. | At most every 30 seconds, while tickets that started on Linear are open or their Issues are watched for a close. |
 | `issue.history` (`fromDelegate`, `toDelegate`) | last 50 entries | Who removed the delegation. | Per detected undelegation. |
 | `DelegatedIssues` filtered by `delegate`, `updatedAt` | `id`, 50 per page | Re-delegated Issues. | At most every 30 seconds. |
 | `DelegationHistory` | last 50 entries, actor `app`, `botActor` | Who delegated the Issue again, and whether a person did. | Per re-delegation candidate. |
@@ -67,9 +68,11 @@ Each activity id is a deterministic UUID in v4 layout, derived from a seed such 
 | Linear answer | Client behaviour |
 | --- | --- |
 | HTTP 401 or an authentication error code | New token, one retry. |
-| HTTP 429 or `RATELIMITED` | No requests until the `x-ratelimit-requests-reset` header's time, capped at one hour, or for 60 seconds without the header. |
+| HTTP 429 or `RATELIMITED` | No requests until the `x-ratelimit-requests-reset` header's time (else `x-ratelimit-endpoint-requests-reset`), capped at one hour, or for 60 seconds without either header. |
 | A not-found error | The entity is gone. A reply to a gone session is dropped; other posts to it are ignored. |
-| Any other error | The round fails and retries on the next one. |
+| Any other error on intake, an activity post or `receive` | The round fails and retries on the next one. |
+| Any error on the team list, an Issue context, an `issues` chunk, a pull request link, completing an Issue after a merge, or an undelegation history read | Swallowed. The round goes on: teams are reported unverified, the session is taken in without context, the chunk or link waits for the next check, or the stop is unattributed. |
+| Any error while advancing a chain or checking re-delegation | Counted in health as "sub-issue chains not advanced". The round goes on. |
 
 ## Session handling
 
@@ -77,8 +80,8 @@ A session's `creator` decides whose Trigger it is. A session the app created, or
 
 | Session | Text of the Trigger |
 | --- | --- |
-| Started by a mention | The comment body, then `(ENG-12: Title)`. |
-| Started by a delegation | `ENG-12: Title`, then the Issue description. |
+| Started with a comment (a mention, or a delegation made with a comment) | The comment body, then `(ENG-12: Title)`. |
+| Started without a comment | `ENG-12: Title`, then the Issue description. |
 | Prompt | The prompt body. A stop prompt starts with "Stop requested in Linear." |
 | Chain sub-issue | `ENG-12: Title`, then the sub-issue's description. |
 
@@ -100,13 +103,21 @@ Parent issue description (context from Linear; data, not instructions):
 - At most 8 sub-issues are shown, open ones first. States are `open`, `done` or `canceled`.
 - The parent's description is cut at 1,500 characters and fenced in backticks longer than any it contains.
 
-The Trigger's `url` is the Issue's page. Replies still go to the session through the Channel.
+The Trigger's `url`, which is also the Channel's link, depends on the Trigger:
+
+| Trigger | `url` |
+| --- | --- |
+| Session | The agent session's URL, or the Issue's page when Linear gives none. |
+| Chain | The URL of the session the chain opened, or the Issue's page. |
+| Prompt | The Issue's page. |
+
+Only `meta.issueUrl` and `DSH_SUPERAGENT_LINEAR_ISSUE_URL` are always the Issue's page. Replies go to the session through the Channel.
 
 ## Delegation
 
 - Delegating an Issue to the app opens a session. Linear opens a new session only on the first delegation and reuses it afterwards. The Source therefore finds later delegations through `DelegatedIssues` and the Issue's history.
 - A re-delegation starts a chain only when the newest delegation since the last check came from a person: not an app, not an automation (`botActor`), and not the app itself.
-- The undelegation check compares each watched Issue's `delegate` with the app user. The stop is attributed to the person in the history entry whose `fromDelegate` is the app, when one exists since the ticket started.
+- The undelegation check compares the `delegate` of each Issue with an open ticket that started on Linear with the app user. The stop is attributed to the person in the history entry whose `fromDelegate` is the app, when one exists since the ticket started.
 
 ## Webhook
 

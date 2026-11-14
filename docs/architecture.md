@@ -80,7 +80,10 @@ sequenceDiagram
   participant H as dsh-superagent
 
   P->>L: teams (cached 10 min), viewer (cached)
-  P->>L: AgentSessions since session cursor
+  alt no cursor stored yet
+    P->>P: set both cursors to now, end the round
+  end
+  P->>L: agentSessions, pages until the cursor
   loop each new session
     P->>L: agentActivityCreate "Received." (ephemeral)
     P->>L: IssueContext (parent, sub-issues)
@@ -90,7 +93,7 @@ sequenceDiagram
       P->>H: receive(session Trigger)
     end
   end
-  P->>L: AgentActivities (prompts) since prompt cursor
+  P->>L: agentActivities, prompts created after the cursor
   loop each new prompt
     P->>H: receive(prompt Trigger), unless an epic answers it
   end
@@ -110,7 +113,7 @@ For each session after the cursor, the round:
 3. Posts the ephemeral "Received." thought once per session.
 4. Reads the Issue context (parent and up to 30 sub-issues) once per new Trigger.
 5. For an Issue with sub-issues: a person's delegation, without a comment, starts a chain. A person's mention gets the chain status. Nothing else follows.
-6. For a delegated Issue whose context could not be read: holds the session for up to 10 minutes by failing the round, then posts an error.
+6. For an Issue delegated to the app, or with a chain record, whose context could not be read: holds the session for up to 10 minutes by failing its take-in, then posts an error. Other Issues go on without context.
 7. Otherwise adds the context header, applies split mode, and calls `receive`.
 
 ### Prompts
@@ -119,7 +122,7 @@ For each prompt after the cursor, the round finds an open ticket on the same Iss
 
 ### Cursors
 
-A cursor moves only when every item it passes was taken in. The next cursor is five seconds before the newest item read, to catch writes Linear records late, and never moves back. Fixed Trigger ids make the overlap harmless. A round in which an item was not taken in throws after finishing the other steps, so the next round reads it again.
+A cursor holds back only when taking in an item threw: `receive` failed, an activity post failed, or a hold for unreadable sub-issues. Items that are skipped on purpose (own sessions, misrouted, unmapped or unlisted Issues) do not hold it. The next cursor is five seconds before the newest item read, to catch writes Linear records late, and never moves back. Fixed Trigger ids make the overlap harmless. A round in which an item was not taken in throws after finishing the other steps, so the next round reads it again.
 
 ### Routing
 
@@ -144,6 +147,12 @@ A chain record per epic is stored under `linear-chain:<epic id>`:
 | `status` | `running`, `stopped` or `done`. |
 | `started` | Per sub-issue: its session, Trigger and ticket. |
 | `checked` | When the epic was last read. |
+| `reason` | Why the chain stopped. |
+| `team`, `teamKey`, `project`, `projectName` | The epic's team and project when the run started. |
+| `identifier`, `url` | The epic's identifier and page. |
+| `delegated` | The epic was delegated to the app. Only then does losing the delegation stop the chain. |
+| `children` | The sub-issues seen at the last read. |
+| `delegation` | When a re-delegation started the run. A new session on the epic within 2 minutes joins that run. |
 
 ```mermaid
 stateDiagram-v2
@@ -184,7 +193,7 @@ All keys live in the Source context's state store.
 The kind uses these parts of dsh-superagent's Source interface:
 
 - `scope`: a Trigger is listened to when an enabled team matches. The admission row is the team's name.
-- `channel.allowed`, `channel.send`, `channel.link`: replies go to the session; links point at the Issue.
+- `channel.allowed`, `channel.send`, `channel.link`: replies go to the session. The link is the Channel's `url`: the agent session's URL for a session Trigger (the Issue's page when Linear gives none), the new session's URL for a chain Trigger, and the Issue's page for a prompt Trigger.
 - `find`: Issue identifiers such as `ENG-12` in a search query become search terms.
 - `policy`: the allowed list of Linear user ids, and one admission row per enabled team, marked "Sessions only".
 - `environment`: the variables listed in [Configuration](configuration.md#execution-environment).

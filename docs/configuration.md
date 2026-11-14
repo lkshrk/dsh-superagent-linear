@@ -74,7 +74,7 @@ An Issue works in its project's repository when the team lists that project, els
 
 | Case | Result |
 | --- | --- |
-| The team or project names a repository the GitHub Source does not serve | Skipped. Health names the team, or `TEAM/project` for a project, and is `error`. |
+| The team or project names a repository the GitHub Source does not serve | Skipped. Health names the team, or `TEAM/<project name>` for a project (the project id when the entry has no name), and is `error`. |
 | The Issue's repository is not served | Not taken in. Health lists the Issue as "left out". |
 | Neither the project nor the team names a repository | Not taken in. The session gets one `error` activity. Health lists the Issue under "no repository for". |
 | The Issue's team is not configured or is disabled | dsh-superagent's scope filter drops it (`team_not_listed`). |
@@ -117,7 +117,7 @@ Seconds between polling rounds. A longer interval costs fewer requests and delay
 
 Once the ticket's own pull request merged, move its Issue to the team's first completed state (lowest `position`), unless the Issue is completed or canceled already. A failed update is retried on later rounds. Pull requests the ticket only follows do not count.
 
-Chains complete the epic regardless of this setting.
+Chains complete the epic regardless of this setting, but never its sub-issues. A chain needs each sub-issue closed by this setting, by Linear's GitHub integration or by a person. A sub-issue whose ticket ends while it is still open stops the chain with "ENG-12 ended without being completed". Turning this off with chains in use means closing sub-issues another way.
 
 ### `chainParallel`
 
@@ -157,7 +157,7 @@ A pull request body with `Fixes ENG-12` lets Linear's own GitHub integration clo
 
 ## Trigger metadata
 
-Session, prompt and chain Triggers carry these `meta` fields. Workers and dsh-superagent's evaluation can read them.
+Triggers carry these `meta` fields. Undelegation and chain-stop Triggers carry only `team`, `teamKey`, `issue`, `identifier`, `issueUrl`, `session`, `kind`, `signal`, `repository`, and `history` or `chain`.
 
 | Field | Present | Value |
 | --- | --- | --- |
@@ -166,12 +166,13 @@ Session, prompt and chain Triggers carry these `meta` fields. Workers and dsh-su
 | `session` | always | The agent session id. |
 | `kind` | always | `session`, `prompt`, `chain`, `undelegated` or `chain-stop`. |
 | `project`, `projectName` | when the Issue has a project | The project's id and name. |
-| `delegate` | session and prompt, when delegated | The delegate's user id. |
+| `delegate` | session and prompt, when the Issue has a delegate | The delegate's user id. |
 | `labels` | when the Issue has labels | Label names. |
 | `repository` | when not the primary | The repository the ticket works in. |
-| `parent`, `children` | when context was read | The parent's id and the number of sub-issues read. |
+| `parent` | when context was read and the Issue has a parent | The parent's id. |
+| `children` | when context was read and the Issue has a parent or sub-issues | The number of sub-issues read. |
 | `mode`, `epic` | split mode | `split` and the Issue's id. |
-| `chain` | chain and chain-stop | The epic's id. |
+| `chain` | chain, chain-stop | The epic's id. |
 | `activity` | prompt | The prompt activity id. |
-| `signal` | stop | `stop`. |
+| `signal` | stop prompt, undelegated, chain-stop | `stop`. |
 | `history` | undelegated, when attributed | The history entry id. |

@@ -8,7 +8,7 @@ The Source also:
 
 - puts the Issue's parent and sub-issues on top of the Trigger text;
 - works through an Issue's sub-issues, one session each, in the order their `blocks` relations allow (chain mode);
-- asks for a plan when an Issue labelled `epic` has no sub-issues yet (split mode);
+- asks a worker to plan an Issue labelled `epic` that has no sub-issues yet (split mode);
 - links pull requests into the session and completes the Issue once the ticket's own pull request merged;
 - stops a ticket when the app is removed as the Issue's delegate.
 
@@ -80,7 +80,7 @@ managed:
 | `webhookSecretFile` | absolute path | `''` | File with the webhook signing secret. Empty means polling only. |
 | `teams` | list | `[]` | Teams whose sessions are taken in, each with a repository, projects, or both. At least one enabled team is required. |
 | `pollSeconds` | integer, 5–600 | `10` | Seconds between polling rounds. |
-| `completeOnMerge` | boolean | `true` | Complete the Issue once the ticket's own pull request merged. |
+| `completeOnMerge` | boolean | `true` | Complete the Issue once the ticket's own pull request merged. Chains need sub-issues closed this way or by hand. |
 | `chainParallel` | integer, 1–8 | `2` | Sub-issues worked on at once, across all chains. |
 
 [Configuration](docs/configuration.md) explains each key in full.
@@ -88,6 +88,18 @@ managed:
 Only people in the Policy's `allowed` list originate work. With the default admission table, a session from anyone else is ignored.
 
 The Source stays `paused` until both credential files and at least one enabled team are set.
+
+### Finding ids and the webhook URL
+
+The Linear GraphQL API returns the ids the config needs. Run these queries in Linear's API explorer or with a personal API key:
+
+| You need | Query |
+| --- | --- |
+| A person's user id, for `allowed` | `query { users { nodes { id name email } } }` |
+| A team id and key | `query { teams { nodes { id key name } } }` |
+| A project id | `query { projects { nodes { id name } } }` |
+
+In the Linear app's webhook settings, set the URL to `https://<public host of DSH's web server>/hooks/linear`, enable agent session events, and put the signing secret Linear shows into the file `webhookSecretFile` names.
 
 ## How it works
 
@@ -99,7 +111,7 @@ Each polling round runs these steps in order:
 4. At most every 30 seconds: check re-delegated Issues, then the delegate and state of the Issues of those tickets.
 5. Advance active chains.
 
-The first round after the Source is switched on only sets both cursors to now. Older sessions are not work for it.
+Both cursors persist in the Source's state. The very first round, with no cursor stored yet, only sets both to now: older sessions are not work for it. After the Source is paused or switched off and on again, the next round reads everything since the stored cursors. Each query reads at most 10 pages of 25, so at most 250 sessions and 250 prompts; older items past that are not read.
 
 A signed webhook delivery ends the wait between rounds early. See [Webhook](#webhook).
 
@@ -109,7 +121,7 @@ A signed webhook delivery ends the wait between rounds early. See [Webhook](#web
 | --- | --- |
 | `linear:session:<session id>` | A person's new session: a delegation or a mention. |
 | `linear:prompt:<activity id>` | A person's prompt in a session. |
-| `linear:undelegated:<history id>` | The app was removed as the delegate of an Issue with an open ticket. |
+| `linear:undelegated:<history id>` | The app was removed as the delegate of an Issue with an open ticket. Without a matching history entry the id is `linear:undelegated:<ticket id>:<time observed>`. |
 | `linear:chain:<run>:<sub-issue id>` | A chain started a sub-issue. |
 | `linear:chain-stop:<run>:<sub-issue id>` | A chain stopped while the sub-issue was started. |
 
@@ -149,7 +161,7 @@ While a ticket that started on Linear is open, the Source checks its Issue's del
 
 - Each pull request a ticket follows is added to the session's external links, labelled `Pull request #12` in the ticket's repository and `Pull request owner/name#12` in another.
 - With `completeOnMerge`, the Issue moves to its team's first completed state once the ticket's own pull request merged.
-- When an Issue moves to a completed or canceled state, the Source reports it to dsh-superagent. This covers open tickets and tickets that ended within the last 14 days.
+- When an Issue moves to a completed or canceled state, the Source reports it to dsh-superagent. This covers open tickets and tickets that ended within the last 14 days. It needs a dsh-superagent whose Source context offers `tickets.issueClosed`; on an older one the Source does not watch for closes.
 
 ## Epics
 
@@ -163,7 +175,7 @@ A new session on an Issue labelled `epic` (any case) that has no sub-issues gets
 Mode: split (plan this epic into sub-issues; no code)
 ```
 
-The worker sees `DSH_SUPERAGENT_LINEAR_MODE=split`. The Source does not create sub-issues itself.
+The worker sees `DSH_SUPERAGENT_LINEAR_MODE=split`. The Source does not create sub-issues itself. The worker creates them through the `linear` MCP server's `save_issue`, so workers need that MCP server. dsh-superagent admits Linear tools only to a split worker, and its `save_issue` only for sub-issues of that epic (see dsh-superagent's deployment docs).
 
 ### Chain mode
 
@@ -174,6 +186,8 @@ A person delegates an Issue with sub-issues to the app. The Issue never gets a w
 3. Ready sub-issues start in sub-issue order, while fewer than `chainParallel` run across all chains.
 4. A sub-issue assigned to a person is left alone. The chain waits for it.
 5. Once every sub-issue is completed or canceled, the Source completes the epic and lists the sub-issues and their pull requests in its session.
+
+The Source completes only the epic. Each sub-issue must be closed by `completeOnMerge`, by Linear's GitHub integration (`Fixes ENG-12` in the pull request), or by a person. A sub-issue whose ticket ends while it is still open stops the chain with "ENG-12 ended without being completed".
 
 Other ways to start a chain:
 
@@ -186,8 +200,9 @@ A chain stops when:
 
 - a sub-issue's ticket ended while the sub-issue is still open;
 - a sub-issue got no ticket within 30 minutes;
-- nothing running can unblock the rest, such as a cycle or a blocker outside the epic;
-- the epic is no longer delegated to the app, or was completed or canceled;
+- nothing running can unblock the rest, such as a cycle or a blocker outside the epic ("stalled: ENG-13 waits for ENG-12");
+- the epic was delegated to the app and no longer is;
+- the epic was completed or canceled, or has no sub-issues left;
 - the epic has more than 30 sub-issues, or a sub-issue more than 20 relations;
 - a sub-issue works in no repository the deployment serves, or the admission table filters it;
 - a person sends a stop in the epic's session.
@@ -196,11 +211,11 @@ Started sub-issues then get a stop Trigger, and the epic's session gets the reas
 
 ## Webhook
 
-With `webhookSecretFile` set, `POST /hooks/linear` on DSH's web server takes Linear's deliveries. A valid delivery only wakes the polling loop for an immediate round. Intake still reads the Linear API.
+With `webhookSecretFile` set, `POST /hooks/linear` on DSH's web server takes Linear's deliveries. The route needs DSH's optional `webServer` service; without it the Source polls only. A valid delivery only wakes the polling loop for an immediate round. Intake still reads the Linear API.
 
 The plugin checks each delivery's `Linear-Signature` and does no other authentication. Expose only that path publicly. See [Webhook](docs/linear-integration.md#webhook).
 
-Keep the app's webhook enabled with agent session events. Linear creates no agent sessions for an app whose webhook is off, so delegations and mentions stop arriving even though polling still runs.
+Keep the app's webhook enabled with agent session events, also when you rely on polling. Linear may not open agent sessions for an app whose webhook is off; this is Linear's behaviour, not something the Source checks.
 
 ## Troubleshooting
 
@@ -213,20 +228,20 @@ The Source reports one health entry, `linear`. Its detail lists the round's coun
 | `Set the app credential files and a team` | A credential file path is empty, or no team is enabled. |
 | `teams … skipped: their repository is not one the GitHub Source serves` | Add the repository to the GitHub Source, or fix the team or project. Health is `error`. |
 | `teams … not found in Linear` | The team key or id is wrong, or the app cannot see the team. Health is `error`. |
-| `teams unverified` | The team list could not be read. Intake goes on. |
+| `teams unverified: Linear's team list was not readable` | The team list could not be read. Intake goes on. |
 | `left out …` | These Issues' repository is not one the GitHub Source serves. |
 | `no repository for …` | Map the Issue's project, or give the team a `repository`. |
-| `parent and sub-issues unreadable: n` | Context reads failed. Sessions were taken in without context. |
+| `parent and sub-issues unreadable: n` | Context reads failed. Sessions on Issues not delegated to the app were taken in without context. |
 | `sub-issue chains not advanced: n` | A chain or re-delegation read failed. It retries next round. |
-| `n failed polls in a row` | Three rounds failed in a row, or a refused token or rate limit blocks every request. Health is `error`. |
+| `n failed polls in a row; last: <error>` | Three rounds failed in a row, or a refused token or rate limit blocks every request. Health is `error`. |
 
 Common causes:
 
 - **No sessions arrive.** Check that the app's webhook is enabled with agent session events, and that the person is in the Policy's `allowed` list.
-- **"Linear refused the token minted n min ago".** Linear rejected a fresh token. The Source waits up to 15 minutes before it asks for another, so it does not evict other services' tokens. Check the credentials and the scope other services request with the same app.
-- **"The Linear app credential files are not readable".** Check the paths and file permissions.
+- **"Linear refused the token minted n min ago".** The Source asks for at most one token per 15 minutes, so it does not evict other services' tokens. The 15 minutes start when it tries, before it reads the credential files or Linear answers. A wrong client id or secret therefore shows as "refused the token minted 0 min ago": Linear answers 401, and the retry that follows hits the 15-minute limit. Check the credentials and the scope other services request with the same app. A fix takes effect up to 15 minutes later.
+- **"The Linear app credential files are not readable".** Check the paths and file permissions. The next try waits the same 15 minutes.
 - **"Linear's rate limit holds requests until …".** The app hit Linear's rate limit. Requests resume after the reset. Raise `pollSeconds`, or configure the webhook and then raise it.
-- **A delegated epic does nothing.** When its sub-issues cannot be read, the session waits up to 10 minutes, then gets an error. Write "start" in the session to retry.
+- **A delegated Issue does nothing, and polls fail.** When the sub-issues of a delegated Issue cannot be read, the Source holds its session or start prompt for up to 10 minutes by failing the round, so the cursor stays put. After three rounds health is `error` with "last: Error: A Linear session or prompt was not taken in; the next round reads it again". After 10 minutes the session gets an error activity and the cursor moves on. Write "start" in the session to retry.
 
 ## Development
 
