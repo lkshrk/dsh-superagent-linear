@@ -75,12 +75,14 @@ async function startRun(ctx: SourceContext, client: LinearClient, start: Start, 
       ...start.delegation ? { delegation: { at: new Date().toISOString() } } : {} })
   }
   setActive(ctx, issue.id, true)
+  watch(ctx, issue.id, session)
+  await tell(client, session, `chain-plan:${run}`, { type: 'thought', body: planText(issue, context, parallel) }, signal)
+  ctx.state.set(CHAIN_KEYS.run(run), issue.id)
+}
+function planText(issue: Issue, context: IssueContext, parallel: number): string {
   const list = context.children.nodes.map(child => `${child.identifier}${closed(child.state) ? ' (done)' : ''}`).join(', ')
   const more = context.children.pageInfo.hasNextPage ? ' and more' : ''
-  watch(ctx, issue.id, { session })
-  await tell(client, session, `chain-plan:${run}`, { type: 'thought',
-    body: `Working through the sub-issues of ${issue.identifier} in the order their blocking relations allow, at most ${parallel} at a time: ${list}${more}.` }, signal)
-  ctx.state.set(CHAIN_KEYS.run(run), issue.id)
+  return `Working through the sub-issues of ${issue.identifier} in the order their blocking relations allow, at most ${parallel} at a time: ${list}${more}.`
 }
 export async function startChain(ctx: SourceContext, client: LinearClient, session: Session, context: IssueContext, viewer: string, parallel: number,
   signal: AbortSignal): Promise<void> {
@@ -88,7 +90,8 @@ export async function startChain(ctx: SourceContext, client: LinearClient, sessi
   if (record?.status === 'running' && record.delegation && Date.now() - Date.parse(record.delegation.at) < ADOPT_MS) {
     record.session = session.id
     save(ctx, session.issue!.id, record)
-    watch(ctx, session.issue!.id, { session: session.id })
+    watch(ctx, session.issue!.id, session.id)
+    await tell(client, session.id, `chain-plan:${record.run}:${session.id}`, { type: 'thought', body: planText(session.issue!, context, parallel) }, signal)
     ctx.state.set(CHAIN_KEYS.run(session.id), session.issue!.id)
     return
   }
@@ -368,14 +371,13 @@ async function finish(env: Env, epic: string, record: ChainRecord): Promise<void
   setActive(ctx, epic, false)
 }
 
-/** What the Source last knew of an Issue: its last session seen, when, and its delegate when known. */
-export interface Watch { session?: string; at: string; delegate?: string | null }
+/** An Issue the Source saw a session or ticket on: its last session, and when. */
+export interface Watch { session?: string; at: string }
 export const DELEGATION_OVERLAP_MS = 5000
 const watches = (ctx: SourceContext) => ctx.state.get<Record<string, Watch>>(CHAIN_KEYS.watched) ?? {}
-export function watch(ctx: SourceContext, issue: string, fields: { session?: string; delegate?: string | null }): void {
+export function watch(ctx: SourceContext, issue: string, session?: string): void {
   const all = watches(ctx)
-  ctx.state.set(CHAIN_KEYS.watched, { ...all, [issue]: { ...all[issue], ...fields.session ? { session: fields.session } : {},
-    ...fields.delegate !== undefined ? { delegate: fields.delegate } : {}, at: new Date().toISOString() } })
+  ctx.state.set(CHAIN_KEYS.watched, { ...all, [issue]: { ...all[issue], ...session ? { session } : {}, at: new Date().toISOString() } })
 }
 function prune(ctx: SourceContext): void {
   const now = Date.now()
@@ -385,9 +387,9 @@ function prune(ctx: SourceContext): void {
 }
 
 /**
- * Starts a chain on each Issue a person delegated to the app since the last check, read in one query, when the Source knew it
- * as not delegated to the app or it has a chain that is not running, and it has open sub-issues: Linear reuses the Issue's
- * session then, so no new one arrives. The check time moves only once every candidate was handled.
+ * Starts a chain on each Issue a person delegated to the app since the last check, read in one query, when the Source saw it
+ * before or it has a chain, no chain or ticket of its own runs, and it has open sub-issues: Linear reuses the Issue's session
+ * then, so no new one arrives. The check time moves only once every candidate was handled.
  */
 export async function followDelegations(ctx: SourceContext, client: LinearClient, viewer: string, parallel: number, round: Round, signal: AbortSignal): Promise<void> {
   prune(ctx)
@@ -399,15 +401,13 @@ export async function followDelegations(ctx: SourceContext, client: LinearClient
   try { ids = await client.delegatedIssues(viewer, since, signal) }
   catch (error) { if (signal.aborted) throw error; round.chainFailed++; return }
   let failed = false
+  const open = openTickets(ctx)
   for (const issue of ids) {
     if (signal.aborted) throw new Error('The Linear Source stopped during the delegations')
     const record = chainOf(ctx, issue)
-    const known = watches(ctx)[issue]?.delegate
-    if (record?.status !== 'running' && (record || (known !== undefined && known !== viewer))) {
-      try { await redelegated(ctx, client, issue, viewer, since, parallel, signal) }
-      catch (error) { if (signal.aborted) throw error; round.chainFailed++; failed = true; continue }
-    }
-    if (watches(ctx)[issue]) watch(ctx, issue, { delegate: viewer })
+    if (record?.status === 'running' || (!record && !watches(ctx)[issue]) || open.has(issue)) continue
+    try { await redelegated(ctx, client, issue, viewer, since, parallel, signal) }
+    catch (error) { if (signal.aborted) throw error; round.chainFailed++; failed = true }
   }
   if (!failed) ctx.state.set(CHAIN_KEYS.delegated, now)
 }

@@ -293,7 +293,7 @@ export async function pollLinear(ctx: SourceContext, client: LinearClient, confi
       }
       // Linear marks a session unresponsive when nothing answers within seconds; an evaluation takes longer.
       if (where.kind === 'served' && !ctx.state.get(KEYS.seen(session.id))) {
-        watch(ctx, String(trigger.meta.issue), { session: session.id, delegate: session.issue?.delegate?.id ?? null })
+        watch(ctx, String(trigger.meta.issue), session.id)
         await client.activity(session.id, stableUuid(`seen:${session.id}`), { type: 'thought', body: 'Received.' }, true, signal)
           .catch((error: unknown) => { if (!(error instanceof LinearError && error.gone)) throw error })
         ctx.state.set(KEYS.seen(session.id), true)
@@ -444,11 +444,7 @@ async function followIssues(ctx: SourceContext, client: LinearClient, config: Li
   if (!running.length && !closing.length) return
   const issues = await client.issues([...new Set([...running, ...closing].map(item => item.issue))], signal)
   reportClosed(ctx, closing, issues)
-  // Only a delegate other than the app is kept: the delegated query above records the app.
-  for (const { origin, issue } of running) {
-    const delegate = issues.get(issue)?.delegate
-    if (delegate !== undefined && delegate !== viewer) watch(ctx, issue, { ...typeof origin.meta.session === 'string' && origin.meta.session ? { session: origin.meta.session } : {}, delegate })
-  }
+  for (const { origin, issue } of running) watch(ctx, issue, typeof origin.meta.session === 'string' ? origin.meta.session : undefined)
   if (!running.length) return
   const next: Record<string, Delegation> = Object.fromEntries(running.map(({ ticket, origin }) =>
     [ticket.id, known[ticket.id] ?? { delegated: origin.meta.delegate === viewer }]))

@@ -1624,6 +1624,14 @@ describe('chain', () => {
       expect(w.historyReads).toEqual(['epic-1', 'epic-1'])
     })
 
+    it('starts from a chain record the Source holds no other state for, as one from before the watch existed', async () => {
+      const w = await stoppedChain()
+      w.state.set(CHAIN_KEYS.watched, undefined)
+      w.redelegate('h1')
+      await w.round()
+      expect(w.record()).toMatchObject({ run: 'h1', session: 'es1', status: 'running' })
+    })
+
     it('retries a re-delegation whose history read failed on the next check, and starts once', async () => {
       const w = await stoppedChain()
       w.state.set(CHAIN_KEYS.delegated, new Date(Date.now() - 60_000).toISOString())
@@ -1701,7 +1709,7 @@ describe('chain', () => {
       expect(w.historyReads).toEqual(['epic-1'])
     })
 
-    it('reads the history of an Issue it knew as undelegated once, and not for its later changes', async () => {
+    it('starts nothing from later changes of an Issue an app delegated to itself', async () => {
       const w = world()
       w.epic().delegate = null; w.kid(2)
       w.delegate('m1', 'epic-1', { id: OWNER }, { comment: { id: 'c1', body: '@dsh status?' } })
@@ -1712,18 +1720,30 @@ describe('chain', () => {
       w.epics.get('epic-1')!.updatedAt = new Date().toISOString()
       await w.round()
       expect(w.record()).toBeUndefined()
-      expect(w.historyReads).toEqual(['epic-1'])
+      expect(w.historyReads).toEqual(['epic-1', 'epic-1'])
     })
 
-    it('starts nothing from a change on an Issue it last saw delegated to the app', async () => {
-      const w = world()
-      w.epic(); w.kid(2)
-      w.delegate('m1', 'epic-1', { id: OWNER }, { comment: { id: 'c1', body: '@dsh status?' } })
-      await w.round()
-      w.redelegate('h1')
-      await w.round()
-      expect(w.record()).toBeUndefined()
-      expect(w.historyReads).toEqual([])
+    it('starts a chain when a person delegates an epic again after its split ticket ended, and not while that ticket is open', async () => {
+      for (const ended of [true, false]) {
+        const w = world()
+        w.epic()
+        w.delegate('es1')
+        await w.round()
+        const split = w.received.find(trigger => trigger.id === 'linear:session:es1')!
+        w.tickets.push({ id: 'split', origin: { triggerId: split.id, triggerIds: [split.id] } })
+        await w.round()
+        w.kid(2)
+        if (ended) w.tickets[0]!.ended = { at: new Date().toISOString() }
+        w.redelegate('h1')
+        await w.round()
+        if (ended) {
+          expect(w.record()).toMatchObject({ run: 'h1', session: 'es1', status: 'running', delegator: { id: OWNER } })
+          expect(w.startedKids()).toEqual(['WEB-2'])
+        } else {
+          expect(w.record()).toBeUndefined()
+          expect(w.historyReads).toEqual([])
+        }
+      }
     })
 
     it('starts the run without posting when no session of the Issue is known', async () => {
@@ -1749,7 +1769,7 @@ describe('chain', () => {
       await w.round(); await w.round()
       expect(w.record()).toMatchObject({ run: 'h1', session: 'es2', status: 'running' })
       expect(w.state.get(CHAIN_KEYS.run('es2'))).toBe('epic-1')
-      expect(plans(w)).toHaveLength(2)
+      expect(plans(w).map(activity => activity.session)).toEqual(['es1', 'es1', 'es2'])
       expect(w.chainTriggers()).toHaveLength(4)
       const record = w.record()!
       w.state.set(CHAIN_KEYS.chain('epic-1'), { ...record, delegation: { at: new Date(Date.now() - ADOPT_MS).toISOString() } })
