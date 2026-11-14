@@ -1,8 +1,31 @@
 # dsh-superagent-linear
 
-A Linear Source for [dsh-superagent](https://github.com/lkshrk/dsh-superagent). A Linear agent app's sessions on the listed teams become Triggers: a person delegates an Issue to the app, or mentions it in a comment, and later prompts in the session follow. dsh-superagent's replies go back into the session as agent activities.
+A Linear Source for [dsh-superagent](https://github.com/lkshrk/dsh-superagent).
 
-It is a separate package that registers its Source kind through dsh-superagent's `orchestrator` service, as other community Sources do. A Source kind is a single registration per dsh-superagent; install it once.
+A Linear agent app's sessions on the configured teams become dsh-superagent Triggers. A person delegates an Issue to the app, or mentions the app in a comment, and a session starts. Later prompts in the same session follow. dsh-superagent's replies go back into the session as agent activities.
+
+The Source also:
+
+- puts the Issue's parent and sub-issues on top of the Trigger text;
+- works through an Issue's sub-issues, one session each, in the order their `blocks` relations allow (chain mode);
+- asks for a plan when an Issue labelled `epic` has no sub-issues yet (split mode);
+- links pull requests into the session and completes the Issue once the ticket's own pull request merged;
+- stops a ticket when the app is removed as the Issue's delegate.
+
+More detail:
+
+- [Architecture](docs/architecture.md): components, the polling round, stored state.
+- [Configuration](docs/configuration.md): every key, team and project matching, the Policy, the execution environment.
+- [Linear integration](docs/linear-integration.md): the Linear app, GraphQL operations, webhook, rate limits.
+
+## Requirements
+
+- dsh `^0.2.1-alpha.2 || ^0.2.2-0` with the dsh-superagent plugin. The Source registers through dsh-superagent's `orchestrator` service.
+- Node.js `^22.19.0 || >=24.0.0`.
+- A Linear OAuth app that uses the client credentials grant and acts as an app user. See [The Linear app](docs/linear-integration.md#the-linear-app).
+- dsh-superagent's GitHub Source, configured with every repository the Linear teams work in.
+
+A Source kind is registered once per dsh-superagent. Install the package once.
 
 ## Install
 
@@ -10,83 +33,200 @@ It is a separate package that registers its Source kind through dsh-superagent's
 dsh plugin --profile <profile> add "github:lkshrk/dsh-superagent-linear#<commit>"
 ```
 
-pnpm builds a Git install through the `prepare` script and blocks it until allowed: add the key pnpm prints, `dsh-superagent-linear@https://codeload.github.com/lkshrk/dsh-superagent-linear/tar.gz/<commit>: true`, under `allowBuilds` in the profile's `pnpm-workspace.yaml`, then run the command again.
+pnpm builds a Git install through the `prepare` script and blocks it until you allow it. Add the key pnpm prints under `allowBuilds` in the profile's `pnpm-workspace.yaml`, then run the command again:
 
-The bundle inserts the plugin disabled. Enable it in the profile's `cordis.patch.yml`:
+```yaml
+allowBuilds:
+  dsh-superagent-linear@https://codeload.github.com/lkshrk/dsh-superagent-linear/tar.gz/<commit>: true
+```
+
+The package's bundle layer (`cordis.patch.yml`) inserts the plugin disabled. Enable it in the profile's `cordis.patch.yml`:
 
 ```yaml
 - id: dsh-superagent-linear
   disabled: false
 ```
 
-## Linear app
+## Configure
 
-Use a Linear OAuth app with the client credentials grant, acting as an app user. Each token request asks for exactly `read,write,app:assignable,app:mentionable`. Linear revokes an app's existing client-credential tokens when a request names another scope, so other services that use the same app must request the same string. Tokens last 30 days; the Source keeps one in memory and requests a new one when Linear refuses it.
-
-Linear keeps at most 1,000 tokens per app and evicts the least recently used, so the Source requests at most one token per 15 minutes: a token Linear refuses right after it was issued makes the Source's health an error until the window passes, instead of requesting new tokens that could evict another service's.
-
-The client id and secret are read from files, such as a mounted Kubernetes Secret, on every token request. They are never put in environment variables, Trigger text or worker sandboxes. The file paths are account fields: dsh-superagent from c8f41c3 refuses a main-Session tool's change to them; only the panel and the plugin configuration may set them.
-
-## Configuration
-
-Set these on the Linear Source in the panel, or in the plugin configuration's `managed.sources.linear.config`:
-
-| Key | Meaning |
-| --- | --- |
-| `clientIdFile`, `clientSecretFile` | Absolute paths of the files holding the app's client id and secret |
-| `teams` | `[{ key or id, repository, projects, enabled }]`: the teams whose sessions are received, each by its key (such as `ENG`) or id. An entry with an id matches that team only, with its key as its name; a key alone matches whichever team holds it; `enabled` defaults to on. Each team is one row of the Source's admission table. A team Linear does not know is left out, and the Source's health says so |
-| `teams[].repository` | The repository the team's Issues work in, unless their project names another: the GitHub Source's `repository` or one of its `repositories`, compared ignoring case. Optional when `projects` is set |
-| `teams[].projects` | `[{ id or name, repository }]`: a repository per Linear project of the team. Prefer project ids: an entry with an id matches that project only and survives a rename. An entry with only a name matches a project of that name, ignoring case, and stops matching once the project is renamed. An Issue in a listed project works in the project's repository, any other Issue in the team's. Not shown in the panel; editing the team there keeps them |
-
-A team needs a `repository`, `projects`, or both. A team or project whose repository the GitHub Source does not list is left out, and the Source's health names it (`ENG/Mobile` for a project).
+Set the Source in the dsh-superagent panel, or in dsh-superagent's plugin configuration under `managed`:
 
 ```yaml
-teams:
-  - key: ENG
-    repository: acme/web          # Issues without a listed project
-    projects:
-      - id: 6a1d3f0e-9c2b-4e57-8f13-2b0c7d9e4a61
-        repository: acme/api
-      - name: Mobile
-        repository: acme/mobile
+managed:
+  sources:
+    linear:
+      config:
+        clientIdFile: /var/run/secrets/linear-app/client-id
+        clientSecretFile: /var/run/secrets/linear-app/client-secret
+        webhookSecretFile: /var/run/secrets/linear-app/webhook-secret
+        teams:
+          - key: ENG
+            repository: acme/web
+            projects:
+              - id: 6a1d3f0e-9c2b-4e57-8f13-2b0c7d9e4a61
+                repository: acme/api
+  policy:
+    sources:
+      linear:
+        allowed:
+          - id: <Linear user id>
+            name: Alice
 ```
 
-| `pollSeconds` | Polling interval, default 10; see Rate limits |
-| `webhookSecretFile` | Absolute path of the file holding the app webhook's signing secret; empty polls only. See Webhook |
-| `completeOnMerge` | Move the Issue to its team's first completed state once the ticket's own pull request merged, unless it is completed already; default on |
-| `chainParallel` | How many sub-issues of epics are worked on at once, across all epics; 1 to 8, default 2. See Sub-issues |
+| Key | Type | Default | Effect |
+| --- | --- | --- | --- |
+| `clientIdFile` | absolute path | `''` | File with the app's client id. Required. |
+| `clientSecretFile` | absolute path | `''` | File with the app's client secret. Required. |
+| `webhookSecretFile` | absolute path | `''` | File with the webhook signing secret. Empty means polling only. |
+| `teams` | list | `[]` | Teams whose sessions are taken in, each with a repository, projects, or both. At least one enabled team is required. |
+| `pollSeconds` | integer, 5–600 | `10` | Seconds between polling rounds. |
+| `completeOnMerge` | boolean | `true` | Complete the Issue once the ticket's own pull request merged. |
+| `chainParallel` | integer, 1–8 | `2` | Sub-issues worked on at once, across all chains. |
 
-In the Policy, list the Linear user ids who may originate work under **Eval → On each Source → Linear**. A listed person's session is an explicit request; anyone else's is ignored with the default admission table. The app's own sessions and activities never become Triggers, and comments that do not address the app are not read.
+[Configuration](docs/configuration.md) explains each key in full.
 
-## Behaviour
+Only people in the Policy's `allowed` list originate work. With the default admission table, a session from anyone else is ignored.
 
-- **Intake.** Each round reads the sessions created since its cursor, then the prompt activities people wrote since its cursor, oldest first. A cursor moves only once every item it passes was taken in, and Trigger ids (`linear:session:<id>`, `linear:prompt:<id>`) make a replay harmless. The first round after the Source is switched on starts from that moment.
-- **Answering at once.** Linear expects an agent to answer a session within about 10 seconds, so a new session on a listed team gets an ephemeral thought, "Received.", when the Source first sees it. The Source cannot read the Policy, so this also answers a session that a person off the allowed list started; nothing else follows for them.
-- **Order.** Linear's `agentSessions` takes no filter, so each round reads pages of 25 until one reaches the cursor (newest first, Linear's default) or, for pages that come oldest first, to the end, at most 250 sessions. Prompts are filtered by time. A cursor never moves back, and a round with nothing new leaves it where it is.
-- **Repositories.** An Issue's repository is its project's when the team lists that project, else the team's. Sessions and prompts are read with the Issue's project, so this costs no extra request. A Trigger whose repository is one of the GitHub Source's additional `repositories` carries `meta.repository`, that repository's name as the deployment lists it, so its ticket works there. Triggers on the primary `repository` carry none and are the same as before. Only a new session is routed by the Issue's current team and project. A prompt on an Issue with an open ticket, a stop included, follows that ticket: it carries the ticket's repository and is taken in even when the Issue has since moved to an unmapped project, one on an unlisted repository, or another team. Issues whose repository the GitHub Source does not list are left out, and the Source's health names them. With a dsh-superagent that has no `repositories`, only the primary is served.
-- **No repository.** An Issue of a team without a `repository`, in a project the team does not list, is not taken in. Its session gets one `error` activity saying so, such as "Not taken in: team ENG names no repository for project Design.", and the Source's health lists the Issue under "no repository for".
-- **Threads.** A Linear Issue is one Thread (`linear:issue:<issue id>`); later sessions on the same Issue follow its ticket.
-- **Stop.** A prompt with Linear's stop signal becomes a Trigger whose text starts with "Stop requested in Linear."
-- **Removed delegation.** While a ticket that started on Linear is open, the Source reads its Issue's delegate (`Issue.delegate`) at most every 30 seconds, one query for all open tickets. When an Issue that was delegated to the app no longer is, because someone removed the app or delegated another agent, the ticket gets a stop Trigger with the same "Stop requested in Linear." text and the ticket's repository in `meta.repository` when it is an additional one, attributed to the person in the Issue's history (`fromDelegate`) when a change since the ticket started shows it, and to no one otherwise. An Issue the query does not return, such as an archived or deleted one, or one in a chunk of 50 that failed, is left for the next check. A ticket that started from a mention, without delegation, keeps running unless the Issue is delegated to the app and that is later removed.
-- **Closed Issue.** The same query reads the Issue's state for each ticket that started on Linear, open or ended within the last 14 days, until its Issue is known to be closed. Once the state's type is `completed` or `canceled`, the Source tells dsh-superagent, which archives the ticket's worker Session once the ticket has ended and restores it if a person's message resumes the ticket. With `completeOnMerge`, the Source's own completion of the Issue counts too.
-- **Replies.** An acknowledgement or a notice is a `thought`, a reply a `response`, both in the session. Each activity's id is fixed by the message id, so a retry never posts twice; a session Linear no longer has drops the message.
-- **Pull requests.** When a ticket that started on Linear follows a GitHub pull request, its link is added to the session's external URLs (`agentSessionUpdate`, `addedExternalUrls`), labelled `Pull request #12` in the ticket's repository and `Pull request owner/name#12` in another. Its merge ends the ticket through the GitHub Source as usual.
-- **Execution environment.** `DSH_SUPERAGENT_LINEAR_ISSUE` (such as `ENG-12`) and `DSH_SUPERAGENT_LINEAR_ISSUE_URL`. A PR body with `Fixes ENG-12` lets Linear's GitHub integration close the Issue too.
+The Source stays `paused` until both credential files and at least one enabled team are set.
 
-- **Sub-issues.** Delegating an Issue that has sub-issues to the app starts a chain instead of a ticket for the Issue. Linear opens a new session only on the first delegation and reuses it afterwards, so every 30 seconds the Source also reads, in one query, the Issues delegated to the app that changed since its last check (`issues` filtered by `delegate` and `updatedAt`). Such an Issue is a candidate when it has a chain, or the Source saw a session or ticket on it within the last 14 days, and neither a chain nor a ticket of its own is running for it. For a candidate, the newest change in its history since the last check that delegated it to the app must come from a person (not an app or automation), and it must have open sub-issues; then a run starts (`run` = that history entry's id, so it starts once) from that person, answered in the Issue's known session or, with none known, silently. An Issue the Source never knew starts nothing this way, and the check time moves only once every candidate was handled. A new session on the epic within 2 minutes of such a start joins that run instead of starting another. A delegation made through an OAuth integration or automation (Linear records it with a `botActor`) does not start a chain; write "start" in the session instead. Writing a message such as "start" in the session of an Issue delegated to the app also starts a run when the Issue has open sub-issues and no chain is running. A mention, or a prompt on such an Issue that is not delegated to the app, only gets a thought with the chain's status; a prompt while a chain runs gets its status, and a stop ends it. The Source opens a session of the app's own on each sub-issue whose `blocks` blockers are all completed or canceled, in sub-issue order, while fewer than `chainParallel` run across all epics, and takes it in as a Trigger (`linear:chain:<run>:<sub-issue>`) from the person who delegated the epic, with the parent on top. A sub-issue assigned to a person is left alone, and the chain waits for it. The Source reads the epic at most every 30 seconds, and at once when a sub-issue's ticket ended. Once every sub-issue is completed or canceled, the epic is completed and its session lists them. These stop the chain: a sub-issue whose ticket ended while it is still open, a sub-issue that got no ticket within 30 minutes, a cycle or an open blocker that nothing running can close, removed delegation, more than 30 sub-issues or 20 relations on one, or a stop in the epic's session. Its started sub-issues then get a stop Trigger and the epic's session the reason. A new run skips completed sub-issues and keeps the ones still running. A delegated Issue whose sub-issues cannot be read waits for the next round, for at most 10 minutes; then its session gets an error and nothing starts. Prompts on an epic never become Triggers.
-- **Webhook.** With `webhookSecretFile` set, `POST /hooks/linear` on DSH's Web server takes Linear's deliveries. A delivery whose `Linear-Signature` (HMAC-SHA256 of the body with the secret) and `webhookTimestamp` (within a minute) check out gets 200 and wakes the polling for an immediate round; the payload itself is not taken in, so intake stays the API read above. Other methods get 405, a body over 1 MiB 413, a missing secret 503, a bad signature 401; a signed delivery over a minute old gets 200 without waking, as Linear may retry with the first attempt's timestamp. Rounds woken by deliveries start at least 2 seconds apart. The route needs no sign-in; expose only that path publicly.
+## How it works
 
-**Keep the app's webhook enabled with Agent session events.** Linear creates no agent sessions for an app whose webhook is off, so delegations and mentions silently stop reaching the Source even though polling still runs.
+Each polling round runs these steps in order:
 
-Not implemented: thread context for assessments.
+1. Read new agent sessions since the session cursor.
+2. Read new prompt activities since the prompt cursor.
+3. Link pull requests and complete merged Issues for tickets that started on Linear.
+4. At most every 30 seconds: check re-delegated Issues, then the delegate and state of the Issues of those tickets.
+5. Advance active chains.
 
-## Rate limits
+The first round after the Source is switched on only sets both cursors to now. Older sessions are not work for it.
 
-Linear allows an OAuth app 5,000 requests and 2,000,000 complexity points per hour, per app user, shared by every service that uses the same app. A round costs two queries of about 200 points each, plus a team list every ten minutes and, while tickets that started on Linear are open or their Issue is still open, one Issue query every 30 seconds. The re-delegation check costs about 120 requests an hour when idle: one `DelegatedIssues` query every 30 seconds. A change on a candidate adds a history read, and each run it starts two more reads. At the default 10 seconds that is about 730 requests (15%) and 140,000 points (7%) per hour, and at most 120 requests (2.4%) more while tickets run. A longer interval lowers both and delays the first answer: past about 10 seconds Linear may show a session as unresponsive until the thought arrives. When Linear rate-limits the app, the Source sends nothing until the limit resets.
+A signed webhook delivery ends the wait between rounds early. See [Webhook](#webhook).
 
-Linear recommends webhooks over polling. With the webhook wired up, `pollSeconds` can go up, as each delivery wakes the polling at once.
+### Triggers
 
-A Source package's schema errors come from its own copy of zod; dsh-superagent from c8f41c3 still answers them as validation errors (400) in the panel.
+| Trigger id | Comes from |
+| --- | --- |
+| `linear:session:<session id>` | A person's new session: a delegation or a mention. |
+| `linear:prompt:<activity id>` | A person's prompt in a session. |
+| `linear:undelegated:<history id>` | The app was removed as the delegate of an Issue with an open ticket. |
+| `linear:chain:<run>:<sub-issue id>` | A chain started a sub-issue. |
+| `linear:chain-stop:<run>:<sub-issue id>` | A chain stopped while the sub-issue was started. |
+
+The Thread is the Issue (`linear:issue:<issue id>`). The Channel is the session. Fixed ids make a replay after a failure harmless.
+
+The app's own sessions and activities never become Triggers.
+
+### Replies
+
+A new session on a served team gets an ephemeral thought, "Received.", in the same round. Linear expects an agent to answer within seconds, and an evaluation takes longer.
+
+dsh-superagent's messages go back as activities in the session:
+
+| Message kind | Activity type |
+| --- | --- |
+| `acknowledgement` | `thought` |
+| `notice` | `thought` |
+| `reply` | `response` |
+
+Each activity id derives from the message id, so a retry never posts twice. A message to a session Linear no longer has is dropped.
+
+### Repositories
+
+An Issue works in its project's repository when the team lists that project, else in the team's repository. The repository must be one the GitHub Source serves.
+
+- A team or project on a repository the GitHub Source does not list is skipped. Health names it.
+- An Issue with no repository at all is not taken in. Its session gets one `error` activity, such as "Not taken in: team ENG names no repository for project Design."
+- A prompt on an Issue with an open ticket follows that ticket's repository, even after the Issue moved to another project or team.
+
+### Stop and undelegation
+
+A prompt with Linear's `stop` signal becomes a Trigger whose text starts with "Stop requested in Linear."
+
+While a ticket that started on Linear is open, the Source checks its Issue's delegate at most every 30 seconds. When an Issue that was delegated to the app no longer is, the ticket gets a stop Trigger. A ticket that started from a mention keeps running, unless the Issue is later delegated to the app and that delegation is removed.
+
+### Pull requests and closed Issues
+
+- Each pull request a ticket follows is added to the session's external links, labelled `Pull request #12` in the ticket's repository and `Pull request owner/name#12` in another.
+- With `completeOnMerge`, the Issue moves to its team's first completed state once the ticket's own pull request merged.
+- When an Issue moves to a completed or canceled state, the Source reports it to dsh-superagent. This covers open tickets and tickets that ended within the last 14 days.
+
+## Epics
+
+The Source treats an Issue with sub-issues as an epic. The `epic` label matters for split mode and for answering prompts.
+
+### Split mode
+
+A new session on an Issue labelled `epic` (any case) that has no sub-issues gets this first line:
+
+```text
+Mode: split (plan this epic into sub-issues; no code)
+```
+
+The worker sees `DSH_SUPERAGENT_LINEAR_MODE=split`. The Source does not create sub-issues itself.
+
+### Chain mode
+
+A person delegates an Issue with sub-issues to the app. The Issue never gets a worker of its own. A chain starts instead:
+
+1. The epic's session gets a plan listing the sub-issues.
+2. The Source opens an app session on each ready sub-issue and takes it in as a chain Trigger from the person who delegated the epic. A sub-issue is ready when each of its `blocks` blockers is completed or canceled.
+3. Ready sub-issues start in sub-issue order, while fewer than `chainParallel` run across all chains.
+4. A sub-issue assigned to a person is left alone. The chain waits for it.
+5. Once every sub-issue is completed or canceled, the Source completes the epic and lists the sub-issues and their pull requests in its session.
+
+Other ways to start a chain:
+
+- Write a message such as "start" in the session of a delegated epic that has open sub-issues and no running chain.
+- Delegate an epic the Source already knows to the app again. Linear reuses the old session, so the Source finds the re-delegation in the Issue's history. A delegation made by an automation or integration does not start a chain; write "start" instead.
+
+A mention of an epic, or a prompt while a chain runs, gets a thought with the chain's status. A stop in the epic's session ends the chain.
+
+A chain stops when:
+
+- a sub-issue's ticket ended while the sub-issue is still open;
+- a sub-issue got no ticket within 30 minutes;
+- nothing running can unblock the rest, such as a cycle or a blocker outside the epic;
+- the epic is no longer delegated to the app, or was completed or canceled;
+- the epic has more than 30 sub-issues, or a sub-issue more than 20 relations;
+- a sub-issue works in no repository the deployment serves, or the admission table filters it;
+- a person sends a stop in the epic's session.
+
+Started sub-issues then get a stop Trigger, and the epic's session gets the reason. A new run skips completed sub-issues and keeps the ones still running.
+
+## Webhook
+
+With `webhookSecretFile` set, `POST /hooks/linear` on DSH's web server takes Linear's deliveries. A valid delivery only wakes the polling loop for an immediate round. Intake still reads the Linear API.
+
+The plugin checks each delivery's `Linear-Signature` and does no other authentication. Expose only that path publicly. See [Webhook](docs/linear-integration.md#webhook).
+
+Keep the app's webhook enabled with agent session events. Linear creates no agent sessions for an app whose webhook is off, so delegations and mentions stop arriving even though polling still runs.
+
+## Troubleshooting
+
+The Source reports one health entry, `linear`. Its detail lists the round's counts and problems.
+
+| Health detail | Meaning |
+| --- | --- |
+| `Waiting for the deployment check` | dsh-superagent's deployment is not configured. The polling loop exits. |
+| `Off` | The Source is switched off. |
+| `Set the app credential files and a team` | A credential file path is empty, or no team is enabled. |
+| `teams … skipped: their repository is not one the GitHub Source serves` | Add the repository to the GitHub Source, or fix the team or project. Health is `error`. |
+| `teams … not found in Linear` | The team key or id is wrong, or the app cannot see the team. Health is `error`. |
+| `teams unverified` | The team list could not be read. Intake goes on. |
+| `left out …` | These Issues' repository is not one the GitHub Source serves. |
+| `no repository for …` | Map the Issue's project, or give the team a `repository`. |
+| `parent and sub-issues unreadable: n` | Context reads failed. Sessions were taken in without context. |
+| `sub-issue chains not advanced: n` | A chain or re-delegation read failed. It retries next round. |
+| `n failed polls in a row` | Three rounds failed in a row, or a refused token or rate limit blocks every request. Health is `error`. |
+
+Common causes:
+
+- **No sessions arrive.** Check that the app's webhook is enabled with agent session events, and that the person is in the Policy's `allowed` list.
+- **"Linear refused the token minted n min ago".** Linear rejected a fresh token. The Source waits up to 15 minutes before it asks for another, so it does not evict other services' tokens. Check the credentials and the scope other services request with the same app.
+- **"The Linear app credential files are not readable".** Check the paths and file permissions.
+- **"Linear's rate limit holds requests until …".** The app hit Linear's rate limit. Requests resume after the reset. Raise `pollSeconds`, or configure the webhook and then raise it.
+- **A delegated epic does nothing.** When its sub-issues cannot be read, the session waits up to 10 minutes, then gets an error. Write "start" in the session to retry.
 
 ## Development
 
@@ -95,4 +235,15 @@ pnpm install
 pnpm check
 ```
 
-Tests stub `fetch`; they never call Linear.
+| Script | Runs |
+| --- | --- |
+| `pnpm build` | `tsdown`: bundles `src/index.ts` into `lib/` as ESM with type declarations. |
+| `pnpm typecheck` | `tsc --noEmit` |
+| `pnpm test` | `vitest run` over `tests/**/*.spec.ts` |
+| `pnpm check` | Typecheck, test and build, in that order. |
+
+Tests stub `fetch`. They never call Linear.
+
+## License
+
+MIT
