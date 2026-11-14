@@ -11,9 +11,9 @@ pre-commit:
       run: 'command -v jq >/dev/null || { echo "jq not installed, skipping JSON check"; exit 0; }; for f in {staged_files}; do jq empty "$f" || { echo "$f is not valid JSON"; exit 1; }; done'
     yaml:
       glob: "*.{yaml,yml}"
-      run: 'for f in {staged_files}; do yq "." "$f" >/dev/null || { echo "$f is not valid YAML"; exit 1; }; done'
+      run: 'command -v yq >/dev/null || { echo "yq not installed, skipping YAML check"; exit 0; }; for f in {staged_files}; do yq "." "$f" >/dev/null || { echo "$f is not valid YAML"; exit 1; }; done'
     typecheck:
-      glob: "{*.ts,tsconfig*.json}"
+      glob: "{*.{ts,tsx},tsconfig*.json}"
       run: 'pnpm typecheck || { echo "fix the type errors above (pnpm typecheck)"; exit 1; }'
 
 pre-push:

@@ -56,8 +56,7 @@ jobs:
       - name: Pack
         id: pack
         run: |
-          tgz=$(node -p "const p = require('./package.json'); p.name + '-' + p.version + '.tgz'")
-          pnpm pack
+          tgz=$(pnpm pack | tail -n 1)
           node .github/check-pack.mjs "$tgz"
           echo "tgz=$tgz" >> "$GITHUB_OUTPUT"
 
