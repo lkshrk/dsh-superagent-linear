@@ -246,4 +246,4 @@ Tests stub `fetch`. They never call Linear.
 
 ## License
 
-MIT
+MIT. See [LICENSE](LICENSE).
