@@ -1,0 +1,3 @@
+FROM scratch
+ARG TARBALL
+COPY ${TARBALL} /

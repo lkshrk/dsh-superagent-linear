@@ -283,6 +283,7 @@ pnpm check
 Tests stub `fetch`. They never call Linear.
 
 Pushing a tag `vX.Y.Z` equal to `v` plus the `version` in `package.json` runs `pnpm check` and attaches `dsh-superagent-linear-X.Y.Z.tgz` to the GitHub release for that tag.
+It also pushes `ghcr.io/lkshrk/dsh-superagent-linear:X.Y.Z`, a `scratch` image for linux/amd64 and linux/arm64 that holds only that tarball at `/`, for mounting as a Kubernetes image volume; the release notes give its digest.
 
 ## License
 
