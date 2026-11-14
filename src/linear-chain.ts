@@ -45,6 +45,8 @@ function addOwnSession(ctx: SourceContext, id: string): void {
   const kept = Object.entries(ctx.state.get<Record<string, string>>(CHAIN_KEYS.sessions) ?? {}).filter(([, at]) => now - Date.parse(at) < CLOSE_HORIZON_MS)
   ctx.state.set(CHAIN_KEYS.sessions, Object.fromEntries([...kept, [id, new Date(now).toISOString()]]))
 }
+/** Whether `actor` may start or stop a chain: the host's policy admits it; nobody may on a host without `admits`. */
+export const mayControl = (ctx: SourceContext, actor: string | undefined) => !!actor && ctx.admits?.({ id: actor, human: true }) === true
 const ignoreGone = (error: unknown) => { if (!(error instanceof LinearError && error.gone)) throw error }
 /** Posts to a session once per id; a run started without a known session posts nothing. */
 async function tell(client: LinearClient, session: string, id: string, content: ActivityContent, signal: AbortSignal): Promise<void> {
@@ -109,7 +111,8 @@ export async function epicPrompt(ctx: SourceContext, client: LinearClient, promp
   const stop = trigger.meta.signal === 'stop'
   const identifier = String(trigger.meta.identifier)
   let context: IssueContext | undefined
-  if (!stop && isStart(prompt) && record?.status !== 'running' && trigger.meta.delegate === viewer) {
+  const allowed = mayControl(ctx, prompt.user?.id)
+  if (!stop && allowed && isStart(prompt) && record?.status !== 'running' && trigger.meta.delegate === viewer) {
     try {
       context = await client.issueContext(epic, signal)
     } catch (error) {
@@ -131,7 +134,7 @@ export async function epicPrompt(ctx: SourceContext, client: LinearClient, promp
   const labels = Array.isArray(trigger.meta.labels) ? trigger.meta.labels : []
   if (!record && !labels.some(label => String(label).toLowerCase() === 'epic')
     && !(context ? context.children.nodes.length > 0 : await client.hasChildren(epic, signal))) return false
-  if (record?.status === 'running' && stop) {
+  if (record?.status === 'running' && stop && allowed) {
     await stopChain(ctx, client, epic, record, 'stop requested in Linear', { id: trigger.actor.id }, signal)
   } else {
     await client.activity(String(trigger.meta.session), stableUuid(`epic-prompt:${String(trigger.meta.activity)}`),
@@ -425,7 +428,7 @@ export async function followDelegations(ctx: SourceContext, client: LinearClient
 }
 async function redelegated(ctx: SourceContext, client: LinearClient, issue: string, viewer: string, since: string, parallel: number, signal: AbortSignal): Promise<void> {
   const change = await client.delegation(issue, viewer, since, signal)
-  if (!change?.person || ctx.state.get(CHAIN_KEYS.run(change.id))) return
+  if (!change?.person || ctx.state.get(CHAIN_KEYS.run(change.id)) || !mayControl(ctx, change.person.id)) return
   const context = await client.issueContext(issue, signal)
   if (!context.children.nodes.some(child => !closed(child.state))) return
   const details = await client.issue(issue, signal)

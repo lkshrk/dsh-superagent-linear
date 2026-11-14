@@ -73,6 +73,7 @@ function context(fields: { tickets?: Ticket[]; triggers?: Trigger[]; threads?: R
   const ctx: SourceContext = {
     deployment: { repository: 'acme/widgets', ...fields.repositories ? { repositories: fields.repositories } : {} }, ready: Promise.resolve(), configured: () => true,
     config: <C>() => config() as unknown as C, receive,
+    admits: vi.fn((actor: { id: string; human: boolean }) => actor.human && actor.id === OWNER),
     state: { get: <V>(key: string) => state.get(key) as V | undefined, set: (key, value) => { if (value === undefined) state.delete(key); else state.set(key, value) },
       keys: prefix => [...state.keys()].filter(key => key.startsWith(prefix)) },
     threads: { get: key => fields.threads?.[key] ? { meta: fields.threads[key]! } : undefined, describe: vi.fn() },
@@ -1757,6 +1758,71 @@ describe('chain', () => {
     expect(w.startedKids()).toEqual(['WEB-3'])
     w.close(3); await w.round()
     expect(w.record()).toMatchObject({ status: 'stopped', reason: 'stalled: WEB-2 waits for an issue the app cannot read' })
+  })
+
+  it('lets only a user the policy allows stop a chain; anyone else gets the status and the chain runs on', async () => {
+    const w = world()
+    w.epic(); w.kid(2); w.kid(3)
+    w.delegate('es1')
+    await w.round()
+    w.prompt('p1', 'epic-1', { signal: 'stop', content: { body: '' }, user: { id: 'stranger', name: 'Stranger' } })
+    await w.round()
+    expect(w.record()).toMatchObject({ status: 'running' })
+    expect(w.received.filter(trigger => trigger.meta.kind === 'chain-stop')).toEqual([])
+    expect(w.activities.at(-1)).toEqual({ session: 'es1', type: 'thought', body: 'Working on WEB-2, WEB-3 of WEB-10. A stop in this session ends the chain.' })
+    w.prompt('p2', 'epic-1', { signal: 'stop', content: { body: '' } })
+    await w.round()
+    expect(w.record()).toMatchObject({ status: 'stopped', reason: 'stop requested in Linear' })
+    expect(vi.mocked(w.ctx.admits!).mock.calls).toContainEqual([{ id: 'stranger', human: true }])
+  })
+
+  it('lets only a user the policy allows start a chain by delegation, re-delegation or a start prompt', async () => {
+    const delegated = world()
+    delegated.epic(); delegated.kid(2)
+    delegated.delegate('es1', 'epic-1', { id: 'stranger', name: 'Stranger' })
+    await delegated.round()
+    expect(delegated.record()).toBeUndefined()
+    expect(delegated.received).toEqual([])
+    expect(delegated.activities.at(-1)!.body).toMatch(/^Not working on WEB-10\./)
+    const prompted = world()
+    prompted.epic(); prompted.kid(2)
+    prompted.prompt('p1', 'epic-1', { content: { body: 'start' }, user: { id: 'stranger', name: 'Stranger' } })
+    await prompted.round()
+    expect(prompted.record()).toBeUndefined()
+    expect(prompted.activities.at(-1)!.body).toMatch(/^Not working on WEB-10\./)
+    const redelegated = world()
+    redelegated.epic().delegate = null; redelegated.kid(2)
+    redelegated.state.set(CHAIN_KEYS.watched, { 'epic-1': { session: 'es1', at: new Date().toISOString() } })
+    redelegated.redelegate('h1', { id: 'stranger', name: 'Stranger', app: false })
+    await redelegated.round()
+    expect(redelegated.record()).toBeUndefined()
+  })
+
+  it('lets nobody start or stop a chain on a host without the policy accessor, and says so in health', async () => {
+    const w = world()
+    w.epic(); w.kid(2); w.kid(3)
+    delete w.ctx.admits
+    w.delegate('es1')
+    const round = await w.round()
+    expect(round.noPolicyAccessor).toBe(true)
+    expect(w.record()).toBeUndefined()
+    expect(w.activities.at(-1)!.body).toMatch(/^Not working on WEB-10\./)
+    const running = world()
+    running.epic(); running.kid(2); running.kid(3)
+    running.delegate('es1')
+    await running.round()
+    delete running.ctx.admits
+    running.prompt('p1', 'epic-1', { signal: 'stop', content: { body: '' } })
+    await running.round()
+    expect(running.record()).toMatchObject({ status: 'running' })
+    const stub = linear({ agentSessions: () => ({ agentSessions: page([]) }), agentActivities: () => ({ agentActivities: page([]) }) })
+    const h = context()
+    delete h.ctx.admits
+    h.state.set(KEYS.sessions, T0); h.state.set(KEYS.prompts, T0)
+    const controller = new AbortController()
+    vi.mocked(h.ctx.report).mockImplementation(() => { controller.abort() })
+    await watchLinear(h.ctx, stub.client, controller.signal)
+    expect(vi.mocked(h.ctx.report).mock.calls.at(-1)![1].detail).toContain('; nobody can start or stop a sub-issue chain: this dsh-superagent version cannot check the Linear policy')
   })
 
   it('holds a delegated session whose sub-issues could not be read, and starts the chain once they can be', async () => {

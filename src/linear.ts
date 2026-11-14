@@ -3,7 +3,7 @@ import { z } from 'zod'
 import { LinearClient, LinearError, READ_PAGES, stableUuid, type ActivityContent, type IssueContext, type IssueStatus, type Prompt, type Read, type Session, type Undelegation } from './linear-api.ts'
 import type { OutboundMessage, SourceContext, SourceKind, Trigger } from './types.ts'
 import { Waker } from './webhook.ts'
-import { CHAIN_KEYS, advanceChains, epicMention, epicPrompt, followDelegations, holdUnreadable, ownSession, releaseHold, startChain, unreadableText, watch } from './linear-chain.ts'
+import { CHAIN_KEYS, advanceChains, epicMention, epicPrompt, followDelegations, holdUnreadable, mayControl, ownSession, releaseHold, startChain, unreadableText, watch } from './linear-chain.ts'
 
 export const SOURCE = 'linear'
 export const HEALTH = 'linear'
@@ -242,7 +242,7 @@ export function linearKind(client: LinearClient): SourceKind<LinearConfig> {
   }
 }
 
-export interface Round { sessions: number; prompts: number; unreadable: number; skipped: string[]; unknown: string[]; misrouted: string[]; unmapped: string[]; unverified: boolean; contextFailed: number; chainFailed: number; followFailed: number }
+export interface Round { sessions: number; prompts: number; unreadable: number; skipped: string[]; unknown: string[]; misrouted: string[]; unmapped: string[]; unverified: boolean; contextFailed: number; chainFailed: number; followFailed: number; noPolicyAccessor: boolean }
 
 export type Route = { kind: 'unlisted' } | { kind: 'unmapped' } | { kind: 'misrouted'; repository: string } | { kind: 'served'; repository: string }
 // A listed team's Issue without a repository, or whose repository the GitHub Source does not serve, is left out; an unlisted team's goes to
@@ -281,7 +281,7 @@ export async function pollLinear(ctx: SourceContext, client: LinearClient, confi
   }
   const viewer = await client.viewer(signal)
   const now = new Date().toISOString()
-  const round: Round = { sessions: 0, prompts: 0, unreadable: 0, skipped, unknown, misrouted: [], unmapped: [], unverified: !known, contextFailed: 0, chainFailed: 0, followFailed: 0 }
+  const round: Round = { sessions: 0, prompts: 0, unreadable: 0, skipped, unknown, misrouted: [], unmapped: [], unverified: !known, contextFailed: 0, chainFailed: 0, followFailed: 0, noPolicyAccessor: !ctx.admits }
   const sessionsSince = ctx.state.get<string>(KEYS.sessions)
   const promptsSince = ctx.state.get<string>(KEYS.prompts)
   // A first round starts from now: sessions from before the Source was switched on are not work for it.
@@ -324,7 +324,7 @@ export async function pollLinear(ctx: SourceContext, client: LinearClient, confi
       if (context) releaseHold(ctx, session.id)
       // An Issue with sub-issues is worked through them; it never gets a worker of its own.
       if (context?.children.nodes.length) {
-        if (found.human && session.issue?.delegate?.id === viewer && !session.comment) {
+        if (found.human && session.issue?.delegate?.id === viewer && !session.comment && mayControl(ctx, found.actor.id)) {
           await startChain(ctx, client, session, context, viewer, config.chainParallel, signal)
           round.sessions++
         } else if (found.human) await epicMention(ctx, client, session, signal)
@@ -595,9 +595,10 @@ export async function watchLinear(ctx: SourceContext, client: LinearClient, sign
         const unmapped = round.unmapped.length ? `; no repository for ${list(round.unmapped)}: map their project or give the team a repository` : ''
         const contextFailed = round.contextFailed ? `; parent and sub-issues unreadable: ${round.contextFailed}` : ''
         const chainFailed = round.chainFailed ? `; sub-issue chains not advanced: ${round.chainFailed}` : ''
+        const policy = round.noPolicyAccessor ? '; nobody can start or stop a sub-issue chain: this dsh-superagent version cannot check the Linear policy' : ''
         const followFailed = round.followFailed ? `; pull request links or Issue completions failing: ${round.followFailed}` : ''
         report({ state: round.skipped.length || round.unknown.length ? 'error' : 'ready', at,
-          detail: `${round.sessions} sessions, ${round.prompts} prompts, ${round.unreadable} unreadable${contextFailed}${chainFailed}${followFailed}${skipped}${misrouted}${unmapped}${unknown}` })
+          detail: `${round.sessions} sessions, ${round.prompts} prompts, ${round.unreadable} unreadable${contextFailed}${chainFailed}${followFailed}${policy}${skipped}${misrouted}${unmapped}${unknown}` })
       } catch (error) {
         failures++
         // A refused token or a rate limit needs no three rounds to show: no request can succeed until it passes.
