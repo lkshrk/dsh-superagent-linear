@@ -61,6 +61,7 @@ const PROMPTS = `query($since: DateTimeOrDuration!, $after: String) {
 const VIEWER = 'query { viewer { id } }'
 const TEAMS = 'query($after: String) { teams(first: 100, after: $after) { nodes { id key } pageInfo { hasNextPage endCursor } } }'
 const TEAMS_TTL_MS = 10 * 60_000
+export const READ_PAGES = 10
 const ACTIVITY = 'query($id: String!) { agentActivity(id: $id) { id } }'
 const CREATE_ACTIVITY = `mutation($input: AgentActivityCreateInput!) { agentActivityCreate(input: $input) { success } }`
 const ADD_URLS = `mutation($id: String!, $input: AgentSessionUpdateInput!) { agentSessionUpdate(id: $id, input: $input) { success } }`
@@ -101,6 +102,8 @@ export type Issue = z.infer<typeof Issue>
 export interface IssueStatus { delegate: string | null; closedAt?: string }
 export interface Undelegation { id: string; at: string; actor?: { id: string; name?: string | null } }
 export interface Delegation { id: string; at: string; person?: { id: string; name?: string | null } }
+/** Items read after a time, oldest first; `next` is set when older items after that time are still unread. */
+export interface Read<T> { items: T[]; unreadable: number; next?: string }
 export interface ActivityContent { type: 'thought' | 'response' | 'error'; body: string }
 
 export class LinearClient {
@@ -196,23 +199,23 @@ export class LinearClient {
     this.teamList = { items, until: Date.now() + TEAMS_TTL_MS }
     return items
   }
-  /** Sessions created after `since`, oldest first, with the number of nodes that did not parse. */
-  async sessions(since: string, signal?: AbortSignal): Promise<{ items: Session[]; unreadable: number }> {
-    return await this.collect(SESSIONS, {}, 'agentSessions', SessionSchema, since, signal)
+  /** Sessions created after `since`, oldest first, with the number of nodes that did not parse; `after` continues an earlier read. */
+  async sessions(since: string, signal?: AbortSignal, after?: string): Promise<Read<Session>> {
+    return await this.collect(SESSIONS, {}, 'agentSessions', SessionSchema, since, signal, after)
   }
   /** Prompts people wrote into sessions after `since`, oldest first. */
-  async prompts(since: string, signal?: AbortSignal): Promise<{ items: Prompt[]; unreadable: number }> {
-    return await this.collect(PROMPTS, { since }, 'agentActivities', PromptSchema, since, signal)
+  async prompts(since: string, signal?: AbortSignal, after?: string): Promise<Read<Prompt>> {
+    return await this.collect(PROMPTS, { since }, 'agentActivities', PromptSchema, since, signal, after)
   }
   /**
    * Reads pages newest first, as Linear sorts by default, until one reaches `since` or none follows; a page that comes oldest
    * first is read to its end instead, so either direction finds every item after `since`.
    */
   private async collect<S extends z.ZodType<{ createdAt: string }>>(query: string, variables: Record<string, unknown>, field: string, schema: S,
-    since: string, signal?: AbortSignal): Promise<{ items: z.infer<S>[]; unreadable: number }> {
+    since: string, signal?: AbortSignal, from?: string): Promise<Read<z.infer<S>>> {
     const items: z.infer<S>[] = []
-    let unreadable = 0, after: string | undefined
-    for (let pages = 0; pages < 10; pages++) {
+    let unreadable = 0, after = from, next: string | undefined
+    for (let pages = 0; pages < READ_PAGES; pages++) {
       const page = Page.parse((await this.request<Record<string, unknown>>(query, { ...variables, after }, signal))[field])
       let reached = false
       const dates = page.nodes.map(node => Date.parse(String((node as { createdAt?: unknown }).createdAt ?? '')))
@@ -225,8 +228,9 @@ export class LinearClient {
       }
       if (reached || !page.pageInfo.hasNextPage || !page.pageInfo.endCursor) break
       after = page.pageInfo.endCursor
+      if (pages === READ_PAGES - 1 && !ascending) next = after
     }
-    return { items: items.sort((a, b) => Date.parse(a.createdAt) - Date.parse(b.createdAt)), unreadable }
+    return { items: items.sort((a, b) => Date.parse(a.createdAt) - Date.parse(b.createdAt)), unreadable, ...next ? { next } : {} }
   }
   /** Publishes an activity once per `id`: a create that failed after Linear stored it is found again by its id. */
   async activity(session: string, id: string, content: ActivityContent, ephemeral = false, signal?: AbortSignal): Promise<void> {

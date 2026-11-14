@@ -5,8 +5,9 @@ import { join } from 'node:path'
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import type { z } from 'zod'
 import { LinearClient, MINT_INTERVAL_MS, SCOPE, stableUuid, type IssueContext, type Prompt, type Session } from '../src/linear-api.ts'
-import { CLOSE_HORIZON_MS, DELEGATION_INTERVAL_MS, KEYS, PARENT_DESCRIPTION_LIMIT, LinearConfigSchema, pullOf, undelegationTrigger, linearKind, pollLinear, promptTrigger, sendLinear, sessionTrigger, SPLIT_LINE, watchLinear, withContext, withMode, type LinearConfig } from '../src/linear.ts'
+import { CLOSE_HORIZON_MS, DELEGATION_INTERVAL_MS, FOLLOW_RETRY_MS, KEYS, PARENT_DESCRIPTION_LIMIT, LinearConfigSchema, pullOf, undelegationTrigger, linearKind, pollLinear, promptTrigger, sendLinear, sessionTrigger, SPLIT_LINE, watchLinear, withContext, withMode, type LinearConfig } from '../src/linear.ts'
 import { apply } from '../src/index.ts'
+import type { Waker } from '../src/webhook.ts'
 import { ADOPT_MS, CHAIN_KEYS, HOLD_MS, type ChainRecord } from '../src/linear-chain.ts'
 import type { OutboundMessage, SourceContext, Ticket, Trigger } from '../src/types.ts'
 
@@ -72,7 +73,8 @@ function context(fields: { tickets?: Ticket[]; triggers?: Trigger[]; threads?: R
   const ctx: SourceContext = {
     deployment: { repository: 'acme/widgets', ...fields.repositories ? { repositories: fields.repositories } : {} }, ready: Promise.resolve(), configured: () => true,
     config: <C>() => config() as unknown as C, receive,
-    state: { get: <V>(key: string) => state.get(key) as V | undefined, set: (key, value) => { if (value === undefined) state.delete(key); else state.set(key, value) } },
+    state: { get: <V>(key: string) => state.get(key) as V | undefined, set: (key, value) => { if (value === undefined) state.delete(key); else state.set(key, value) },
+      keys: prefix => [...state.keys()].filter(key => key.startsWith(prefix)) },
     threads: { get: key => fields.threads?.[key] ? { meta: fields.threads[key]! } : undefined, describe: vi.fn() },
     tickets: { get: id => fields.tickets?.find(ticket => ticket.id === id), open: () => fields.tickets ?? [] },
     triggers: { get: id => triggers.get(id) },
@@ -251,11 +253,12 @@ describe('polling', () => {
     expect(round.skipped).toEqual(['OPS'])
     expect(round.misrouted).toEqual(['OPS-2'])
     expect(round.unknown).toEqual([])
-    expect(stub.activities).toEqual([{ id: stableUuid('seen:s1'), agentSessionId: 's1', content: { type: 'thought', body: 'Received.' }, ephemeral: true }])
+    expect(stub.activities).toEqual([{ id: stableUuid('seen:s1'), agentSessionId: 's1', content: { type: 'thought', body: 'Received.' }, ephemeral: true },
+      { id: stableUuid('misrouted:s2'), agentSessionId: 's2', content: { type: 'error', body: 'Not taken in: OPS-2 works in acme/other, which this deployment does not serve.' } }])
     expect(h.state.get(KEYS.sessions)).toBe('2026-11-12T10:02:55.000Z')
     expect(h.state.get(KEYS.prompts)).toBe('2026-11-12T10:03:55.000Z')
     await pollLinear(h.ctx, stub.client, config(), signal())
-    expect(stub.activities).toHaveLength(1)
+    expect(stub.activities).toHaveLength(2)
   })
   it('takes in a team on an additional repository with that repository\'s canonical name, and leaves the primary\'s Triggers unchanged', async () => {
     const stub = sources([session('s1', '2026-11-12T10:01:00.000Z'), session('s2', '2026-11-12T10:02:00.000Z', { issue: issue(OTHER_TEAM, 2) })],
@@ -270,13 +273,19 @@ describe('polling', () => {
     expect(h.received[0]).toEqual(sessionTrigger(session('s1', '2026-11-12T10:01:00.000Z'), VIEWER))
     expect(stub.activities.map(activity => activity.agentSessionId)).toEqual(['s1', 's2'])
   })
-  it('leaves out a team whose repository the deployment does not list, and names it in health', async () => {
-    const stub = sources([session('s2', '2026-11-12T10:02:00.000Z', { issue: issue(OTHER_TEAM, 2) })])
+  it('leaves out a team whose repository the deployment does not list, names it in health, and says so once in the session', async () => {
+    const stub = sources([session('s2', '2026-11-12T10:02:00.000Z', { issue: issue(OTHER_TEAM, 2) })],
+      [prompt('a2', '2026-11-12T10:03:00.000Z', { agentSession: { id: 's2', issue: issue(OTHER_TEAM, 2) } })])
     const h = context({ repositories: ['acme/widgets', 'acme/third'] })
     h.state.set(KEYS.sessions, T0); h.state.set(KEYS.prompts, T0)
     const round = await pollLinear(h.ctx, stub.client, config(), signal())
-    expect(round).toMatchObject({ sessions: 0, skipped: ['OPS'], misrouted: ['OPS-2'] })
+    expect(round).toMatchObject({ sessions: 0, prompts: 0, skipped: ['OPS'], misrouted: ['OPS-2', 'OPS-2'] })
     expect(h.received).toEqual([])
+    const text = 'Not taken in: OPS-2 works in acme/other, which this deployment does not serve.'
+    expect(stub.activities).toEqual([{ id: stableUuid('misrouted:s2'), agentSessionId: 's2', content: { type: 'error', body: text } },
+      { id: stableUuid('misrouted:a2'), agentSessionId: 's2', content: { type: 'error', body: text } }])
+    await pollLinear(h.ctx, stub.client, config(), signal())
+    expect(stub.activities).toHaveLength(2)
   })
   describe('projects', () => {
     const inProject = (n: number, project: { id: string; name?: string } | null, team = TEAM) => ({ ...issue(team, n), project })
@@ -317,10 +326,11 @@ describe('polling', () => {
       expect(h.round).toMatchObject({ sessions: 0, prompts: 0, unmapped: ['WEB-1', 'WEB-2', 'WEB-1'], misrouted: [], skipped: [] })
       expect(h.activities.map(activity => [activity.agentSessionId, activity.content])).toEqual([
         ['s1', { type: 'error', body: 'Not taken in: team WEB names no repository for project Else.' }],
-        ['s2', { type: 'error', body: 'Not taken in: team WEB names no repository for Issues without a project.' }]])
-      h.state.set(KEYS.sessions, T0)
+        ['s2', { type: 'error', body: 'Not taken in: team WEB names no repository for Issues without a project.' }],
+        ['s1', { type: 'error', body: 'Not taken in: team WEB names no repository for project Else.' }]])
+      h.state.set(KEYS.sessions, T0); h.state.set(KEYS.prompts, T0)
       await pollLinear(h.ctx, h.client, config({ teams: [{ key: 'WEB', projects: [{ id: 'p-a', repository: 'acme/widgets' }] }] }), signal())
-      expect(h.activities).toHaveLength(2)
+      expect(h.activities).toHaveLength(3)
     })
 
     it('names a project whose repository is not listed in health, and leaves its Issues out', async () => {
@@ -399,6 +409,44 @@ describe('polling', () => {
       expect(h.received.map(trigger => trigger.id)).toEqual(['linear:session:new-1', 'linear:session:new-2'])
     }
   })
+  it('reads more than ten pages of new items over several rounds, oldest pages last, and moves the cursor only once all are read', async () => {
+    const all = Array.from({ length: 300 }, (_, n) => session(`s${n}`, new Date(Date.parse(T0) + (n + 1) * 1000).toISOString()))
+    const newestFirst = [...all].reverse()
+    const reads: (string | undefined)[] = []
+    const stub = linear({
+      agentSessions: variables => {
+        const after = variables.after as string | undefined
+        reads.push(after)
+        const start = after ? Number(after) : 0
+        const nodes = newestFirst.slice(start, start + 25)
+        return { agentSessions: { nodes, pageInfo: { hasNextPage: start + 25 < newestFirst.length, endCursor: String(start + 25) } } }
+      },
+      agentActivities: () => ({ agentActivities: page([]) }), agentActivityCreate: () => ({ agentActivityCreate: { success: true } }) })
+    const h = context()
+    h.state.set(KEYS.sessions, T0); h.state.set(KEYS.prompts, T0)
+    const log = vi.spyOn(console, 'log').mockImplementation(() => {})
+    await pollLinear(h.ctx, stub.client, config(), signal())
+    expect(h.received).toHaveLength(250)
+    expect(h.state.get(KEYS.sessions)).toBe(T0)
+    expect(log).toHaveBeenCalledWith(expect.stringContaining('more than 250 items after 2026-11-12T10:00:00.000Z'))
+    await pollLinear(h.ctx, stub.client, config(), signal())
+    expect(reads.slice(10)).toEqual(['250', '275'])
+    expect(new Set(h.received.map(trigger => trigger.id)).size).toBe(300)
+    expect(h.state.get(KEYS.sessions)).toBe(new Date(Date.parse(all.at(-1)!.createdAt) - 5000).toISOString())
+    expect(h.state.get(KEYS.sessionsBacklog)).toBeUndefined()
+    await pollLinear(h.ctx, stub.client, config(), signal())
+    expect(reads.at(-1)).toBeUndefined()
+    log.mockRestore()
+  })
+  it('counts the replayed newest session and prompt only the first time', async () => {
+    const stub = sources([session('s1', '2026-11-12T10:01:00.000Z')], [prompt('a1', '2026-11-12T10:02:00.000Z')])
+    const h = context()
+    h.state.set(KEYS.sessions, T0); h.state.set(KEYS.prompts, T0)
+    const stored = new Set<string>()
+    h.receive.mockImplementation(async trigger => { const seen = stored.has(trigger.id); stored.add(trigger.id); return seen ? 'duplicate' : 'stored' })
+    expect(await pollLinear(h.ctx, stub.client, config(), signal())).toMatchObject({ sessions: 1, prompts: 1 })
+    expect(await pollLinear(h.ctx, stub.client, config(), signal())).toMatchObject({ sessions: 0, prompts: 0 })
+  })
   it('keeps the cursor when a session was not taken in, and reads it again next round', async () => {
     const stub = sources([session('s1', '2026-11-12T10:01:00.000Z'), session('s2', '2026-11-12T10:02:00.000Z')])
     const h = context()
@@ -464,6 +512,41 @@ describe('polling', () => {
     expect(states).toEqual([{ id: 'issue-1', state: 'done' }])
     expect(h.state.get(KEYS.followed)).toEqual([])
     open.mockRestore()
+  })
+  it('stops linking into a session Linear no longer has, counts other follow-up failures in health, and gives up after a day', async () => {
+    const updates: unknown[] = []
+    let completing = 0
+    const stub = linear({
+      agentSessions: () => ({ agentSessions: page([]) }), agentActivities: () => ({ agentActivities: page([]) }),
+      agentSessionUpdate: variables => { updates.push(variables); throw Object.assign(new Error('Entity not found: AgentSession'), { code: 'INVALID_INPUT' }) },
+      'issue(id': () => { completing++; throw new Error('Internal error') },
+    })
+    const origin = sessionTrigger(session('s1', T0), VIEWER)!
+    const ticket: Ticket = { id: 't1', origin: { triggerId: origin.id, triggerIds: [origin.id] },
+      follows: [{ thread: 'github:54', own: true, closed: { at: T0, outcome: 'merged' } }] }
+    const h = context({ tickets: [ticket], triggers: [origin], threads: { 'github:54': { url: 'https://github.com/acme/widgets/pull/54' } } })
+    h.state.set(KEYS.sessions, T0); h.state.set(KEYS.prompts, T0)
+    expect(await pollLinear(h.ctx, stub.client, config(), signal())).toMatchObject({ followFailed: 1 })
+    expect(await pollLinear(h.ctx, stub.client, config(), signal())).toMatchObject({ followFailed: 1 })
+    expect(updates).toHaveLength(1)
+    expect(completing).toBe(2)
+    expect(h.state.get(KEYS.followFailed('t1', 'complete'))).toMatchObject({ count: 2 })
+    const open = vi.spyOn(h.ctx.tickets, 'open').mockReturnValue([])
+    const log = vi.spyOn(console, 'log').mockImplementation(() => {})
+    h.state.set(KEYS.followFailed('t1', 'complete'), { first: new Date(Date.now() - FOLLOW_RETRY_MS - 1000).toISOString(), count: 2 })
+    expect(await pollLinear(h.ctx, stub.client, config(), signal())).toMatchObject({ followFailed: 0 })
+    expect(log).toHaveBeenCalledWith(expect.stringMatching(/^dsh-superagent-linear: gave up completing WEB-1 for ticket t1 after 3 attempts: /))
+    expect(h.state.get(KEYS.followed)).toEqual([])
+    expect(h.state.get(KEYS.followFailed('t1', 'complete'))).toBeUndefined()
+    await pollLinear(h.ctx, stub.client, config(), signal())
+    expect(completing).toBe(3)
+    open.mockRestore(); log.mockRestore()
+    const fresh = context({ tickets: [{ ...ticket, id: 't2' }], triggers: [origin] })
+    fresh.state.set(KEYS.sessions, T0); fresh.state.set(KEYS.prompts, T0)
+    const controller = new AbortController()
+    vi.mocked(fresh.ctx.report).mockImplementation(() => { controller.abort() })
+    await watchLinear(fresh.ctx, stub.client, controller.signal)
+    expect(vi.mocked(fresh.ctx.report).mock.calls.at(-1)![1].detail).toContain('; pull request links or Issue completions failing: 1')
   })
   it('labels a linked pull request by the ticket\'s repository, naming any other repository in full', async () => {
     const updates: { input: { addedExternalUrls: { label: string }[] } }[] = []
@@ -653,6 +736,47 @@ describe('polling', () => {
       expect(h.received.map(trigger => trigger.id)).toEqual(['linear:undelegated:h2'])
     })
   })
+})
+
+it('logs a failed poll once while the rate limit holds, and again once it changes', async () => {
+  const stub = linear({ agentSessions: () => ({ agentSessions: page([]) }), agentActivities: () => ({ agentActivities: page([]) }) })
+  await stub.client.viewer()
+  stub.limit(Date.now() + 120_000)
+  const h = context()
+  h.state.set(KEYS.sessions, '2026-11-12T10:00:00.000Z'); h.state.set(KEYS.prompts, '2026-11-12T10:00:00.000Z')
+  const controller = new AbortController()
+  vi.mocked(h.ctx.report).mockImplementation(() => { if (vi.mocked(h.ctx.report).mock.calls.length >= 4) controller.abort() })
+  const log = vi.spyOn(console, 'log').mockImplementation(() => {})
+  await watchLinear(h.ctx, stub.client, controller.signal, { wait: async () => {} } as unknown as Waker)
+  expect(log.mock.calls.filter(([line]) => String(line).includes('poll failed'))).toHaveLength(1)
+  log.mockRestore()
+})
+
+it('drops once-only markers past the close horizon hourly, stamps those without a time, and keeps a followed ticket\'s completion', async () => {
+  const stub = linear({ agentSessions: () => ({ agentSessions: page([]) }), agentActivities: () => ({ agentActivities: page([]) }) })
+  const origin = sessionTrigger(session('s1', '2026-11-12T10:00:00.000Z'), VIEWER)!
+  const h = context({ tickets: [{ id: 't-open', origin: { triggerId: origin.id, triggerIds: [origin.id] } }], triggers: [origin] })
+  h.state.set(KEYS.sessions, '2026-11-12T10:00:00.000Z'); h.state.set(KEYS.prompts, '2026-11-12T10:00:00.000Z')
+  const old = new Date(Date.now() - CLOSE_HORIZON_MS - 1000).toISOString()
+  h.state.set(KEYS.seen('s-old'), old); h.state.set(KEYS.seen('s-legacy'), true); h.state.set(CHAIN_KEYS.run('p-old'), old)
+  h.state.set(CHAIN_KEYS.held('s-held'), old); h.state.set(KEYS.completed('t-done'), old); h.state.set(KEYS.completed('t-open'), old)
+  await pollLinear(h.ctx, stub.client, config(), signal())
+  expect(h.state.get(KEYS.seen('s-old'))).toBe(old)
+  h.state.set(KEYS.pruned, new Date(Date.now() - 3600_000 - 1000).toISOString())
+  await pollLinear(h.ctx, stub.client, config(), signal())
+  expect([KEYS.seen('s-old'), CHAIN_KEYS.run('p-old'), CHAIN_KEYS.held('s-held'), KEYS.completed('t-done')].map(key => h.state.has(key))).toEqual([false, false, false, false])
+  expect(Date.parse(h.state.get(KEYS.seen('s-legacy')) as string)).toBeGreaterThan(Date.now() - 60_000)
+  expect(h.state.get(KEYS.completed('t-open'))).toBe(old)
+})
+
+it('passes only a well-formed Issue identifier and a linear.app Issue url to workers', () => {
+  const env = (meta: Record<string, unknown>) => linearKind(linear().client).environment!.values({ config: config(),
+    trigger: { ...sessionTrigger(session('s1', '2026-11-12T10:00:00.000Z'), VIEWER)!, meta } })
+  expect(env({ identifier: 'WEB-12', issueUrl: 'https://linear.app/x/issue/WEB-12' })).toMatchObject({ DSH_SUPERAGENT_LINEAR_ISSUE: 'WEB-12',
+    DSH_SUPERAGENT_LINEAR_ISSUE_URL: 'https://linear.app/x/issue/WEB-12' })
+  expect(env({ identifier: 'WEB-12; rm -rf /', issueUrl: 'https://evil.example/linear.app/' })).toMatchObject({ DSH_SUPERAGENT_LINEAR_ISSUE: '',
+    DSH_SUPERAGENT_LINEAR_ISSUE_URL: '' })
+  expect(env({ identifier: 'web-12', issueUrl: 'http://linear.app/x' })).toMatchObject({ DSH_SUPERAGENT_LINEAR_ISSUE: '', DSH_SUPERAGENT_LINEAR_ISSUE_URL: '' })
 })
 
 describe('issue closes', () => {
@@ -853,20 +977,35 @@ describe('issue context', () => {
     expect(h.received.map(trigger => trigger.id)).toContain('linear:session:s3')
     expect(stub.reads).toEqual([])
   })
-  it('takes the session in unchanged when its context cannot be read or parsed, and says so in health', async () => {
+  it('holds a session whose context cannot be read or parsed, and takes it in once a read works', async () => {
     for (const answer of [() => { throw new Error('Internal error') }, () => ({ issue: null })]) {
-      const stub = served(answer)
+      let failing = true
+      const stub = served(() => failing ? answer() : { issue: { parent: null, children: none } })
       const h = polled()
+      await expect(pollLinear(h.ctx, stub.client, config(), signal())).rejects.toThrow('not taken in')
+      expect(h.received.filter(trigger => trigger.meta.kind === 'session')).toEqual([])
+      expect(h.state.get(KEYS.sessions)).toBe(T0)
+      failing = false
       const round = await pollLinear(h.ctx, stub.client, config(), signal())
-      expect(round.contextFailed).toBe(1)
-      expect(h.received[0]).toEqual(sessionTrigger(session('s1', '2026-11-12T10:01:00.000Z'), VIEWER))
+      expect(round.contextFailed).toBe(0)
+      expect(h.received.filter(trigger => trigger.meta.kind === 'session')).toEqual([sessionTrigger(session('s1', '2026-11-12T10:01:00.000Z'), VIEWER)])
       expect(h.state.get(KEYS.sessions)).toBe('2026-11-12T10:00:55.000Z')
     }
-    const { health, received } = await healthOf(served(() => { throw new Error('Internal error') }), config())
-    expect(received).toHaveLength(2)
-    expect(health).toMatchObject({ detail: expect.stringContaining('; parent and sub-issues unreadable: 1') })
     const fine = await healthOf(served(() => ({ issue: { parent: null, children: none } })), config())
     expect(fine.health.detail).not.toContain('parent and sub-issues')
+  })
+  it('stops holding a mention whose context stays unreadable for 10 minutes, says so once, and moves the cursor on', async () => {
+    const stub = served(() => { throw new Error('Internal error') })
+    const h = polled()
+    await expect(pollLinear(h.ctx, stub.client, config(), signal())).rejects.toThrow('not taken in')
+    h.state.set(CHAIN_KEYS.held('s1'), new Date(Date.now() - HOLD_MS - 1000).toISOString())
+    const round = await pollLinear(h.ctx, stub.client, config(), signal())
+    expect(round.contextFailed).toBe(1)
+    expect(h.received.filter(trigger => trigger.meta.kind === 'session')).toEqual([])
+    expect(h.state.get(KEYS.sessions)).toBe('2026-11-12T10:00:55.000Z')
+    const errors = stub.calls.filter(call => call.query?.includes('agentActivityCreate'))
+      .map(call => (call.variables!.input as { content: { type: string; body: string } }).content).filter(content => content.type === 'error')
+    expect(errors).toEqual([{ type: 'error', body: 'Could not read the sub-issues of WEB-1; mention the app again to retry.' }])
   })
   it('stops when its signal aborts during the context read', async () => {
     const controller = new AbortController()
@@ -931,26 +1070,20 @@ describe('split mode', () => {
     expect(h.received[1]!.meta).not.toHaveProperty('mode')
     expect(h.received[1]!.text).toBe('Also the header')
   })
-  it('holds a delegated epic whose context read failed, and takes a mentioned one in unsplit', async () => {
-    let failing = true
-    const stub = linear({ agentSessions: () => ({ agentSessions: page([session('s1', '2026-11-12T10:01:00.000Z', { issue: { ...labelled('epic'), delegate: { id: VIEWER } } })]) }),
-      agentActivities: () => ({ agentActivities: page([]) }), agentActivityCreate: () => ({ agentActivityCreate: { success: true } }),
-      IssueContext: () => { if (failing) throw new Error('Internal error'); return { issue: { parent: null, children: { nodes: [], pageInfo: { hasNextPage: false } } } } } })
-    const h = context(); h.state.set(KEYS.sessions, T0); h.state.set(KEYS.prompts, T0)
-    await expect(pollLinear(h.ctx, stub.client, config(), signal())).rejects.toThrow('not taken in')
-    expect(h.received).toEqual([])
-    expect(h.state.get(KEYS.sessions)).toBe(T0)
-    failing = false
-    await pollLinear(h.ctx, stub.client, config(), signal())
-    expect(h.received[0]!.meta.mode).toBe('split')
-    const mentioned = linear({ agentSessions: () => ({ agentSessions: page([session('s2', '2026-11-12T10:01:00.000Z', { issue: labelled('epic') })]) }),
-      agentActivities: () => ({ agentActivities: page([]) }), agentActivityCreate: () => ({ agentActivityCreate: { success: true } }),
-      IssueContext: () => { throw new Error('Internal error') } })
-    const m = context(); m.state.set(KEYS.sessions, T0); m.state.set(KEYS.prompts, T0)
-    const round = await pollLinear(m.ctx, mentioned.client, config(), signal())
-    expect(round.contextFailed).toBe(1)
-    expect(m.received[0]!.meta).not.toHaveProperty('mode')
-    expect(m.received[0]!.text).not.toContain(SPLIT_LINE)
+  it('holds an epic whose context read failed, delegated or mentioned, and splits it once the read works', async () => {
+    for (const fields of [{ delegate: { id: VIEWER } }, {}]) {
+      let failing = true
+      const stub = linear({ agentSessions: () => ({ agentSessions: page([session('s1', '2026-11-12T10:01:00.000Z', { issue: { ...labelled('epic'), ...fields } })]) }),
+        agentActivities: () => ({ agentActivities: page([]) }), agentActivityCreate: () => ({ agentActivityCreate: { success: true } }),
+        IssueContext: () => { if (failing) throw new Error('Internal error'); return { issue: { parent: null, children: { nodes: [], pageInfo: { hasNextPage: false } } } } } })
+      const h = context(); h.state.set(KEYS.sessions, T0); h.state.set(KEYS.prompts, T0)
+      await expect(pollLinear(h.ctx, stub.client, config(), signal())).rejects.toThrow('not taken in')
+      expect(h.received).toEqual([])
+      expect(h.state.get(KEYS.sessions)).toBe(T0)
+      failing = false
+      await pollLinear(h.ctx, stub.client, config(), signal())
+      expect(h.received[0]!.meta.mode).toBe('split')
+    }
   })
   it('does not split an epic on an unlisted team', async () => {
     const elsewhere = { ...issue('elsewhere', 3), labels: { nodes: [{ name: 'epic' }] } }

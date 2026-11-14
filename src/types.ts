@@ -40,7 +40,8 @@ export interface SourceContext {
   configured(): boolean
   config<C extends Record<string, unknown>>(kind: string): C | undefined
   receive(trigger: Trigger): ReceiveResult | Promise<ReceiveResult>
-  state: { get<V>(key: string): V | undefined; set<V>(key: string, value: V | undefined): void }
+  /** `keys` lists the keys starting with a prefix; hosts before it have none. */
+  state: { get<V>(key: string): V | undefined; set<V>(key: string, value: V | undefined): void; keys?(prefix: string): string[] }
   threads: { get(key: string): Thread | undefined; describe(key: string, description: { label?: string; url?: string }): void }
   /** `issueClosed` reports that the Issue a ticket started on closed; hosts before it have none. */
   tickets: { get(id: string): Ticket | undefined; open(): Ticket[]; issueClosed?(id: string, at: string): void }
