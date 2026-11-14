@@ -134,6 +134,22 @@ describe('translation', () => {
     expect(sessionTrigger(session('s2', '2026-11-12T10:00:00.000Z', { issue: { ...issue(), labels: { nodes: [] } } }), VIEWER)!.meta).not.toHaveProperty('labels')
     expect(promptTrigger(prompt('a2', '2026-11-12T10:00:00.000Z'), VIEWER)!.meta).not.toHaveProperty('labels')
   })
+  it('gives workers the Issue url, not the session url, while replies still go to the session', () => {
+    const env = (trigger: Trigger) => linearKind(linear().client).environment!.values({ config: config(), trigger }).DSH_SUPERAGENT_LINEAR_ISSUE_URL
+    const started = sessionTrigger(session('s1', '2026-11-12T10:00:00.000Z'), VIEWER)!
+    expect(env(started)).toBe('https://linear.app/x/issue/WEB-1')
+    expect(started).toMatchObject({ url: 'https://linear.app/x/session/s1', meta: { issueUrl: 'https://linear.app/x/issue/WEB-1' },
+      channel: { address: { session: 's1', url: 'https://linear.app/x/session/s1' } } })
+    const prompted = promptTrigger(prompt('a1', '2026-11-12T10:01:00.000Z'), VIEWER)!
+    expect(env(prompted)).toBe('https://linear.app/x/issue/WEB-1')
+    expect(prompted.channel!.address).toMatchObject({ session: 's1' })
+    const stop = undelegationTrigger(started, 'ticket-1', undefined, '2026-11-12T10:03:00.000Z')
+    expect(env(stop)).toBe('https://linear.app/x/issue/WEB-1')
+    expect(stop).toMatchObject({ url: 'https://linear.app/x/session/s1', channel: started.channel })
+    const { issueUrl: _, ...stored } = started.meta
+    expect(env({ ...started, meta: stored })).toBe('https://linear.app/x/session/s1')
+    expect(undelegationTrigger({ ...started, meta: stored }, 'ticket-1', undefined, '2026-11-12T10:03:00.000Z').meta).not.toHaveProperty('issueUrl')
+  })
   it('makes a stop signal explicit, and drops what the app itself wrote', () => {
     expect(promptTrigger(prompt('a2', '2026-11-12T10:02:00.000Z', { signal: 'stop', content: { body: '' } }), VIEWER))
       .toMatchObject({ text: 'Stop requested in Linear.', meta: { signal: 'stop' } })
@@ -1083,7 +1099,8 @@ describe('chain', () => {
     expect(trigger!.text.split('\n')[0]).toBe('Parent: WEB-10 "The epic" https://linear.app/x/issue/WEB-10')
     expect(trigger!.text).not.toContain(SPLIT_LINE)
     expect(trigger!.text).toContain('WEB-2: Part WEB-2\n\nMake the part.')
-    expect(linearKind(w.stub.client).environment!.values({ config: config(), trigger: trigger! }).DSH_SUPERAGENT_LINEAR_MODE).toBe('')
+    expect(linearKind(w.stub.client).environment!.values({ config: config(), trigger: trigger! })).toMatchObject({ DSH_SUPERAGENT_LINEAR_MODE: '',
+      DSH_SUPERAGENT_LINEAR_ISSUE_URL: 'https://linear.app/x/issue/WEB-2' })
   })
 
   it('skips the sessions it created on replay, also once their work finished, without relying on their creator', async () => {

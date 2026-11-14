@@ -76,7 +76,7 @@ export function channel(issue: Issue, session: string, url: string) {
     address: { session, issue: issue.id, team: issue.team.id, teamKey: issue.team.key, identifier: issue.identifier, url } }
 }
 export function meta(issue: Issue, session: string, kind: string) {
-  return { team: issue.team.id, teamKey: issue.team.key, issue: issue.id, identifier: issue.identifier, session, kind,
+  return { team: issue.team.id, teamKey: issue.team.key, issue: issue.id, identifier: issue.identifier, issueUrl: issue.url, session, kind,
     ...issue.project ? { project: issue.project.id, ...issue.project.name ? { projectName: issue.project.name } : {} } : {},
     ...issue.delegate ? { delegate: issue.delegate.id } : {}, ...issue.labels?.nodes.length ? { labels: issue.labels.nodes.map(label => label.name) } : {} }
 }
@@ -107,13 +107,13 @@ export function promptTrigger(prompt: Prompt, viewer: string): Trigger | undefin
 
 /** The stop Trigger for a ticket whose Issue is no longer delegated to the app, from the change that removed it when the history has it. */
 export function undelegationTrigger(origin: Trigger, ticket: string, change: Undelegation | undefined, observed: string, repository?: string): Trigger {
-  const { team, teamKey, issue, identifier, session } = origin.meta
+  const { team, teamKey, issue, identifier, issueUrl, session } = origin.meta
   const who = change?.actor?.name ?? 'Someone'
   return { id: change ? `linear:undelegated:${change.id}` : `linear:undelegated:${ticket}:${observed}`, source: SOURCE, threads: origin.threads,
     actor: { source: SOURCE, id: change?.actor?.id ?? '' }, human: !!change?.actor, addressed: 'direct', at: change?.at ?? observed,
     text: `Stop requested in Linear.\n\n${who} removed the app as the delegate of ${String(identifier)}.`,
     ...origin.channel ? { channel: origin.channel } : {}, ...origin.url ? { url: origin.url } : {},
-    meta: { team, teamKey, issue, identifier, session, kind: 'undelegated', ...change ? { history: change.id } : {}, signal: 'stop',
+    meta: { team, teamKey, issue, identifier, ...issueUrl ? { issueUrl } : {}, session, kind: 'undelegated', ...change ? { history: change.id } : {}, signal: 'stop',
       ...repository ? { repository } : {} } }
 }
 
@@ -210,11 +210,11 @@ export function linearKind(client: LinearClient): SourceKind<LinearConfig> {
     environment: {
       variables: [
         { key: 'DSH_SUPERAGENT_LINEAR_ISSUE', description: { zh: '接下工单的 Linear Issue 标识，例如 ENG-12；工单不是从 Linear 来的时为空', en: 'Identifier of the Linear Issue that started the ticket, such as ENG-12; empty when the ticket did not start on Linear' } },
-        { key: 'DSH_SUPERAGENT_LINEAR_ISSUE_URL', description: { zh: '那个 Linear Issue 的链接', en: 'Link to that Linear Issue' } },
+        { key: 'DSH_SUPERAGENT_LINEAR_ISSUE_URL', description: { zh: '那个 Linear Issue 的链接（Issue 页面，不是智能体会话）', en: 'Link to that Linear Issue\'s page, not its agent session' } },
         { key: 'DSH_SUPERAGENT_LINEAR_MODE', description: { zh: '工单要把 Linear epic 拆成子 Issue 时为 split；其他情况为空', en: 'split when the ticket plans a Linear epic into sub-issues; empty otherwise' } },
       ],
       values: ({ trigger }) => trigger?.source === SOURCE
-        ? { DSH_SUPERAGENT_LINEAR_ISSUE: String(trigger.meta.identifier ?? ''), DSH_SUPERAGENT_LINEAR_ISSUE_URL: trigger.url ?? '',
+        ? { DSH_SUPERAGENT_LINEAR_ISSUE: String(trigger.meta.identifier ?? ''), DSH_SUPERAGENT_LINEAR_ISSUE_URL: String(trigger.meta.issueUrl ?? trigger.url ?? ''),
           DSH_SUPERAGENT_LINEAR_MODE: String(trigger.meta.mode ?? '') }
         : { DSH_SUPERAGENT_LINEAR_ISSUE: '', DSH_SUPERAGENT_LINEAR_ISSUE_URL: '', DSH_SUPERAGENT_LINEAR_MODE: '' },
     },

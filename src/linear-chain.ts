@@ -329,11 +329,11 @@ export async function stopChain(ctx: SourceContext, client: LinearClient, epic: 
   const at = new Date().toISOString()
   const stopped = new Set<string>()
   const stopTrigger = (origin: Trigger, child: string, repository: string | undefined): Trigger => {
-    const { team, teamKey, issue, identifier, session } = origin.meta
+    const { team, teamKey, issue, identifier, issueUrl, session } = origin.meta
     return { id: `linear:chain-stop:${record.run}:${child}`, source: SOURCE, threads: origin.threads, actor: { source: SOURCE, id: by?.id ?? '' },
       human: !!by, addressed: 'direct', at, text: `Stop requested in Linear.\n\nThe work on the sub-issues of ${record.identifier} stopped: ${reason}.`,
       ...origin.channel ? { channel: origin.channel } : {}, ...origin.url ? { url: origin.url } : {},
-      meta: { team, teamKey, issue, identifier, session, kind: 'chain-stop', signal: 'stop', chain: epic, ...repository ? { repository } : {} } }
+      meta: { team, teamKey, issue, identifier, ...issueUrl ? { issueUrl } : {}, session, kind: 'chain-stop', signal: 'stop', chain: epic, ...repository ? { repository } : {} } }
   }
   for (const child of new Set([...(record.children ?? []).map(child => child.id), ...Object.keys(record.started)])) {
     for (const ticket of open.get(child) ?? []) {
