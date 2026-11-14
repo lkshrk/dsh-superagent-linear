@@ -23,9 +23,10 @@ export interface ChainRecord {
   run: string; session: string; delegator: { id: string; name?: string }; status: 'running' | 'stopped' | 'done'; reason?: string
   team: string; teamKey: string; project?: string; projectName?: string; identifier: string; url: string
   delegated: boolean; started: Record<string, Started>; children?: { id: string; identifier: string }[]; checked?: string
-  delegation?: { at: string }
+  delegation?: { at: string }; waiting?: string
 }
 type Child = Chain['children']['nodes'][number]
+const UNREADABLE_BLOCKER = { id: '', identifier: 'an issue the app cannot read', state: null }
 interface Env { ctx: SourceContext; client: LinearClient; config: LinearConfig; viewer: string; round: Round; signal: AbortSignal }
 
 export const chainOf = (ctx: SourceContext, epic: string): ChainRecord | undefined => {
@@ -44,6 +45,8 @@ function addOwnSession(ctx: SourceContext, id: string): void {
   const kept = Object.entries(ctx.state.get<Record<string, string>>(CHAIN_KEYS.sessions) ?? {}).filter(([, at]) => now - Date.parse(at) < CLOSE_HORIZON_MS)
   ctx.state.set(CHAIN_KEYS.sessions, Object.fromEntries([...kept, [id, new Date(now).toISOString()]]))
 }
+/** Whether `actor` may start or stop a chain: the host's policy admits it; nobody may on a host without `admits`. */
+export const mayControl = (ctx: SourceContext, actor: string | undefined) => !!actor && ctx.admits?.({ id: actor, human: true }) === true
 const ignoreGone = (error: unknown) => { if (!(error instanceof LinearError && error.gone)) throw error }
 /** Posts to a session once per id; a run started without a known session posts nothing. */
 async function tell(client: LinearClient, session: string, id: string, content: ActivityContent, signal: AbortSignal): Promise<void> {
@@ -53,12 +56,13 @@ async function tell(client: LinearClient, session: string, id: string, content: 
 export function holdUnreadable(ctx: SourceContext, key: string): void {
   const held = ctx.state.get<string>(CHAIN_KEYS.held(key))
   if (!held) ctx.state.set(CHAIN_KEYS.held(key), new Date().toISOString())
-  if (!held || Date.now() - Date.parse(held) < HOLD_MS) throw new Error('The sub-issues of a delegated Issue were not readable')
+  if (!held || Date.now() - Date.parse(held) < HOLD_MS) throw new Error(`The sub-issues of the Issue of ${key} were not readable`)
 }
 export function releaseHold(ctx: SourceContext, key: string): void {
   if (ctx.state.get(CHAIN_KEYS.held(key))) ctx.state.set(CHAIN_KEYS.held(key), undefined)
 }
-export const unreadableText = (identifier: string) => `Could not read the sub-issues of ${identifier}; write "start" in this session to retry.`
+export const unreadableText = (identifier: string, delegated = true) =>
+  `Could not read the sub-issues of ${identifier}; ${delegated ? 'write exactly "start" in this session' : 'mention the app again'} to retry.`
 const closed = (state: { type: string } | null | undefined) => state?.type === 'completed' || state?.type === 'canceled'
 
 interface Start { run: string; session: string; issue: Issue; delegator: { id: string; name?: string | null }; delegation?: boolean }
@@ -107,7 +111,8 @@ export async function epicPrompt(ctx: SourceContext, client: LinearClient, promp
   const stop = trigger.meta.signal === 'stop'
   const identifier = String(trigger.meta.identifier)
   let context: IssueContext | undefined
-  if (!stop && record?.status !== 'running' && trigger.meta.delegate === viewer) {
+  const allowed = mayControl(ctx, prompt.user?.id)
+  if (!stop && allowed && isStart(prompt) && record?.status !== 'running' && trigger.meta.delegate === viewer) {
     try {
       context = await client.issueContext(epic, signal)
     } catch (error) {
@@ -129,15 +134,27 @@ export async function epicPrompt(ctx: SourceContext, client: LinearClient, promp
   const labels = Array.isArray(trigger.meta.labels) ? trigger.meta.labels : []
   if (!record && !labels.some(label => String(label).toLowerCase() === 'epic')
     && !(context ? context.children.nodes.length > 0 : await client.hasChildren(epic, signal))) return false
-  if (record?.status === 'running' && stop) {
-    await stopChain(ctx, client, epic, record, 'stop requested in Linear', { id: trigger.actor.id }, signal)
-    return true
+  const control = stop ? record?.status === 'running' : isStart(prompt)
+  if (control && allowed && stop) {
+    await stopChain(ctx, client, epic, record!, 'stop requested in Linear', { id: trigger.actor.id }, signal)
+  } else {
+    await client.activity(String(trigger.meta.session), stableUuid(`epic-prompt:${String(trigger.meta.activity)}`),
+      { type: 'thought', body: control && !allowed ? refusedText(ctx) : statusText(ctx, record, identifier, 'the app') }, false, signal).catch(ignoreGone)
   }
-  await client.activity(String(trigger.meta.session), stableUuid(`epic-prompt:${String(trigger.meta.activity)}`),
-    { type: 'thought', body: statusText(ctx, record, identifier, 'the app') }, false, signal).catch(ignoreGone)
+  ctx.state.set(CHAIN_KEYS.run(prompt.id), epic)
   return true
 }
+const isStart = (prompt: Prompt) => (prompt.content.body ?? '').trim().toLowerCase() === 'start'
 
+/** Why a person's start or stop of a chain was not carried out. */
+export const refusedText = (ctx: SourceContext) => ctx.admits
+  ? 'Only users on the Linear Source\'s allowed list can start or stop a chain of sub-issues.'
+  : 'This dsh-superagent version cannot check the Linear policy, so nobody can start or stop a chain of sub-issues.'
+/** Answers a delegation by someone the policy does not admit, once per session. */
+export async function refuseDelegation(ctx: SourceContext, client: LinearClient, session: Session, signal: AbortSignal): Promise<void> {
+  await tell(client, session.id, `chain-refused:${session.id}`, { type: 'thought', body: refusedText(ctx) }, signal)
+  ctx.state.set(CHAIN_KEYS.run(session.id), session.issue!.id)
+}
 /** Answers a mention on an Issue with sub-issues: only a delegation starts a chain. */
 export async function epicMention(ctx: SourceContext, client: LinearClient, session: Session, signal: AbortSignal): Promise<void> {
   const issue = session.issue!
@@ -148,7 +165,7 @@ export async function epicMention(ctx: SourceContext, client: LinearClient, sess
 
 function statusText(ctx: SourceContext, record: ChainRecord | undefined, identifier: string, app: string): string {
   if (record?.status !== 'running') {
-    return `Not working on ${identifier}${record?.reason ? ` (stopped: ${record.reason})` : ''}. To start a chain, delegate the issue to ${app}; if it is delegated already, write "start" in its session.`
+    return `Not working on ${identifier}${record?.reason ? ` (stopped: ${record.reason})` : ''}. To start a chain, delegate the issue to ${app}; if it is delegated already, write exactly "start" in its session.`
   }
   const working = [...busy(ctx, record)].map(id => identifierOf(record, id))
   return `Working on ${working.length ? working.join(', ') : 'the next sub-issues'} of ${identifier}. A stop in this session ends the chain.`
@@ -217,11 +234,13 @@ async function advance(env: Env, epic: string, record: ChainRecord): Promise<voi
   save(ctx, epic, record)
   const stop = (reason: string) => stopChain(ctx, client, epic, record, reason, undefined, signal)
 
-  if (chain.delegate?.id === viewer) record.delegated = true
-  else if (record.delegated) return await stop(`${record.identifier} is no longer delegated to the app`)
-  if (closed(chain.state)) return await stop(`${record.identifier} was ${chain.state!.type}`)
   const children = chain.children.nodes
-  if (chain.children.pageInfo.hasNextPage || children.some(child => child.inverseRelations.pageInfo.hasNextPage)) {
+  // Linear can close a parent together with its last sub-issue, and may drop its delegate as it does.
+  const finished = children.length > 0 && !chain.children.pageInfo.hasNextPage && children.every(child => closed(child.state))
+  if (chain.delegate?.id === viewer) record.delegated = true
+  else if (record.delegated && !finished) return await stop(`${record.identifier} is no longer delegated to the app`)
+  if (closed(chain.state) && !finished) return await stop(`${record.identifier} was ${chain.state!.type}`)
+  if (!finished && (chain.children.pageInfo.hasNextPage || children.some(child => child.inverseRelations.pageInfo.hasNextPage))) {
     return await stop('too many sub-issues or relations to read (at most 30 sub-issues and 20 relations on each)')
   }
   if (!children.length) return await stop(`${record.identifier} has no sub-issues`)
@@ -249,7 +268,7 @@ async function advance(env: Env, epic: string, record: ChainRecord): Promise<voi
     return await finish(env, epic, record)
   }
 
-  const blockers = (child: Child) => child.inverseRelations.nodes.flatMap(relation => relation.type === 'blocks' && relation.issue ? [relation.issue] : [])
+  const blockers = (child: Child) => child.inverseRelations.nodes.flatMap(relation => relation.type === 'blocks' ? [relation.issue ?? UNREADABLE_BLOCKER] : [])
   const elsewhere = children.filter(child => !done(child.id) && !running.has(child.id) && !record.started[child.id]
     && !!child.assignee && child.assignee.id !== viewer)
   const ready = children.filter(child => !done(child.id) && !running.has(child.id) && !record.started[child.id] && !elsewhere.includes(child)
@@ -261,6 +280,12 @@ async function advance(env: Env, epic: string, record: ChainRecord): Promise<voi
       return waiting.length ? `${child.identifier} waits for ${waiting.join(', ')}` : child.identifier
     })
     return await stop(`stalled: ${waits.join('; ')}`)
+  }
+  const waiting = !running.size && !ready.length ? elsewhere.map(child => child.identifier).join(', ') : ''
+  if (waiting && record.waiting !== waiting) {
+    await tell(client, record.session, `chain-waiting:${record.run}:${waiting}`, { type: 'thought',
+      body: `Waiting for ${waiting}, assigned to someone else; the chain goes on once they close.` }, signal)
+    record.waiting = waiting
   }
 
   for (const child of children) {
@@ -416,7 +441,12 @@ async function redelegated(ctx: SourceContext, client: LinearClient, issue: stri
   if (!change?.person || ctx.state.get(CHAIN_KEYS.run(change.id))) return
   const context = await client.issueContext(issue, signal)
   if (!context.children.nodes.some(child => !closed(child.state))) return
-  const details = await client.issue(issue, signal)
   const session = chainOf(ctx, issue)?.session || watches(ctx)[issue]?.session || ''
+  if (!mayControl(ctx, change.person.id)) {
+    await tell(client, session, `chain-refused:${change.id}`, { type: 'thought', body: refusedText(ctx) }, signal)
+    ctx.state.set(CHAIN_KEYS.run(change.id), issue)
+    return
+  }
+  const details = await client.issue(issue, signal)
   await startRun(ctx, client, { run: change.id, session, issue: details, delegator: change.person, delegation: true }, context, viewer, parallel, signal)
 }

@@ -1,6 +1,6 @@
 {
   "name": "dsh-superagent-linear",
-  "description": "Linear Source for dsh-superagent: a Linear agent app's sessions on one team become Triggers, and replies go back as agent activities.",
+  "description": "Linear Source for dsh-superagent: a Linear agent app's sessions on the listed teams become Triggers, and replies go back as agent activities.",
   "version": "0.1.0",
   "license": "MIT",
   "type": "module",
