@@ -1491,6 +1491,9 @@ describe('chain', () => {
     expect(stuck.received).toEqual([])
     expect(stuck.state.has(CHAIN_KEYS.held('p1'))).toBe(false)
     expect(stuck.activities.at(-1)).toEqual({ session: 'es1', type: 'error', body: 'Could not read the sub-issues of WEB-10; write "start" in this session to retry.' })
+    await stuck.round()
+    expect(stuck.state.has(CHAIN_KEYS.held('p1'))).toBe(false)
+    expect(stuck.activities.filter(activity => activity.type === 'error')).toHaveLength(1)
   })
 
   it('reads the sub-issues of a delegated Issue once for a prompt, without a second epic check', async () => {
