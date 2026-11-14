@@ -74,6 +74,19 @@ export const threadOf = (issue: string) => `issue:${issue}`
 const cursorAfter = (since: string, newest: string | undefined) =>
   newest === undefined ? since : new Date(Math.max(Date.parse(since), Date.parse(newest) - 5000)).toISOString()
 interface Backlog { after: string; newest?: string }
+/** Reads on from a stored backlog; one Linear no longer continues is dropped, and the read starts again from the newest page. */
+async function readOn<T>(ctx: SourceContext, backlogKey: string, read: (after?: string) => Promise<Read<T>>): Promise<{ read: Read<T>; backlog?: Backlog }> {
+  const backlog = ctx.state.get<Backlog>(backlogKey)
+  if (!backlog) return { read: await read() }
+  try {
+    return { read: await read(backlog.after), backlog }
+  } catch (error) {
+    if (!(error instanceof LinearError) || error.throttled) throw error
+    console.log(`dsh-superagent-linear: could not read ${backlogKey} on from its last page (${String(error)}); reading from the newest again`)
+    ctx.state.set(backlogKey, undefined)
+    return { read: await read() }
+  }
+}
 /** Moves a cursor past a read taken in whole; a read cut at the page limit keeps it and continues from its last page next round. */
 function moveCursor(ctx: SourceContext, cursor: string, backlogKey: string, since: string, read: Read<{ createdAt: string }>, backlog: Backlog | undefined): void {
   const dates = [backlog?.newest, read.items.at(-1)?.createdAt].filter((at): at is string => !!at)
@@ -244,6 +257,8 @@ export function linearKind(client: LinearClient): SourceKind<LinearConfig> {
 
 export interface Round { sessions: number; prompts: number; unreadable: number; skipped: string[]; unknown: string[]; misrouted: string[]; unmapped: string[]; unverified: boolean; contextFailed: number; chainFailed: number; followFailed: number; noPolicyAccessor: boolean }
 
+/** A round that read everything but could not take every item in; it carries what it counted. */
+export class RoundFailed extends Error { constructor(message: string, readonly round: Round) { super(message) } }
 export type Route = { kind: 'unlisted' } | { kind: 'unmapped' } | { kind: 'misrouted'; repository: string } | { kind: 'served'; repository: string }
 // A listed team's Issue without a repository, or whose repository the GitHub Source does not serve, is left out; an unlisted team's goes to
 // receive, whose scope filters it.
@@ -291,8 +306,7 @@ export async function pollLinear(ctx: SourceContext, client: LinearClient, confi
     return round
   }
 
-  const sessionsBacklog = ctx.state.get<Backlog>(KEYS.sessionsBacklog)
-  const sessions = await client.sessions(sessionsSince, signal, sessionsBacklog?.after)
+  const { read: sessions, backlog: sessionsBacklog } = await readOn(ctx, KEYS.sessionsBacklog, after => client.sessions(sessionsSince, signal, after))
   round.unreadable += sessions.unreadable
   let failed = false
   for (const session of sessions.items) {
@@ -304,7 +318,7 @@ export async function pollLinear(ctx: SourceContext, client: LinearClient, confi
     const trigger = placed(ctx, found, where.kind === 'served' ? where.repository : undefined)
     try {
       if (where.kind === 'unmapped' || where.kind === 'misrouted') {
-        round[where.kind].push(String(found.meta.identifier))
+        note(round[where.kind], String(found.meta.identifier))
         await refuse(ctx, client, session.id, session.id, found, where, signal)
         continue
       }
@@ -352,8 +366,7 @@ export async function pollLinear(ctx: SourceContext, client: LinearClient, confi
   if (!failed) moveCursor(ctx, KEYS.sessions, KEYS.sessionsBacklog, sessionsSince, sessions, sessionsBacklog)
   const sessionsFailed = failed
 
-  const promptsBacklog = ctx.state.get<Backlog>(KEYS.promptsBacklog)
-  const prompts = await client.prompts(promptsSince, signal, promptsBacklog?.after)
+  const { read: prompts, backlog: promptsBacklog } = await readOn(ctx, KEYS.promptsBacklog, after => client.prompts(promptsSince, signal, after))
   round.unreadable += prompts.unreadable
   failed = false
   for (const prompt of prompts.items) {
@@ -370,7 +383,7 @@ export async function pollLinear(ctx: SourceContext, client: LinearClient, confi
       } else {
         const where = route(found)
         if (where.kind === 'misrouted' || where.kind === 'unmapped') {
-          round[where.kind].push(String(found.meta.identifier))
+          note(round[where.kind], String(found.meta.identifier))
           await refuse(ctx, client, prompt.id, prompt.agentSession.id, found, where, signal)
           continue
         }
@@ -390,10 +403,11 @@ export async function pollLinear(ctx: SourceContext, client: LinearClient, confi
   await followIssues(ctx, client, config, viewer, round, signal)
   await advanceChains(ctx, client, config, viewer, round, signal)
   prune(ctx)
-  if (failed || sessionsFailed) throw new Error('A Linear session or prompt was not taken in; the next round reads it again')
+  if (failed || sessionsFailed) throw new RoundFailed('A Linear session or prompt was not taken in; the next round reads it again', round)
   return round
 }
 
+const note = (list: string[], item: string) => { if (!list.includes(item)) list.push(item) }
 /** Says once, in the session, why a session or prompt was not taken in; `key` is the session or prompt it answers. */
 async function refuse(ctx: SourceContext, client: LinearClient, key: string, session: string, trigger: Trigger, route: Extract<Route, { kind: 'unmapped' | 'misrouted' }>,
   signal: AbortSignal): Promise<void> {
@@ -410,8 +424,13 @@ function unmappedText(trigger: Trigger): string {
 }
 
 const PRUNE_INTERVAL_MS = 3600_000
-const PRUNED = ['linear-seen:', 'linear-chain-run:', 'linear-completed:', 'linear-chain-held:']
-/** Hourly, drops once-only markers older than CLOSE_HORIZON_MS; a marker without a time gets one, to age from then. */
+const PRUNED = ['linear-seen:', 'linear-chain-run:', 'linear-completed:', 'linear-chain-held:', 'linear-follow-failed:', 'linear-linked:']
+const ISO_TIME = /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(\.\d+)?Z$/
+const storedTime = (value: unknown): string | undefined => {
+  const at = typeof value === 'object' && value !== null ? (value as { first?: unknown }).first : value
+  return typeof at === 'string' && ISO_TIME.test(at) ? at : undefined
+}
+/** Hourly, drops once-only markers older than CLOSE_HORIZON_MS, except a followed ticket's; a marker without a time gets one, to age from then. */
 function prune(ctx: SourceContext): void {
   const { keys } = ctx.state
   if (!keys) return
@@ -421,13 +440,20 @@ function prune(ctx: SourceContext): void {
   ctx.state.set(KEYS.pruned, now)
   if (!last) return
   const followed = new Set(ctx.state.get<string[]>(KEYS.followed) ?? [])
+  const sessions = new Set([...followed].flatMap(id => {
+    const ticket = ctx.tickets.get(id)
+    const session = ticket && ctx.triggers.get(ticket.origin.triggerId)?.meta.session
+    return typeof session === 'string' ? [session] : []
+  }))
+  const kept = (prefix: string, rest: string) => prefix === 'linear-linked:' ? sessions.has(rest.split(':')[0]!)
+    : (prefix === 'linear-completed:' || prefix === 'linear-follow-failed:') && followed.has(rest.split(':')[0]!)
   for (const prefix of PRUNED) {
     for (const key of keys(prefix)) {
-      if (prefix === 'linear-completed:' && followed.has(key.slice(prefix.length))) continue
+      if (kept(prefix, key.slice(prefix.length))) continue
       const value = ctx.state.get<unknown>(key)
-      const at = typeof value === 'string' ? Date.parse(value) : Number.NaN
-      if (Number.isNaN(at)) ctx.state.set(key, now)
-      else if (Date.now() - at >= CLOSE_HORIZON_MS) ctx.state.set(key, undefined)
+      const at = storedTime(value)
+      if (at === undefined) { if (typeof value !== 'object') ctx.state.set(key, now) }
+      else if (Date.now() - Date.parse(at) >= CLOSE_HORIZON_MS) ctx.state.set(key, undefined)
     }
   }
 }
@@ -456,18 +482,19 @@ async function followTickets(ctx: SourceContext, client: LinearClient, config: L
     if (!ticket || !origin) { followed.delete(id); continue }
     const session = String(origin.meta.session ?? ''), issue = String(origin.meta.issue ?? '')
     const own = ticket.execution?.repository ?? repositoryMeta(origin) ?? ctx.deployment.repository
+    let pending = false
     for (const follow of ticket.follows ?? []) {
       const pull = pullOf(follow.thread, ctx.deployment.repository)
       if (!pull) continue
       const url = ctx.threads.get(follow.thread)?.meta.url
       if (typeof url === 'string' && url && !ctx.state.get(KEYS.linked(session, url))) {
         const label = sameName(pull.repository, own) ? `Pull request #${pull.number}` : `Pull request ${pull.repository}#${pull.number}`
-        const done = await attempt(ctx, round, id, `link:${url}`, `linking ${url} into session ${session}`, () => client.addLinks(session, [{ label, url }], signal))
-        if (done) ctx.state.set(KEYS.linked(session, url), true)
+        if (await attempt(ctx, round, id, `link:${url}`, `linking ${url} into session ${session}`, () => client.addLinks(session, [{ label, url }], signal))) {
+          ctx.state.set(KEYS.linked(session, url), true)
+        } else pending = true
       }
     }
     const merged = (ticket.follows ?? []).some(follow => follow.own && follow.closed?.outcome === 'merged')
-    let pending = false
     if (merged && config.completeOnMerge && !ctx.state.get(KEYS.completed(id))) {
       if (await attempt(ctx, round, id, 'complete', `completing ${String(origin.meta.identifier ?? issue)}`, () => client.complete(issue, signal))) ctx.state.set(KEYS.completed(id), true)
       else pending = true
@@ -571,10 +598,9 @@ function reportClosed(ctx: SourceContext, closing: { id: string; issue: string }
 /** Reads every `pollSeconds` once setup finished, reporting the Source's health; three failed rounds in a row are an error. */
 export async function watchLinear(ctx: SourceContext, client: LinearClient, signal: AbortSignal, waker = new Waker()): Promise<void> {
   let last = ''
-  const report = (health: Parameters<SourceContext['report']>[1]) => {
+  const report = (health: Parameters<SourceContext['report']>[1], same = `${health.state}: ${health.detail ?? ''}`) => {
     ctx.report(HEALTH, health)
-    const line = `${health.state}: ${health.detail ?? ''}`
-    if (line !== last) { last = line; console.log(`dsh-superagent-linear: ${line}`) }
+    if (same !== last) { last = same; console.log(`dsh-superagent-linear: ${health.state}: ${health.detail ?? ''}`) }
   }
   await ctx.ready
   if (!ctx.configured()) { report({ state: 'paused', detail: 'Waiting for the deployment check' }); return }
@@ -607,7 +633,9 @@ export async function watchLinear(ctx: SourceContext, client: LinearClient, sign
         const blocked = error instanceof LinearError && error.throttled
         if (!signal.aborted && !(blocked && blockedBefore)) console.log(`dsh-superagent-linear: poll failed (${failures} in a row): ${String(error)}`)
         blockedBefore = blocked
-        if (!signal.aborted && (blocked || failures >= 3)) report({ state: 'error', at, detail: `${failures} failed polls in a row; last: ${String(error)}` })
+        const unreadable = error instanceof RoundFailed && error.round.contextFailed ? `; parent and sub-issues unreadable: ${error.round.contextFailed}` : ''
+        const same = blocked ? `error: blocked (${(error as LinearError).codes.join()})` : `error: ${String(error)}${unreadable}`
+        if (!signal.aborted && (blocked || failures >= 3)) report({ state: 'error', at, detail: `${failures} failed polls in a row; last: ${String(error)}${unreadable}` }, same)
       }
     }
     await waker.wait((config?.pollSeconds ?? 10) * 1000, signal)

@@ -296,7 +296,7 @@ describe('polling', () => {
     const h = context({ repositories: ['acme/widgets', 'acme/third'] })
     h.state.set(KEYS.sessions, T0); h.state.set(KEYS.prompts, T0)
     const round = await pollLinear(h.ctx, stub.client, config(), signal())
-    expect(round).toMatchObject({ sessions: 0, prompts: 0, skipped: ['OPS'], misrouted: ['OPS-2', 'OPS-2'] })
+    expect(round).toMatchObject({ sessions: 0, prompts: 0, skipped: ['OPS'], misrouted: ['OPS-2'] })
     expect(h.received).toEqual([])
     const text = 'Not taken in: OPS-2 works in acme/other, which this deployment does not serve.'
     expect(stub.activities).toEqual([{ id: stableUuid('misrouted:s2'), agentSessionId: 's2', content: { type: 'error', body: text } },
@@ -340,7 +340,7 @@ describe('polling', () => {
         session('s2', '2026-11-12T10:02:00.000Z', { issue: inProject(2, null) })],
         [prompt('a1', '2026-11-12T10:04:00.000Z', { agentSession: { id: 's1', issue: inProject(1, { id: 'p-z', name: 'Else' }) } })])
       expect(h.received).toEqual([])
-      expect(h.round).toMatchObject({ sessions: 0, prompts: 0, unmapped: ['WEB-1', 'WEB-2', 'WEB-1'], misrouted: [], skipped: [] })
+      expect(h.round).toMatchObject({ sessions: 0, prompts: 0, unmapped: ['WEB-1', 'WEB-2'], misrouted: [], skipped: [] })
       expect(h.activities.map(activity => [activity.agentSessionId, activity.content])).toEqual([
         ['s1', { type: 'error', body: 'Not taken in: team WEB names no repository for project Else.' }],
         ['s2', { type: 'error', body: 'Not taken in: team WEB names no repository for Issues without a project.' }],
@@ -455,6 +455,61 @@ describe('polling', () => {
     expect(reads.at(-1)).toBeUndefined()
     log.mockRestore()
   })
+  /** Linear's pages newest first, 25 at a time, with cursors that name an item, so new items do not shift them. */
+  function paged<T extends { id: string }>(items: () => T[], reads: (string | undefined)[], fail?: (after: string | undefined) => boolean) {
+    return (variables: Record<string, unknown>) => {
+      const after = variables.after as string | undefined
+      reads.push(after)
+      if (fail?.(after)) throw Object.assign(new Error('Invalid cursor'), { code: 'INVALID_INPUT' })
+      const list = items()
+      const start = after ? list.findIndex(item => item.id === after) + 1 : 0
+      const nodes = list.slice(start, start + 25)
+      return { nodes, pageInfo: { hasNextPage: start + 25 < list.length, endCursor: nodes.at(-1)?.id ?? null } }
+    }
+  }
+  const at = (n: number) => new Date(Date.parse(T0) + n * 1000).toISOString()
+  it('reads a prompts backlog the same way, and takes in a prompt that arrived meanwhile once the backlog is read', async () => {
+    const all = Array.from({ length: 260 }, (_, n) => prompt(`a${n}`, at(n + 1)))
+    const reads: (string | undefined)[] = []
+    const read = paged(() => [...all].reverse(), reads)
+    const stub = linear({ agentSessions: () => ({ agentSessions: page([]) }), agentActivities: variables => ({ agentActivities: read(variables) }) })
+    const h = context()
+    h.state.set(KEYS.sessions, T0); h.state.set(KEYS.prompts, T0)
+    const log = vi.spyOn(console, 'log').mockImplementation(() => {})
+    await pollLinear(h.ctx, stub.client, config(), signal())
+    expect(h.state.get(KEYS.promptsBacklog)).toMatchObject({ after: 'a10', newest: at(260) })
+    all.push(prompt('late', at(400)))
+    await pollLinear(h.ctx, stub.client, config(), signal())
+    expect(h.state.get(KEYS.prompts)).toBe(new Date(Date.parse(at(260)) - 5000).toISOString())
+    expect(h.received.map(trigger => trigger.id)).not.toContain('linear:prompt:late')
+    await pollLinear(h.ctx, stub.client, config(), signal())
+    expect(new Set(h.received.map(trigger => trigger.id)).size).toBe(261)
+    expect(h.received.map(trigger => trigger.id)).toContain('linear:prompt:late')
+    log.mockRestore()
+  })
+  it('goes on with a backlog after a restart, and drops it to read from the newest again when Linear refuses its cursor', async () => {
+    const all = Array.from({ length: 300 }, (_, n) => session(`s${n}`, at(n + 1)))
+    const reads: (string | undefined)[] = []
+    let refuse = false
+    const read = paged(() => [...all].reverse(), reads, after => refuse && after === 's50')
+    const handlers = { agentSessions: (variables: Record<string, unknown>) => ({ agentSessions: read(variables) }),
+      agentActivities: () => ({ agentActivities: page([]) }), agentActivityCreate: () => ({ agentActivityCreate: { success: true } }) }
+    const h = context()
+    h.state.set(KEYS.sessions, T0); h.state.set(KEYS.prompts, T0)
+    const log = vi.spyOn(console, 'log').mockImplementation(() => {})
+    await pollLinear(h.ctx, linear(handlers).client, config(), signal())
+    expect(h.state.get(KEYS.sessionsBacklog)).toMatchObject({ after: 's50' })
+    refuse = true
+    await pollLinear(h.ctx, linear(handlers).client, config(), signal())
+    expect(log).toHaveBeenCalledWith(expect.stringContaining('could not read linear-sessions-backlog on from its last page'))
+    expect(reads.slice(10, 12)).toEqual(['s50', undefined])
+    expect(h.state.get(KEYS.sessions)).toBe(T0)
+    refuse = false
+    await pollLinear(h.ctx, linear(handlers).client, config(), signal())
+    expect(new Set(h.received.map(trigger => trigger.id)).size).toBe(300)
+    expect(h.state.get(KEYS.sessions)).toBe(new Date(Date.parse(at(300)) - 5000).toISOString())
+    log.mockRestore()
+  })
   it('counts the replayed newest session and prompt only the first time', async () => {
     const stub = sources([session('s1', '2026-11-12T10:01:00.000Z')], [prompt('a1', '2026-11-12T10:02:00.000Z')])
     const h = context()
@@ -564,6 +619,24 @@ describe('polling', () => {
     vi.mocked(fresh.ctx.report).mockImplementation(() => { controller.abort() })
     await watchLinear(fresh.ctx, stub.client, controller.signal)
     expect(vi.mocked(fresh.ctx.report).mock.calls.at(-1)![1].detail).toContain('; pull request links or Issue completions failing: 1')
+  })
+  it('keeps an ended ticket followed while linking its pull request fails, and drops it once the link is in', async () => {
+    let failing = true
+    const stub = linear({ agentSessions: () => ({ agentSessions: page([]) }), agentActivities: () => ({ agentActivities: page([]) }),
+      agentSessionUpdate: () => { if (failing) throw new Error('Internal error'); return { agentSessionUpdate: { success: true } } } })
+    const origin = sessionTrigger(session('s1', T0), VIEWER)!
+    const ticket: Ticket = { id: 't1', origin: { triggerId: origin.id, triggerIds: [origin.id] }, follows: [{ thread: 'github:54', own: true }] }
+    const h = context({ tickets: [ticket], triggers: [origin], threads: { 'github:54': { url: 'https://github.com/acme/widgets/pull/54' } } })
+    h.state.set(KEYS.sessions, T0); h.state.set(KEYS.prompts, T0)
+    h.state.set(KEYS.followed, ['t1'])
+    const open = vi.spyOn(h.ctx.tickets, 'open').mockReturnValue([])
+    await pollLinear(h.ctx, stub.client, config(), signal())
+    expect(h.state.get(KEYS.followed)).toEqual(['t1'])
+    failing = false
+    await pollLinear(h.ctx, stub.client, config(), signal())
+    expect(h.state.get(KEYS.followed)).toEqual([])
+    expect(h.state.get(KEYS.followFailed('t1', 'link:https://github.com/acme/widgets/pull/54'))).toBeUndefined()
+    open.mockRestore()
   })
   it('labels a linked pull request by the ticket\'s repository, naming any other repository in full', async () => {
     const updates: { input: { addedExternalUrls: { label: string }[] } }[] = []
@@ -766,24 +839,53 @@ it('logs a failed poll once while the rate limit holds, and again once it change
   const log = vi.spyOn(console, 'log').mockImplementation(() => {})
   await watchLinear(h.ctx, stub.client, controller.signal, { wait: async () => {} } as unknown as Waker)
   expect(log.mock.calls.filter(([line]) => String(line).includes('poll failed'))).toHaveLength(1)
+  expect(log.mock.calls.filter(([line]) => String(line).includes('failed polls in a row'))).toHaveLength(1)
+  expect(vi.mocked(h.ctx.report).mock.calls.map(([, health]) => health.detail.split(' ')[0])).toEqual(['1', '2', '3', '4'])
   log.mockRestore()
 })
 
-it('drops once-only markers past the close horizon hourly, stamps those without a time, and keeps a followed ticket\'s completion', async () => {
+it('keeps the count of unreadable parents and sub-issues in health when the round fails for them', async () => {
+  const stub = linear({ agentSessions: () => ({ agentSessions: page([session('s1', '2026-11-12T10:01:00.000Z')]) }), agentActivities: () => ({ agentActivities: page([]) }),
+    agentActivityCreate: () => ({ agentActivityCreate: { success: true } }), IssueContext: () => { throw new Error('Internal error') } })
+  const h = context()
+  h.state.set(KEYS.sessions, '2026-11-12T10:00:00.000Z'); h.state.set(KEYS.prompts, '2026-11-12T10:00:00.000Z')
+  const controller = new AbortController()
+  vi.mocked(h.ctx.report).mockImplementation(() => { controller.abort() })
+  const log = vi.spyOn(console, 'log').mockImplementation(() => {})
+  await watchLinear(h.ctx, stub.client, controller.signal, { wait: async () => {} } as unknown as Waker)
+  expect(vi.mocked(h.ctx.report).mock.calls.at(-1)![1]).toMatchObject({ state: 'error',
+    detail: '3 failed polls in a row; last: Error: A Linear session or prompt was not taken in; the next round reads it again; parent and sub-issues unreadable: 1' })
+  log.mockRestore()
+})
+
+it('drops once-only markers past the close horizon hourly, stamps those without a time, and keeps a followed ticket\'s', async () => {
   const stub = linear({ agentSessions: () => ({ agentSessions: page([]) }), agentActivities: () => ({ agentActivities: page([]) }) })
   const origin = sessionTrigger(session('s1', '2026-11-12T10:00:00.000Z'), VIEWER)!
   const h = context({ tickets: [{ id: 't-open', origin: { triggerId: origin.id, triggerIds: [origin.id] } }], triggers: [origin] })
   h.state.set(KEYS.sessions, '2026-11-12T10:00:00.000Z'); h.state.set(KEYS.prompts, '2026-11-12T10:00:00.000Z')
   const old = new Date(Date.now() - CLOSE_HORIZON_MS - 1000).toISOString()
   h.state.set(KEYS.seen('s-old'), old); h.state.set(KEYS.seen('s-legacy'), true); h.state.set(CHAIN_KEYS.run('p-old'), old)
-  h.state.set(CHAIN_KEYS.held('s-held'), old); h.state.set(KEYS.completed('t-done'), old); h.state.set(KEYS.completed('t-open'), old)
+  h.state.set(CHAIN_KEYS.run('p-issue'), 'issue-1'); h.state.set(CHAIN_KEYS.run('p-date-like'), '2026-11-12'); h.state.set(CHAIN_KEYS.held('s-held'), old)
+  h.state.set(KEYS.completed('t-done'), true); h.state.set(KEYS.completed('t-open'), true)
+  h.state.set(KEYS.linked('s-gone', 'https://x/1'), true); h.state.set(KEYS.linked('s1', 'https://x/2'), true)
+  h.state.set(KEYS.followFailed('t-gone', 'complete'), { first: old, count: 9 }); h.state.set(KEYS.followFailed('t-open', 'complete'), { first: old, count: 9 })
   await pollLinear(h.ctx, stub.client, config(), signal())
   expect(h.state.get(KEYS.seen('s-old'))).toBe(old)
-  h.state.set(KEYS.pruned, new Date(Date.now() - 3600_000 - 1000).toISOString())
+  const hourLater = () => h.state.set(KEYS.pruned, new Date(Date.now() - 3600_000 - 1000).toISOString())
+  hourLater()
   await pollLinear(h.ctx, stub.client, config(), signal())
-  expect([KEYS.seen('s-old'), CHAIN_KEYS.run('p-old'), CHAIN_KEYS.held('s-held'), KEYS.completed('t-done')].map(key => h.state.has(key))).toEqual([false, false, false, false])
-  expect(Date.parse(h.state.get(KEYS.seen('s-legacy')) as string)).toBeGreaterThan(Date.now() - 60_000)
-  expect(h.state.get(KEYS.completed('t-open'))).toBe(old)
+  expect([KEYS.seen('s-old'), CHAIN_KEYS.run('p-old'), CHAIN_KEYS.held('s-held'), KEYS.followFailed('t-gone', 'complete')].map(key => h.state.has(key)))
+    .toEqual([false, false, false, false])
+  const stamped = [KEYS.seen('s-legacy'), CHAIN_KEYS.run('p-issue'), CHAIN_KEYS.run('p-date-like'), KEYS.completed('t-done'), KEYS.linked('s-gone', 'https://x/1')]
+  for (const key of stamped) expect(Date.parse(h.state.get(key) as string)).toBeGreaterThan(Date.now() - 60_000)
+  expect([h.state.get(KEYS.completed('t-open')), h.state.get(KEYS.linked('s1', 'https://x/2'))]).toEqual([true, true])
+  expect(h.state.get(KEYS.followFailed('t-open', 'complete'))).toEqual({ first: old, count: 9 })
+  vi.spyOn(Date, 'now').mockReturnValue(Date.now() + CLOSE_HORIZON_MS + 3600_000)
+  hourLater()
+  await pollLinear(h.ctx, stub.client, config(), signal())
+  vi.restoreAllMocks()
+  expect(stamped.map(key => h.state.has(key))).toEqual([false, false, false, false, false])
+  expect(h.state.get(KEYS.completed('t-open'))).toBe(true)
 })
 
 it('passes only a well-formed Issue identifier and a linear.app Issue url to workers', () => {
