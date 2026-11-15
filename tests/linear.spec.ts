@@ -27,6 +27,8 @@ const issue = (team = TEAM, n = 1) => ({ id: `issue-${n}`, identifier: `${KEYS_O
   url: `https://linear.app/x/issue/WEB-${n}`, team: { id: team, key: KEYS_OF[team]! } })
 const session = (id: string, at: string, fields: Partial<Session> = {}): Session => ({ id, createdAt: at, url: `https://linear.app/x/session/${id}`,
   creator: { id: OWNER, name: 'Owner' }, appUser: { id: VIEWER }, comment: null, issue: issue(), ...fields })
+const PLACEHOLDER = { id: 'c0', body: 'This thread is for an agent session with dsh.', user: null, botActor: { type: 'system', name: 'Linear' } }
+const said = (id: string, body: string) => ({ id, body, user: { id: OWNER, name: 'Owner', app: false }, botActor: null })
 const prompt = (id: string, at: string, fields: Partial<Prompt> = {}): Prompt => ({ id, createdAt: at, signal: null, content: { body: 'Also the header' },
   user: { id: OWNER, name: 'Owner' }, agentSession: { id: 's1', issue: issue() }, ...fields })
 
@@ -161,6 +163,14 @@ describe('token', () => {
     const nulled = { data: { agentSessions: { nodes: [{ ...session('s1', '2026-11-12T10:01:00.000Z'), issue: null }], pageInfo: { hasNextPage: false, endCursor: null } } },
       errors: [{ message: 'Forbidden', path: ['agentSessions', 'nodes', 0, 'issue'] }] }
     await expect(answer(nulled).sessions('2026-11-12T10:00:00.000Z')).rejects.toThrow('Forbidden')
+    for (const path of [['agentSessions', 'nodes', 0, 'comment'], ['agentSessions', 'nodes', 0, 'comment', 'user']]) {
+      const comment = path.length === 4 ? null : { id: 'c0', body: 'This thread is for an agent session with dsh.', user: null, botActor: null }
+      const noAuthor = { data: { agentSessions: { nodes: [session('s1', '2026-11-12T10:01:00.000Z', { comment })], pageInfo: { hasNextPage: false, endCursor: null } } },
+        errors: [{ message: 'Forbidden: comment author', path }] }
+      const read = await answer(noAuthor).sessions('2026-11-12T10:00:00.000Z')
+      expect(read.items.map(item => sessionTrigger(item, VIEWER)!.text)).toEqual(['WEB-1: Fix the footer\n\nIt overlaps.'])
+      expect(log).toHaveBeenCalledWith('dsh-superagent-linear: Linear answered in part: Forbidden: comment author')
+    }
     const chain = (path: unknown[]) => ({ data: { issue: { id: 'e', identifier: 'WEB-10', state: { type: 'started' }, delegate: { id: VIEWER },
       children: { nodes: [{ id: 'k', identifier: 'WEB-2', title: 'Part', state: { type: 'started' }, assignee: null, subIssueSortOrder: 1,
         inverseRelations: { nodes: [{ type: 'blocks', issue: null }], pageInfo: { hasNextPage: false } } }], pageInfo: { hasNextPage: false } } } },
@@ -187,11 +197,20 @@ describe('translation', () => {
       actor: { source: 'linear', id: OWNER }, human: true, addressed: 'direct', text: 'WEB-1: Fix the footer\n\nIt overlaps.',
       channel: { source: 'linear', thread: 'linear:issue:issue-1', address: { session: 's1', issue: 'issue-1', team: TEAM, teamKey: 'WEB', identifier: 'WEB-1' } },
       meta: { team: TEAM, identifier: 'WEB-1', session: 's1', kind: 'session' } })
-    expect(sessionTrigger(session('s1', '2026-11-12T10:00:00.000Z', { comment: { id: 'c1', body: '@agent please fix' } }), VIEWER)!.text)
-      .toBe('@agent please fix\n\n(WEB-1: Fix the footer)')
+    expect(sessionTrigger(session('s1', '2026-11-12T10:00:00.000Z', { comment: said('c1', '@agent please fix') }), VIEWER)!.text)
+      .toBe('@agent please fix\n\n(WEB-1: Fix the footer)\n\nIt overlaps.')
     expect(promptTrigger(prompt('a1', '2026-11-12T10:01:00.000Z'), VIEWER)).toMatchObject({ id: 'linear:prompt:a1', text: 'Also the header',
       threads: [{ id: 'issue:issue-1' }], meta: { session: 's1', activity: 'a1', kind: 'prompt' } })
     expect(trigger.meta).not.toHaveProperty('labels')
+  })
+  it('takes a session comment as the prompt only when a person wrote it, and the description once', () => {
+    const at = '2026-11-12T10:00:00.000Z'
+    expect(sessionTrigger(session('s1', at, { comment: PLACEHOLDER }), VIEWER)!.text).toBe('WEB-1: Fix the footer\n\nIt overlaps.')
+    expect(sessionTrigger(session('s1', at, { comment: { ...said('c1', 'Posted by an app'), user: { id: 'bot-1', app: true } } }), VIEWER)!.text).toBe('WEB-1: Fix the footer\n\nIt overlaps.')
+    expect(sessionTrigger(session('s1', at, { comment: { ...said('c1', 'Echo'), user: { id: VIEWER, app: false } } }), VIEWER)!.text).toBe('WEB-1: Fix the footer\n\nIt overlaps.')
+    expect(sessionTrigger(session('s1', at, { comment: { ...said('c1', 'Synced from an integration'), botActor: { type: 'integration', name: 'Slack' } } }), VIEWER)!.text).toBe('WEB-1: Fix the footer\n\nIt overlaps.')
+    expect(sessionTrigger(session('s1', at, { comment: said('c1', ' It overlaps. ') }), VIEWER)!.text).toBe('It overlaps.\n\n(WEB-1: Fix the footer)')
+    expect(sessionTrigger(session('s1', at, { comment: said('c1', '@agent go'), issue: { ...issue(), description: null } }), VIEWER)!.text).toBe('@agent go\n\n(WEB-1: Fix the footer)')
   })
   it('carries the Issue\'s label names on session and prompt Triggers, and none when it has no labels', () => {
     const labelled = { ...issue(), labels: { nodes: [{ name: 'hard' }, { name: 'Bug' }] } }
@@ -2044,6 +2063,23 @@ describe('chain', () => {
     expect(closedKids.stub.calls.filter(call => call.query?.includes('EpicCheck'))).toHaveLength(0)
   })
 
+  it('starts the chain of an Issue delegated with Linear\'s own thread comment, and asks for "start" when its sub-issues are unreadable', async () => {
+    const w = world()
+    w.epic(); w.kid(2)
+    w.delegate('es1', 'epic-1', { id: OWNER, name: 'Owner' }, { comment: PLACEHOLDER })
+    await w.round()
+    expect(w.record()).toMatchObject({ run: 'es1', session: 'es1', status: 'running' })
+    expect(w.startedKids()).toEqual(['WEB-2'])
+    const held = world()
+    held.epic(); held.kid(2)
+    held.delegate('es1', 'epic-1', { id: OWNER, name: 'Owner' }, { comment: PLACEHOLDER })
+    held.failures.IssueContext = 99
+    await expect(held.round()).rejects.toThrow('not taken in')
+    held.state.set(CHAIN_KEYS.held('es1'), new Date(Date.now() - HOLD_MS - 1000).toISOString())
+    await held.round()
+    expect(held.activities.at(-1)).toEqual({ session: 'es1', type: 'error', body: 'Could not read the sub-issues of WEB-10; write exactly "start" in this session to retry.' })
+  })
+
   it('stops holding a delegated session whose sub-issues stay unreadable for 10 minutes, says so once, and moves the cursor on', async () => {
     const w = world()
     w.epic(); w.kid(2)
@@ -2075,7 +2111,7 @@ describe('chain', () => {
   })
 
   it('starts no chain on a mention of an Issue with sub-issues, and answers with the chain\'s status', async () => {
-    for (const fields of [{ comment: { id: 'c1', body: '@dsh status?' } }, { issue: { ...chainSession('x', { id: 'epic-1', identifier: 'WEB-10', state: 'started', delegate: null, more: false }, T0).issue! } }]) {
+    for (const fields of [{ comment: said('c1', '@dsh status?') }, { issue: { ...chainSession('x', { id: 'epic-1', identifier: 'WEB-10', state: 'started', delegate: null, more: false }, T0).issue! } }]) {
       const w = world()
       w.epic(); w.kid(2)
       w.delegate('m1', 'epic-1', { id: OWNER }, { ...fields, appUser: { id: VIEWER, name: 'dsh' } })
@@ -2088,7 +2124,7 @@ describe('chain', () => {
     w.epic(); w.kid(2)
     w.delegate('es1')
     await w.round()
-    w.delegate('m2', 'epic-1', { id: OWNER }, { comment: { id: 'c2', body: '@dsh?' }, appUser: { id: VIEWER, name: 'dsh' } })
+    w.delegate('m2', 'epic-1', { id: OWNER }, { comment: said('c2', '@dsh?'), appUser: { id: VIEWER, name: 'dsh' } })
     await w.round()
     expect(w.record()!.run).toBe('es1')
     expect(w.activities.at(-1)).toEqual({ session: 'm2', type: 'thought', body: 'Working on WEB-2 of WEB-10. A stop in this session ends the chain.' })
@@ -2205,7 +2241,7 @@ describe('chain', () => {
       const w = world()
       w.epic().delegate = null; w.kid(2)
       w.epic('epic-2', 'WEB-20'); w.kid(5, { epic: 'epic-2' })
-      w.delegate('m1', 'epic-1', { id: OWNER }, { comment: { id: 'c1', body: '@dsh status?' } })
+      w.delegate('m1', 'epic-1', { id: OWNER }, { comment: said('c1', '@dsh status?') })
       await w.round()
       w.redelegate('h2', undefined, 'epic-2')
       await w.round()
@@ -2222,7 +2258,7 @@ describe('chain', () => {
     it('starts nothing from later changes of an Issue an app delegated to itself', async () => {
       const w = world()
       w.epic().delegate = null; w.kid(2)
-      w.delegate('m1', 'epic-1', { id: OWNER }, { comment: { id: 'c1', body: '@dsh status?' } })
+      w.delegate('m1', 'epic-1', { id: OWNER }, { comment: said('c1', '@dsh status?') })
       await w.round()
       w.redelegate('h1', { id: 'bot-1', name: 'Agent', app: true })
       await w.round()

@@ -113,7 +113,7 @@ For each session after the cursor, the round:
 2. Routes the Issue to a repository (see [Routing](#routing)). A misrouted or unmapped Issue gets one `error` activity and is left out.
 3. Posts the ephemeral "Received." thought once per session.
 4. Reads the Issue context (parent and up to 30 sub-issues) once per new Trigger.
-5. For an Issue with sub-issues: a person's delegation, without a comment, starts a chain when `admits` lets that person; otherwise it gets the refusal. A person's mention gets the chain status. Nothing else follows.
+5. For an Issue with sub-issues: a person's delegation, without a comment from a person, starts a chain when `admits` lets that person; otherwise it gets the refusal. A person's mention gets the chain status. Nothing else follows.
 6. For a new session whose context could not be read: holds it for up to 10 minutes by failing its take-in, then posts an error and drops it. Unknown sub-issues could make the Issue an epic, which never gets a worker of its own.
 7. Otherwise adds the context header, applies split mode, and calls `receive`.
 

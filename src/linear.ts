@@ -111,13 +111,23 @@ export function meta(issue: Issue, session: string, kind: string) {
     ...issue.delegate ? { delegate: issue.delegate.id } : {}, ...issue.labels?.nodes.length ? { labels: issue.labels.nodes.map(label => label.name) } : {} }
 }
 
+/** The session's thread comment when a person wrote it; Linear opens a delegated session's thread with a comment of its own. */
+export function personComment(session: Session, viewer: string): string | undefined {
+  const comment = session.comment
+  if (!comment?.body?.trim() || comment.botActor || !comment.user || comment.user.app || comment.user.id === viewer) return undefined
+  return comment.body.trim()
+}
 /** The Trigger of a session a person started by delegating an issue to the app or mentioning it; the app's own sessions produce none. */
 export function sessionTrigger(session: Session, viewer: string): Trigger | undefined {
   const issue = session.issue
   if (!issue || session.creator?.id === viewer) return undefined
   const url = session.url ?? issue.url
   const subject = `${issue.identifier}: ${issue.title}`
-  const text = session.comment?.body ? `${session.comment.body}\n\n(${subject})` : `${subject}\n\n${issue.description ?? ''}`.trim()
+  const said = personComment(session, viewer)
+  const description = issue.description?.trim() ?? ''
+  const text = said
+    ? [said, `(${subject})`, said === description ? '' : description].filter(Boolean).join('\n\n')
+    : `${subject}\n\n${description}`.trim()
   return { id: `linear:session:${session.id}`, source: SOURCE, threads: [{ source: SOURCE, id: threadOf(issue.id) }],
     actor: { source: SOURCE, id: session.creator?.id ?? '' }, human: !!session.creator, addressed: 'direct', at: session.createdAt, text,
     channel: channel(issue, session.id, url), url, meta: meta(issue, session.id, 'session') }
@@ -338,7 +348,7 @@ export async function pollLinear(ctx: SourceContext, client: LinearClient, confi
       if (context) releaseHold(ctx, session.id)
       // An Issue with sub-issues is worked through them; it never gets a worker of its own.
       if (context?.children.nodes.length) {
-        const delegation = found.human && session.issue?.delegate?.id === viewer && !session.comment
+        const delegation = found.human && session.issue?.delegate?.id === viewer && !personComment(session, viewer)
         if (delegation && mayControl(ctx, found.actor.id)) {
           await startChain(ctx, client, session, context, viewer, config.chainParallel, signal)
           round.sessions++
@@ -349,7 +359,7 @@ export async function pollLinear(ctx: SourceContext, client: LinearClient, confi
       // Unknown sub-issues could make the Issue an epic, which never gets a worker of its own; it waits for a readable round.
       if (fresh && !context) {
         holdUnreadable(ctx, session.id)
-        const delegated = session.issue?.delegate?.id === viewer && !session.comment
+        const delegated = session.issue?.delegate?.id === viewer && !personComment(session, viewer)
         await client.activity(session.id, stableUuid(`unreadable:${session.id}`), { type: 'error', body: unreadableText(String(found.meta.identifier), delegated) }, false, signal)
           .catch((error: unknown) => { if (!(error instanceof LinearError && error.gone)) throw error })
         ctx.state.set(CHAIN_KEYS.run(session.id), String(trigger.meta.issue))
