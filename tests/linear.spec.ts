@@ -8,7 +8,7 @@ import { LinearClient, MINT_INTERVAL_MS, SCOPE, stableUuid, type IssueContext, t
 import { CLOSE_HORIZON_MS, DELEGATION_INTERVAL_MS, FOLLOW_RETRY_MS, KEYS, PARENT_DESCRIPTION_LIMIT, LinearConfigSchema, pullOf, undelegationTrigger, linearKind, pollLinear, promptTrigger, sendLinear, sessionTrigger, SPLIT_LINE, watchLinear, withContext, withMode, type LinearConfig } from '../src/linear.ts'
 import { apply } from '../src/index.ts'
 import type { Waker } from '../src/webhook.ts'
-import { ADOPT_MS, CHAIN_KEYS, HOLD_MS, type ChainRecord } from '../src/linear-chain.ts'
+import { ADOPT_MS, CHAIN_KEYS, DELEGATION_GRACE_MS, HOLD_MS, REDELEGATION_GIVE_UP_MS, ownSession, type ChainRecord } from '../src/linear-chain.ts'
 import type { OutboundMessage, SourceContext, Ticket, Trigger } from '../src/types.ts'
 
 const VIEWER = 'app-user', OWNER = 'owner-1', TEAM = 'team-web', OTHER_TEAM = 'team-ops'
@@ -242,6 +242,14 @@ describe('translation', () => {
     expect(promptTrigger(prompt('a3', '2026-11-12T10:00:00.000Z', { user: { id: VIEWER } }), VIEWER)).toBeUndefined()
     expect(sessionTrigger(session('s3', '2026-11-12T10:00:00.000Z', { issue: null }), VIEWER)).toBeUndefined()
   })
+  it('puts the Issue text after the person\'s words in a prompt that starts a ticket, keeps a follow-up bare, and a stop unchanged', () => {
+    const at = '2026-11-12T10:01:00.000Z'
+    expect(promptTrigger(prompt('a1', at), VIEWER, true)).toMatchObject({ id: 'linear:prompt:a1', text: 'Also the header\n\n(WEB-1: Fix the footer)\n\nIt overlaps.' })
+    expect(promptTrigger(prompt('a1', at), VIEWER, false)!.text).toBe('Also the header')
+    expect(promptTrigger(prompt('a1', at, { content: { body: '' } }), VIEWER, true)!.text).toBe('WEB-1: Fix the footer\n\nIt overlaps.')
+    expect(promptTrigger(prompt('a2', at, { signal: 'stop', content: { body: 'enough' } }), VIEWER, true))
+      .toMatchObject({ id: 'linear:prompt:a2', text: 'Stop requested in Linear.\n\nenough', meta: { signal: 'stop' } })
+  })
   it('listens to the configured teams by key or id, leaves switched-off ones out, and offers a sessions-only admission row per team', () => {
     const kind = linearKind(linear().client)
     expect(kind.scope!({ meta: { team: TEAM, teamKey: 'web' } }, config())).toEqual({ listened: true, observed: false, row: 'WEB' })
@@ -296,6 +304,18 @@ describe('polling', () => {
     expect(h.state.get(KEYS.prompts)).toBe('2026-11-12T10:03:55.000Z')
     await pollLinear(h.ctx, stub.client, config(), signal())
     expect(stub.activities).toHaveLength(2)
+  })
+  it('gives a prompt that starts a ticket the Issue text, and passes a prompt to an open ticket as written', async () => {
+    const stub = sources([], [prompt('a1', '2026-11-12T10:01:00.000Z', { content: { body: 'start please' } })])
+    const h = context()
+    h.state.set(KEYS.sessions, T0); h.state.set(KEYS.prompts, T0)
+    await pollLinear(h.ctx, stub.client, config(), signal())
+    expect(h.received.map(trigger => [trigger.id, trigger.text])).toEqual([['linear:prompt:a1', 'start please\n\n(WEB-1: Fix the footer)\n\nIt overlaps.']])
+    const origin = sessionTrigger(session('s1', T0), VIEWER)!
+    const open = context({ tickets: [{ id: 't1', origin: { triggerId: origin.id, triggerIds: [origin.id] } }], triggers: [origin] })
+    open.state.set(KEYS.sessions, T0); open.state.set(KEYS.prompts, T0)
+    await pollLinear(open.ctx, sources([], [prompt('a1', '2026-11-12T10:01:00.000Z', { content: { body: 'start please' } })]).client, config(), signal())
+    expect(open.received.map(trigger => [trigger.id, trigger.text])).toEqual([['linear:prompt:a1', 'start please']])
   })
   it('takes in a team on an additional repository with that repository\'s canonical name, and leaves the primary\'s Triggers unchanged', async () => {
     const stub = sources([session('s1', '2026-11-12T10:01:00.000Z'), session('s2', '2026-11-12T10:02:00.000Z', { issue: issue(OTHER_TEAM, 2) })],
@@ -1123,7 +1143,7 @@ describe('issue context', () => {
     expect(round.contextFailed).toBe(0)
     expect(h.received[0]!.text).toBe(`${PARENT_LINE}\n\n${base().text}\n${TITLE_BLOCK}`)
     expect(h.received[0]!.meta).toMatchObject({ parent: 'issue-0', children: 0 })
-    expect(h.received[1]!.text).toBe('Also the header')
+    expect(h.received[1]!.text).toBe('Also the header\n\n(WEB-1: Fix the footer)\n\nIt overlaps.')
     await pollLinear(h.ctx, stub.client, config(), signal())
     expect(h.received.map(trigger => trigger.id)).toContain('linear:session:s1')
     expect(stub.reads).toHaveLength(1)
@@ -1270,9 +1290,10 @@ describe('split mode', () => {
 describe('chain', () => {
   const T0 = '2026-11-12T10:00:00.000Z'
   type Kid = { id: string; identifier: string; state: string; order: number | null; blockedBy: string[]; labels: string[]; epic: string; team: string; assignee?: string }
-  type Epic = { id: string; identifier: string; state: string; delegate: string | null; more: boolean; updatedAt?: string }
+  type Epic = { id: string; identifier: string; state: string; delegate: string | null; more: boolean; updatedAt?: string; team?: string; labels?: string[] }
   const chainSession = (id: string, epic: Epic, at: string) => session(id, at, { issue: { id: epic.id, identifier: epic.identifier, title: 'The epic',
-    description: 'Do it all.', url: `https://linear.app/x/issue/${epic.identifier}`, team: { id: TEAM, key: 'WEB' }, ...epic.delegate ? { delegate: { id: epic.delegate } } : {} } })
+    description: 'Do it all.', url: `https://linear.app/x/issue/${epic.identifier}`, team: { id: epic.team ?? TEAM, key: KEYS_OF[epic.team ?? TEAM]! },
+    ...epic.delegate ? { delegate: { id: epic.delegate } } : {} } })
 
   function world(parallel = 2) {
     const kids = new Map<string, Kid>(), epics = new Map<string, Epic>()
@@ -1285,6 +1306,7 @@ describe('chain', () => {
     const hooks: { complete?: (id: string) => void } = {}
     const history = new Map<string, Record<string, unknown>[]>()
     const delegateReads: string[][] = [], historyReads: string[] = [], delegatedReads: string[] = []
+    const gone = new Set<string>()
     let relationsMore = false
     const failing = (operation: string) => { if (failures[operation]) { failures[operation]--; throw new Error('Internal error') } }
     const kidsOf = (epic: string) => [...kids.values()].filter(kid => kid.epic === epic)
@@ -1323,7 +1345,8 @@ describe('chain', () => {
       },
       ChainChild: variables => {
         const epic = epics.get(String(variables.id))
-        if (epic) return { issue: { ...chainSession('x', epic, T0).issue!, labels: { nodes: [] } } }
+        if (gone.has(String(variables.id))) throw Object.assign(new Error('Entity not found'), { code: 'NOT_FOUND' })
+        if (epic) return { issue: { ...chainSession('x', epic, T0).issue!, state: { type: epic.state }, labels: { nodes: (epic.labels ?? []).map(name => ({ name })) } } }
         const kid = kids.get(String(variables.id))!
         return { issue: { id: kid.id, identifier: kid.identifier, title: `Part ${kid.identifier}`, description: 'Make the part.', url: `https://linear.app/x/issue/${kid.identifier}`,
           team: { id: kid.team, key: KEYS_OF[kid.team] }, delegate: null, project: null, labels: { nodes: kid.labels.map(name => ({ name })) } } }
@@ -1364,7 +1387,7 @@ describe('chain', () => {
     let minute = 0
     const at = () => `2026-11-12T10:${String(++minute).padStart(2, '0')}:00.000Z`
     const w = {
-      ...h, stub, kids, epics, foreign, sessions, prompts, tickets, created, activities, completed, failures, hooks, history, delegateReads, historyReads, delegatedReads, autoTicket: true,
+      ...h, stub, kids, epics, foreign, sessions, prompts, tickets, created, activities, completed, failures, hooks, history, delegateReads, historyReads, delegatedReads, gone, autoTicket: true,
       redelegate(id: string, actor: Record<string, unknown> | null = { id: OWNER, name: 'Owner', app: false }, epic = 'epic-1', botActor: Record<string, unknown> | null = null) {
         const now = new Date().toISOString()
         Object.assign(epics.get(epic)!, { delegate: VIEWER, updatedAt: now })
@@ -2228,13 +2251,18 @@ describe('chain', () => {
       expect(w.historyReads).toEqual(['epic-1'])
     })
 
-    it('starts nothing on an Issue without open sub-issues', async () => {
+    it('starts nothing on an Issue whose sub-issues are all closed, and says so once in its known session', async () => {
       const w = await stoppedChain()
       w.close(2); w.close(3)
       w.redelegate('h1')
       await w.round()
+      settle(w)
+      await w.round(); await w.round()
       expect(w.record()).toMatchObject({ run: 'es1', status: 'stopped' })
       expect(w.chainTriggers()).toHaveLength(2)
+      expect(w.created).toHaveLength(2)
+      expect(w.activities.filter(activity => activity.body.startsWith('All sub-issues of WEB-10'))).toEqual([
+        { session: 'es1', type: 'thought', body: 'All sub-issues of WEB-10 are done; nothing to start. Add an open sub-issue and delegate it again to start a chain.' }])
     })
 
     it('starts from a session it saw on an undelegated Issue, and reads no history for an Issue it never knew', async () => {
@@ -2337,6 +2365,351 @@ describe('chain', () => {
       w.failures.DelegatedIssues = 1
       await w.round()
       expect(w.state.get(CHAIN_KEYS.delegated)).toBe(checked)
+    })
+
+    describe('of an Issue without sub-issues', () => {
+      const LEAF_TEXT = 'WEB-30: The epic\n\nDo it all.'
+      function leafWorld(watched = true) {
+        const w = world()
+        w.epic('leaf-1', 'WEB-30').delegate = null
+        if (watched) w.state.set(CHAIN_KEYS.watched, { 'leaf-1': { session: 'old-1', at: new Date(Date.now() - 3600_000).toISOString() } })
+        return w
+      }
+      const ripen = (w: ReturnType<typeof world>) => {
+        const pending = w.state.get(CHAIN_KEYS.redelegations) as Record<string, { at: string }> | undefined
+        if (pending) w.state.set(CHAIN_KEYS.redelegations, Object.fromEntries(Object.entries(pending).map(([issue, entry]) =>
+          [issue, { ...entry, at: new Date(Date.now() - DELEGATION_GRACE_MS).toISOString() }])))
+      }
+      const delegations = (w: ReturnType<typeof world>) => w.received.filter(trigger => trigger.id.startsWith('linear:delegation:'))
+
+      it('starts one run in a new session of its own with the full Issue text once the grace has passed, also across later polls', async () => {
+        for (const watched of [true, false]) {
+          const w = leafWorld(watched)
+          w.redelegate('h1', undefined, 'leaf-1')
+          await w.round()
+          expect(delegations(w)).toEqual([])
+          expect(w.created).toEqual([])
+          ripen(w)
+          await w.round()
+          expect(w.created).toEqual([{ issue: 'leaf-1', id: 'cs-1' }])
+          expect(delegations(w)).toHaveLength(1)
+          expect(delegations(w)[0]).toMatchObject({ id: 'linear:delegation:h1', text: LEAF_TEXT, actor: { id: OWNER }, human: true,
+            channel: { address: { session: 'cs-1', issue: 'leaf-1' } }, meta: { issue: 'leaf-1', identifier: 'WEB-30', session: 'cs-1', kind: 'session', delegate: VIEWER } })
+          expect(w.activities.filter(activity => activity.session === 'cs-1').map(activity => activity.body)).toEqual(['Received.'])
+          expect(ownSession(w.ctx, 'cs-1')).toBe(true)
+          settle(w)
+          await w.round(); await w.round()
+          w.epics.get('leaf-1')!.updatedAt = new Date().toISOString()
+          await w.round()
+          expect(w.created).toHaveLength(1)
+          expect(delegations(w)).toHaveLength(1)
+          expect(w.state.get(CHAIN_KEYS.redelegations)).toBeUndefined()
+        }
+      })
+
+      it('leaves a delegation that opened a session of its own to that session', async () => {
+        const w = leafWorld(false)
+        w.redelegate('h1', undefined, 'leaf-1')
+        w.delegate('ls1', 'leaf-1', undefined, { createdAt: new Date(Date.now() + 1000).toISOString() })
+        await w.round()
+        ripen(w)
+        await w.round()
+        expect([...new Set(w.received.map(trigger => trigger.id))]).toEqual(['linear:session:ls1'])
+        expect(w.created).toEqual([])
+        expect(w.state.get(CHAIN_KEYS.redelegations)).toBeUndefined()
+      })
+
+      it('starts nothing while a ticket of the Issue is open', async () => {
+        const w = leafWorld(false)
+        w.delegate('ls1', 'leaf-1')
+        await w.round()
+        w.tickets.push({ id: 'leaf-ticket', origin: { triggerId: 'linear:session:ls1', triggerIds: ['linear:session:ls1'] } })
+        w.redelegate('h1', undefined, 'leaf-1')
+        await w.round()
+        ripen(w)
+        await w.round()
+        expect(delegations(w)).toEqual([])
+        expect(w.created).toEqual([])
+      })
+
+      it('queues a re-delegation made while the Issue\'s earlier ticket is still open, and starts one run once it ended', async () => {
+        const w = leafWorld(false)
+        w.delegate('ls1', 'leaf-1')
+        await w.round()
+        w.tickets.push({ id: 'leaf-ticket', origin: { triggerId: 'linear:session:ls1', triggerIds: ['linear:session:ls1'] } })
+        w.redelegate('h1', undefined, 'leaf-1')
+        await w.round()
+        ripen(w); settle(w)
+        await w.round(); await w.round()
+        expect(delegations(w)).toEqual([])
+        expect(w.created).toEqual([])
+        expect(Object.keys(w.state.get(CHAIN_KEYS.redelegations) as object)).toEqual(['leaf-1'])
+        w.tickets[0]!.ended = { at: new Date().toISOString() }
+        await w.round(); await w.round(); await w.round()
+        expect(w.created).toEqual([{ issue: 'leaf-1', id: 'cs-1' }])
+        expect(delegations(w).map(trigger => trigger.id)).toEqual(['linear:delegation:h1'])
+        expect(w.state.get(CHAIN_KEYS.redelegations)).toBeUndefined()
+      })
+
+      it('drops a queued re-delegation quietly when the Issue was completed or canceled by the time its earlier ticket ended', async () => {
+        for (const state of ['completed', 'canceled']) {
+          const w = leafWorld(false)
+          w.delegate('ls1', 'leaf-1')
+          await w.round()
+          w.tickets.push({ id: 'leaf-ticket', origin: { triggerId: 'linear:session:ls1', triggerIds: ['linear:session:ls1'] } })
+          w.redelegate('h1', undefined, 'leaf-1')
+          await w.round()
+          ripen(w); settle(w)
+          await w.round()
+          w.tickets[0]!.ended = { at: new Date().toISOString() }
+          w.epics.get('leaf-1')!.state = state
+          const before = w.activities.length
+          await w.round(); await w.round()
+          expect(w.created).toEqual([])
+          expect(delegations(w)).toEqual([])
+          expect(w.activities.slice(before)).toEqual([])
+          expect(w.state.get(CHAIN_KEYS.redelegations)).toBeUndefined()
+        }
+      })
+
+      it('tells the session it opened when a queued re-delegation\'s Issue closed before its Trigger', async () => {
+        const w = leafWorld(false)
+        w.delegate('ls1', 'leaf-1')
+        await w.round()
+        w.tickets.push({ id: 'leaf-ticket', origin: { triggerId: 'linear:session:ls1', triggerIds: ['linear:session:ls1'] } })
+        w.redelegate('h1', undefined, 'leaf-1')
+        await w.round()
+        ripen(w); settle(w)
+        await w.round()
+        w.tickets[0]!.ended = { at: new Date().toISOString() }
+        w.failures.IssueContext = 1
+        await w.round()
+        expect(w.created).toEqual([{ issue: 'leaf-1', id: 'cs-1' }])
+        w.epics.get('leaf-1')!.state = 'canceled'
+        await w.round(); await w.round()
+        expect(delegations(w)).toEqual([])
+        expect(w.activities.filter(activity => activity.session === 'cs-1')).toEqual([{ session: 'cs-1', type: 'thought', body: 'Received.' },
+          { session: 'cs-1', type: 'thought', body: 'Not started: WEB-30 is canceled.' }])
+        expect(w.state.get(CHAIN_KEYS.redelegations)).toBeUndefined()
+      })
+
+      it('starts a run on a completed Issue re-delegated without an earlier ticket, as a first delegation would', async () => {
+        const w = leafWorld()
+        w.epics.get('leaf-1')!.state = 'completed'
+        w.redelegate('h1', undefined, 'leaf-1')
+        await w.round()
+        ripen(w)
+        await w.round(); await w.round()
+        expect(w.created).toEqual([{ issue: 'leaf-1', id: 'cs-1' }])
+        expect(delegations(w).map(trigger => trigger.id)).toEqual(['linear:delegation:h1'])
+      })
+
+      it('gives up a queued re-delegation whose earlier ticket is still open after a day', async () => {
+        const w = leafWorld(false)
+        w.delegate('ls1', 'leaf-1')
+        await w.round()
+        w.tickets.push({ id: 'leaf-ticket', origin: { triggerId: 'linear:session:ls1', triggerIds: ['linear:session:ls1'] } })
+        w.redelegate('h1', undefined, 'leaf-1')
+        await w.round()
+        settle(w)
+        const pending = w.state.get(CHAIN_KEYS.redelegations) as Record<string, { at: string }>
+        w.state.set(CHAIN_KEYS.redelegations, { 'leaf-1': { ...pending['leaf-1'], at: new Date(Date.now() - REDELEGATION_GIVE_UP_MS).toISOString() } })
+        const log = vi.spyOn(console, 'log').mockImplementation(() => {})
+        let logged = '', failed = 0
+        try { failed = (await w.round()).chainFailed; logged = log.mock.calls.flat().join('\n') } finally { log.mockRestore() }
+        expect(logged).toContain('gave up starting leaf-1 after 24 hours: its earlier ticket is still open')
+        expect(failed).toBe(1)
+        expect(w.state.get(CHAIN_KEYS.redelegations)).toBeUndefined()
+        w.tickets[0]!.ended = { at: new Date().toISOString() }
+        await w.round(); await w.round()
+        expect(delegations(w)).toEqual([])
+        expect(w.created).toEqual([])
+      })
+
+      it('does not queue behind a ticket that the delegation\'s own session started', async () => {
+        const w = leafWorld(false)
+        w.redelegate('h1', undefined, 'leaf-1')
+        w.delegate('ls1', 'leaf-1', undefined, { createdAt: new Date(Date.now() + 1000).toISOString() })
+        await w.round()
+        w.tickets.push({ id: 'leaf-ticket', origin: { triggerId: 'linear:session:ls1', triggerIds: ['linear:session:ls1'] } })
+        ripen(w); settle(w)
+        await w.round()
+        expect(w.state.get(CHAIN_KEYS.redelegations)).toBeUndefined()
+        w.tickets[0]!.ended = { at: new Date().toISOString() }
+        await w.round(); await w.round()
+        expect(delegations(w)).toEqual([])
+        expect(w.created).toEqual([])
+      })
+
+      it('starts nothing on a team routed to no served repository, for a delegator the policy does not admit, or once the Issue was undelegated again', async () => {
+        const routed = leafWorld()
+        routed.epics.get('leaf-1')!.team = OTHER_TEAM
+        routed.redelegate('h1', undefined, 'leaf-1')
+        const stranger = leafWorld()
+        stranger.redelegate('h1', { id: 'stranger-1', name: 'Stranger', app: false }, 'leaf-1')
+        const undone = leafWorld()
+        undone.redelegate('h1', undefined, 'leaf-1')
+        const unseen = leafWorld(false)
+        unseen.redelegate('h1', { id: 'stranger-1', name: 'Stranger', app: false }, 'leaf-1')
+        for (const w of [routed, stranger, undone, unseen]) {
+          await w.round()
+          if (w === undone) w.epics.get('leaf-1')!.delegate = null
+          ripen(w)
+          await w.round(); await w.round()
+          expect(delegations(w)).toEqual([])
+          expect(w.created).toEqual([])
+          expect(w.activities).toEqual(w === stranger
+            ? [{ session: 'old-1', type: 'thought', body: 'Only users on the Linear Source\'s allowed list can start work by delegating an Issue to the app.' }] : [])
+          expect(w.state.get(CHAIN_KEYS.redelegations)).toBeUndefined()
+        }
+      })
+
+      it('gives a re-delegated Issue labelled epic without sub-issues the split mode a first delegation gives it', async () => {
+        const w = leafWorld()
+        w.epics.get('leaf-1')!.labels = ['EPIC']
+        w.redelegate('h1', undefined, 'leaf-1')
+        await w.round()
+        ripen(w)
+        await w.round()
+        expect(delegations(w)).toHaveLength(1)
+        expect(delegations(w)[0]).toMatchObject({ text: `${SPLIT_LINE}\n${LEAF_TEXT}`, meta: { mode: 'split', epic: 'leaf-1' } })
+      })
+
+      it('retries the start next check when the sub-issues cannot be read, with one session, and starts nothing once sub-issues appeared', async () => {
+        const w = leafWorld()
+        w.redelegate('h1', undefined, 'leaf-1')
+        await w.round()
+        ripen(w); settle(w)
+        w.failures.IssueContext = 1
+        const failed = await w.round()
+        expect([failed.chainFailed, failed.contextFailed]).toEqual([1, 1])
+        expect(delegations(w)).toEqual([])
+        await w.round()
+        expect(w.created).toEqual([{ issue: 'leaf-1', id: 'cs-1' }])
+        expect(delegations(w).map(trigger => trigger.id)).toEqual(['linear:delegation:h1'])
+
+        const grown = leafWorld()
+        grown.redelegate('h1', undefined, 'leaf-1')
+        await grown.round()
+        ripen(grown); settle(grown)
+        grown.kid(7, { epic: 'leaf-1' })
+        await grown.round(); await grown.round()
+        expect(delegations(grown)).toEqual([])
+        expect(grown.activities.filter(activity => activity.session === 'cs-1').map(activity => activity.body)).toEqual(['Received.',
+          'Not started: WEB-30 has sub-issues now. Delegate it to the app again to work through them.'])
+        expect(grown.state.get(CHAIN_KEYS.redelegations)).toBeUndefined()
+      })
+
+      it('compares the session Linear opened with the delegation by Linear\'s times, whatever the local clock says', async () => {
+        const w = leafWorld(false)
+        const ahead = Date.now() + 5 * 60_000
+        w.redelegate('h1', undefined, 'leaf-1')
+        w.history.get('leaf-1')![0]!.createdAt = new Date(ahead).toISOString()
+        w.delegate('ls1', 'leaf-1', undefined, { createdAt: new Date(ahead + 1000).toISOString() })
+        await w.round()
+        vi.useFakeTimers({ toFake: ['Date'], now: ahead + 2 * DELEGATION_GRACE_MS })
+        try { await w.round() } finally { vi.useRealTimers() }
+        expect(delegations(w)).toEqual([])
+        expect(w.created).toEqual([])
+        expect(w.state.get(CHAIN_KEYS.redelegations)).toBeUndefined()
+      })
+
+      it('says in its session why a started run stops when the Issue no longer routes to a served repository', async () => {
+        const w = leafWorld()
+        w.redelegate('h1', undefined, 'leaf-1')
+        await w.round()
+        ripen(w); settle(w)
+        w.failures.IssueContext = 1
+        await w.round()
+        w.epics.get('leaf-1')!.team = OTHER_TEAM
+        await w.round()
+        expect(delegations(w)).toEqual([])
+        expect(w.activities.filter(activity => activity.session === 'cs-1')).toEqual([{ session: 'cs-1', type: 'thought', body: 'Received.' },
+          { session: 'cs-1', type: 'error', body: 'Not started: WEB-30 is no longer in a repository this deployment serves.' }])
+        expect(w.state.get(CHAIN_KEYS.redelegations)).toBeUndefined()
+      })
+
+      it('drops the start when the Issue is gone, and gives up one that kept failing for a day', async () => {
+        const gone = leafWorld()
+        gone.redelegate('h1', undefined, 'leaf-1')
+        await gone.round()
+        ripen(gone)
+        gone.gone.add('leaf-1')
+        expect((await gone.round()).chainFailed).toBe(0)
+        expect(gone.state.get(CHAIN_KEYS.redelegations)).toBeUndefined()
+        expect(gone.state.get(CHAIN_KEYS.run('h1'))).toBe('leaf-1')
+
+        const stuck = leafWorld()
+        stuck.redelegate('h1', undefined, 'leaf-1')
+        await stuck.round()
+        ripen(stuck)
+        stuck.failures.ChainSession = 99
+        expect((await stuck.round()).chainFailed).toBe(1)
+        expect(stuck.state.get(CHAIN_KEYS.redelegations)).toBeDefined()
+        const pending = stuck.state.get(CHAIN_KEYS.redelegations) as Record<string, { at: string }>
+        stuck.state.set(CHAIN_KEYS.redelegations, { 'leaf-1': { ...pending['leaf-1'], at: new Date(Date.now() - REDELEGATION_GIVE_UP_MS).toISOString() } })
+        const log = vi.spyOn(console, 'log').mockImplementation(() => {})
+        let logged = ''
+        try { await stuck.round(); logged = log.mock.calls.flat().join('\n') } finally { log.mockRestore() }
+        expect(logged).toContain('gave up starting WEB-30 after 24 hours')
+        expect(stuck.state.get(CHAIN_KEYS.redelegations)).toBeUndefined()
+        await stuck.round()
+        expect(delegations(stuck)).toEqual([])
+      })
+
+      it('waits with the start while the session read left something out', async () => {
+        const w = leafWorld()
+        w.epic('epic-2', 'WEB-20'); w.kid(5, { epic: 'epic-2' })
+        w.redelegate('h1', undefined, 'leaf-1')
+        await w.round()
+        ripen(w)
+        w.delegate('es9', 'epic-2')
+        w.failures.IssueContext = 1
+        await expect(w.round()).rejects.toThrow('not taken in')
+        expect(w.created).toEqual([])
+        await w.round()
+        expect(delegations(w).map(trigger => trigger.id)).toEqual(['linear:delegation:h1'])
+      })
+
+      it('creates no second session when taking the Trigger in failed', async () => {
+        const w = leafWorld()
+        w.redelegate('h1', undefined, 'leaf-1')
+        await w.round()
+        ripen(w)
+        w.receive.mockRejectedValueOnce(new Error('host down'))
+        expect((await w.round()).chainFailed).toBe(1)
+        await w.round()
+        expect(w.created).toEqual([{ issue: 'leaf-1', id: 'cs-1' }])
+        expect([...new Set(delegations(w).map(trigger => trigger.id))]).toEqual(['linear:delegation:h1'])
+        expect(w.state.get(CHAIN_KEYS.redelegations)).toBeUndefined()
+      })
+
+      it('starts nothing for a delegation from before the Source first checked', async () => {
+        const w = leafWorld()
+        w.state.set(CHAIN_KEYS.delegated, undefined)
+        w.redelegate('h1', undefined, 'leaf-1')
+        w.history.get('leaf-1')![0]!.createdAt = new Date(Date.now() - 10 * 60_000).toISOString()
+        await w.round()
+        w.epics.get('leaf-1')!.updatedAt = new Date().toISOString()
+        await w.round()
+        ripen(w)
+        await w.round()
+        expect(delegations(w)).toEqual([])
+        expect(w.created).toEqual([])
+      })
+
+      it('retries a run whose session could not be created, and creates one session only', async () => {
+        const w = leafWorld()
+        w.redelegate('h1', undefined, 'leaf-1')
+        await w.round()
+        ripen(w)
+        w.failures.ChainSession = 1
+        expect((await w.round()).chainFailed).toBe(1)
+        expect(delegations(w)).toEqual([])
+        await w.round(); await w.round()
+        expect(w.created).toEqual([{ issue: 'leaf-1', id: 'cs-1' }])
+        expect(delegations(w).map(trigger => trigger.id)).toEqual(['linear:delegation:h1'])
+      })
     })
 
     it('forgets a watched Issue after the close horizon', async () => {

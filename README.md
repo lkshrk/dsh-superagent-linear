@@ -124,6 +124,7 @@ A signed webhook delivery ends the wait between rounds early. See [Webhook](#web
 | --- | --- |
 | `linear:session:<session id>` | A person's new session: a delegation or a mention. |
 | `linear:prompt:<activity id>` | A person's prompt in a session. |
+| `linear:delegation:<history id>` | A person delegated an Issue without sub-issues to the app again, and Linear reused its old session. |
 | `linear:undelegated:<history id>` | The app was removed as the delegate of an Issue with an open ticket. Without a matching history entry the id is `linear:undelegated:<ticket id>:<time observed>`. |
 | `linear:chain:<run>:<sub-issue id>` | A chain started a sub-issue. |
 | `linear:chain-stop:<run>:<sub-issue id>` | A chain stopped while the sub-issue was started. |
@@ -155,6 +156,18 @@ An Issue works in its project's repository when the team lists that project, els
 - An Issue with no repository at all is not taken in. Its session gets one `error` activity, such as "Not taken in: team ENG names no repository for project Design."
 - A prompt routed either way gets the same kind of `error` activity, once per prompt.
 - A prompt on an Issue with an open ticket follows that ticket's repository, even after the Issue moved to another project or team.
+
+### Prompts
+
+A prompt on an Issue with an open ticket goes to that ticket as written. A prompt on an Issue without one starts a new ticket. Its text is the prompt first, then `(ENG-12: title)` and the Issue's description, because the worker cannot read the Issue itself.
+
+### Re-delegation
+
+Linear opens a session only on an Issue's first delegation and reuses it afterwards. When a person delegates an Issue without sub-issues to the app again, the Source finds the delegation in the Issue's history and starts a run like a first delegation: a new app session on the Issue, "Received.", and a Trigger with the Issue's subject and description. It waits 60 seconds first, and starts nothing when a session for that delegation arrived meanwhile; both times are Linear's. A re-delegation made while an earlier ticket of the Issue is still open, such as undelegating and delegating again to restart, waits until that ticket ended and then starts one run, unless the Issue was completed or canceled by then; a session already opened for it then says so. Like a first delegation, a re-delegation that did not wait still starts on a completed or canceled Issue. It starts nothing when the Issue routes to no served repository, or when it is no longer delegated to the app. A person not on the Linear Source's allowed list gets the refusal in the Issue's known session, if the Source knows one. A delegation by an automation, an integration or an app starts nothing, and neither does one made before the Source's first check.
+
+The Issue's sub-issues are read before the Trigger. When that read fails, the start is retried on the next check in the same session. When the Issue has sub-issues by then, its session says so instead. When the Issue moved to a team or project this deployment does not serve after its session was opened, the session gets an `error` activity. A start that keeps failing is given up 24 hours after the delegation, with a log line.
+
+Re-delegating an epic whose sub-issues are all closed starts nothing; its known session says so.
 
 ### Stop and undelegation
 
