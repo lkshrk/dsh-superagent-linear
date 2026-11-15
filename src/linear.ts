@@ -337,7 +337,7 @@ export async function pollLinear(ctx: SourceContext, client: LinearClient, confi
       }
       // Linear marks a session unresponsive when nothing answers within seconds; an evaluation takes longer.
       if (where.kind === 'served' && !ctx.state.get(KEYS.seen(session.id))) {
-        watch(ctx, String(trigger.meta.issue), session.id)
+        watch(ctx, String(trigger.meta.issue), session.id, session.createdAt)
         await client.activity(session.id, stableUuid(`seen:${session.id}`), { type: 'thought', body: 'Received.' }, true, signal)
           .catch((error: unknown) => { if (!(error instanceof LinearError && error.gone)) throw error })
         ctx.state.set(KEYS.seen(session.id), true)

@@ -15,6 +15,8 @@ export const CHAIN_KEYS = {
 }
 /** How long a re-delegated Issue without sub-issues waits for a session Linear may open for the delegation itself. */
 export const DELEGATION_GRACE_MS = 60_000
+/** How long after its delegation a start that keeps failing is retried. */
+export const REDELEGATION_GIVE_UP_MS = 24 * 3600_000
 /** How long after a delegation started a run a new session on the epic joins it instead of starting another. */
 export const ADOPT_MS = 2 * 60_000
 export const CHAIN_INTERVAL_MS = 30_000
@@ -147,6 +149,7 @@ export async function epicPrompt(ctx: SourceContext, client: LinearClient, promp
   ctx.state.set(CHAIN_KEYS.run(prompt.id), epic)
   return true
 }
+const refusedWorkText = 'Only users on the Linear Source\'s allowed list can start work by delegating an Issue to the app.'
 const isStart = (prompt: Prompt) => (prompt.content.body ?? '').trim().toLowerCase() === 'start'
 
 /** Why a person's start or stop of a chain was not carried out. */
@@ -399,13 +402,13 @@ async function finish(env: Env, epic: string, record: ChainRecord): Promise<void
   setActive(ctx, epic, false)
 }
 
-/** An Issue the Source saw a session or ticket on: its last session, and when. */
-export interface Watch { session?: string; at: string }
+/** An Issue the Source saw a session or ticket on: its last session, when, and when Linear created the newest session it read. */
+export interface Watch { session?: string; at: string; sessionAt?: string }
 export const DELEGATION_OVERLAP_MS = 5000
 const watches = (ctx: SourceContext) => ctx.state.get<Record<string, Watch>>(CHAIN_KEYS.watched) ?? {}
-export function watch(ctx: SourceContext, issue: string, session?: string): void {
+export function watch(ctx: SourceContext, issue: string, session?: string, sessionAt?: string): void {
   const all = watches(ctx)
-  ctx.state.set(CHAIN_KEYS.watched, { ...all, [issue]: { ...all[issue], ...session ? { session } : {}, at: new Date().toISOString() } })
+  ctx.state.set(CHAIN_KEYS.watched, { ...all, [issue]: { ...all[issue], ...session ? { session } : {}, ...sessionAt ? { sessionAt } : {}, at: new Date().toISOString() } })
 }
 function prune(ctx: SourceContext): void {
   const now = Date.now()
@@ -450,9 +453,22 @@ async function redelegated(ctx: SourceContext, client: LinearClient, issue: stri
   const change = await client.delegation(issue, viewer, since, signal)
   if (!change?.person || ctx.state.get(CHAIN_KEYS.run(change.id))) return
   context ??= await client.issueContext(issue, signal)
-  if (!context.children.nodes.length) { pend(ctx, issue, { change: change.id, at: change.at, person: change.person }); return }
-  if (!context.children.nodes.some(child => !closed(child.state))) return
   const session = chainOf(ctx, issue)?.session || watches(ctx)[issue]?.session || ''
+  if (!context.children.nodes.length) {
+    if (mayControl(ctx, change.person.id)) pend(ctx, issue, { change: change.id, at: change.at, person: change.person })
+    else {
+      await tell(client, session, `delegation-refused:${change.id}`, { type: 'thought', body: refusedWorkText }, signal)
+      ctx.state.set(CHAIN_KEYS.run(change.id), issue)
+    }
+    return
+  }
+  if (!context.children.nodes.some(child => !closed(child.state))) {
+    const details = await client.issue(issue, signal)
+    await tell(client, session, `chain-all-done:${change.id}`, { type: 'thought',
+      body: `All sub-issues of ${details.identifier} are done; nothing to start. Add an open sub-issue and delegate it again to start a chain.` }, signal)
+    ctx.state.set(CHAIN_KEYS.run(change.id), issue)
+    return
+  }
   if (!mayControl(ctx, change.person.id)) {
     await tell(client, session, `chain-refused:${change.id}`, { type: 'thought', body: refusedText(ctx) }, signal)
     ctx.state.set(CHAIN_KEYS.run(change.id), issue)
@@ -463,7 +479,7 @@ async function redelegated(ctx: SourceContext, client: LinearClient, issue: stri
 }
 
 /** A delegation of an Issue without sub-issues waiting to start a run, with the session made for it once there is one. */
-interface Redelegation { change: string; at: string; person: { id: string; name?: string | null }; session?: string; url?: string }
+interface Redelegation { change: string; at: string; person: { id: string; name?: string | null }; session?: string; url?: string; identifier?: string }
 const redelegations = (ctx: SourceContext) => ctx.state.get<Record<string, Redelegation>>(CHAIN_KEYS.redelegations) ?? {}
 function pend(ctx: SourceContext, issue: string, entry: Redelegation): void {
   const all = redelegations(ctx)
@@ -481,8 +497,11 @@ async function startRedelegations(env: Env, open: Map<string, Ticket[]>): Promis
     try { await startRedelegation(env, issue, entry, open) }
     catch (error) {
       if (env.signal.aborted) throw error
-      if (error instanceof LinearError && error.gone) settle(env.ctx, issue, entry.change)
-      else env.round.chainFailed++
+      if (error instanceof LinearError && error.gone) { settle(env.ctx, issue, entry.change); continue }
+      env.round.chainFailed++
+      if (Date.now() - Date.parse(entry.at) < REDELEGATION_GIVE_UP_MS) continue
+      console.log(`dsh-superagent-linear: gave up starting ${entry.identifier ?? issue} after ${REDELEGATION_GIVE_UP_MS / 3600_000} hours: ${String(error)}`)
+      settle(env.ctx, issue, entry.change)
     }
   }
 }
@@ -496,13 +515,21 @@ export function redelegationTrigger(issue: Issue, session: string, url: string, 
 /** Starts a re-delegated Issue without sub-issues as a first delegation would, in a session of its own recorded before its Trigger. */
 async function startRedelegation(env: Env, issue: string, entry: Redelegation, open: Map<string, Ticket[]>): Promise<void> {
   const { ctx, client, config, viewer, signal } = env
-  const seen = watches(ctx)[issue]
-  if (!entry.session && (open.has(issue) || chainOf(ctx, issue)?.status === 'running' || (seen && Date.parse(seen.at) >= Date.parse(entry.at)))) {
+  const fresh = watches(ctx)[issue]?.sessionAt
+  // Both times are Linear's, so the local clock cannot make the delegation's own session look older.
+  if (!entry.session && (open.has(issue) || chainOf(ctx, issue)?.status === 'running'
+    || (fresh && Date.parse(fresh) >= Date.parse(entry.at) - DELEGATION_OVERLAP_MS))) {
     return settle(ctx, issue, entry.change)
   }
   const details = await client.issue(issue, signal)
+  if (entry.identifier !== details.identifier) {
+    entry.identifier = details.identifier
+    ctx.state.set(CHAIN_KEYS.redelegations, { ...redelegations(ctx), [issue]: entry })
+  }
   const where = routeOf(ctx, config, redelegationTrigger(details, '', details.url, entry.change, entry.person.id, entry.at))
   if (where.kind !== 'served' || (!entry.session && (details.delegate?.id !== viewer || !mayControl(ctx, entry.person.id)))) {
+    if (entry.session) await tell(client, entry.session, `delegation-unserved:${entry.change}`,
+      { type: 'error', body: `Not started: ${details.identifier} no longer works in a repository this deployment serves.` }, signal)
     return settle(ctx, issue, entry.change)
   }
   if (!entry.session) {
@@ -517,7 +544,12 @@ async function startRedelegation(env: Env, issue: string, entry: Redelegation, o
     await client.activity(session, stableUuid(`seen:${session}`), { type: 'thought', body: 'Received.' }, true, signal).catch(ignoreGone)
     ctx.state.set(KEYS.seen(session), true)
   }
-  const context = await client.issueContext(issue, signal).catch((error: unknown) => { if (signal.aborted) throw error; env.round.contextFailed++; return undefined })
+  const context = await client.issueContext(issue, signal).catch((error: unknown) => { if (!signal.aborted) env.round.contextFailed++; throw error })
+  if (context.children.nodes.length) {
+    await tell(client, session, `delegation-grown:${entry.change}`,
+      { type: 'thought', body: `Not started: ${details.identifier} has sub-issues now. Delegate it to the app again to work through them.` }, signal)
+    return settle(ctx, issue, entry.change)
+  }
   const trigger = redelegationTrigger(details, session, entry.url ?? details.url, entry.change, entry.person.id, entry.at)
   await ctx.receive(placed(ctx, withMode(withContext(trigger, context), context), where.repository))
   watch(ctx, issue, session)

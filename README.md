@@ -163,7 +163,11 @@ A prompt on an Issue with an open ticket goes to that ticket as written. A promp
 
 ### Re-delegation
 
-Linear opens a session only on an Issue's first delegation and reuses it afterwards. When a person delegates an Issue without sub-issues to the app again, the Source finds the delegation in the Issue's history and starts a run like a first delegation: a new app session on the Issue, "Received.", and a Trigger with the Issue's subject and description. It waits 60 seconds first, and starts nothing when a session for that delegation arrived meanwhile. It also starts nothing while a ticket of the Issue is open, when the Issue routes to no served repository, when it is no longer delegated to the app, or when the person is not on the Linear Source's allowed list. A delegation by an automation, an integration or an app starts nothing, and neither does one made before the Source's first check.
+Linear opens a session only on an Issue's first delegation and reuses it afterwards. When a person delegates an Issue without sub-issues to the app again, the Source finds the delegation in the Issue's history and starts a run like a first delegation: a new app session on the Issue, "Received.", and a Trigger with the Issue's subject and description. It waits 60 seconds first, and starts nothing when a session for that delegation arrived meanwhile; both times are Linear's. It also starts nothing while a ticket of the Issue is open, when the Issue routes to no served repository, or when it is no longer delegated to the app. A person not on the Linear Source's allowed list gets the refusal in the Issue's known session, if the Source knows one. A delegation by an automation, an integration or an app starts nothing, and neither does one made before the Source's first check.
+
+The Issue's sub-issues are read before the Trigger. When that read fails, the start is retried on the next check in the same session. When the Issue has sub-issues by then, its session says so instead. When the Issue moved to a team or project this deployment does not serve after its session was opened, the session gets an `error` activity. A start that keeps failing is given up 24 hours after the delegation, with a log line.
+
+Re-delegating an epic whose sub-issues are all closed starts nothing; its known session says so.
 
 ### Stop and undelegation
 
