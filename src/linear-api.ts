@@ -43,7 +43,8 @@ const Issue = z.looseObject({ id: z.string(), identifier: z.string(), title: z.s
   labels: z.looseObject({ nodes: z.array(z.looseObject({ name: z.string() })) }).nullish() })
 export const SessionSchema = z.looseObject({
   id: z.string(), createdAt: z.string(), url: z.string().nullish(), creator: User.nullish(), appUser: User.nullish(),
-  comment: z.looseObject({ id: z.string(), body: z.string().nullish() }).nullish(), issue: Issue.nullish(),
+  comment: z.looseObject({ id: z.string(), body: z.string().nullish(), user: User.extend({ app: z.boolean().nullish() }).nullish(),
+    botActor: z.looseObject({ type: z.string() }).nullish() }).nullish(), issue: Issue.nullish(),
 })
 export type Session = z.infer<typeof SessionSchema>
 export const PromptSchema = z.looseObject({
@@ -56,7 +57,7 @@ const Page = z.looseObject({ nodes: z.array(z.unknown()), pageInfo: PageInfo })
 
 const ISSUE_FIELDS = 'id identifier title description url team { id key } delegate { id } project { id name } labels { nodes { name } }'
 const SESSIONS = `query($after: String) { agentSessions(first: 25, after: $after, orderBy: createdAt) {
-  nodes { id createdAt url creator { id name } appUser { id name } comment { id body } issue { ${ISSUE_FIELDS} } }
+  nodes { id createdAt url creator { id name } appUser { id name } comment { id body user { id name app } botActor { type name } } issue { ${ISSUE_FIELDS} } }
   pageInfo { hasNextPage endCursor } } }`
 const PROMPTS = `query($since: DateTimeOrDuration!, $after: String) {
   agentActivities(first: 25, after: $after, orderBy: createdAt, filter: { type: { eq: "prompt" }, createdAt: { gt: $since } }) {
