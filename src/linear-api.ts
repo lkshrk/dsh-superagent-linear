@@ -114,6 +114,7 @@ export interface ActivityContent { type: 'thought' | 'response' | 'error'; body:
 /** Which error paths a read can take part of its data with; the nodes they name come back null. */
 type PartialOk = (path: unknown[]) => boolean
 const anyNested: PartialOk = () => true
+const underComment: PartialOk = path => path[0] === 'agentSessions' && path[1] === 'nodes' && path[3] === 'comment'
 
 export class LinearClient {
   private token?: { value: string; expires: number }
@@ -214,7 +215,7 @@ export class LinearClient {
   }
   /** Sessions created after `since`, oldest first, with the number of nodes that did not parse; `after` continues an earlier read. */
   async sessions(since: string, signal?: AbortSignal, after?: string): Promise<Read<Session>> {
-    return await this.collect(SESSIONS, {}, 'agentSessions', SessionSchema, since, signal, after)
+    return await this.collect(SESSIONS, {}, 'agentSessions', SessionSchema, since, signal, after, underComment)
   }
   /** Prompts people wrote into sessions after `since`, oldest first. */
   async prompts(since: string, signal?: AbortSignal, after?: string): Promise<Read<Prompt>> {
@@ -225,11 +226,11 @@ export class LinearClient {
    * first is read to its end instead, so either direction finds every item after `since`.
    */
   private async collect<S extends z.ZodType<{ createdAt: string }>>(query: string, variables: Record<string, unknown>, field: string, schema: S,
-    since: string, signal?: AbortSignal, from?: string): Promise<Read<z.infer<S>>> {
+    since: string, signal?: AbortSignal, from?: string, partial?: PartialOk): Promise<Read<z.infer<S>>> {
     const items: z.infer<S>[] = []
     let unreadable = 0, after = from, next: string | undefined
     for (let pages = 0; pages < READ_PAGES; pages++) {
-      const page = Page.parse((await this.request<Record<string, unknown>>(query, { ...variables, after }, signal))[field])
+      const page = Page.parse((await this.request<Record<string, unknown>>(query, { ...variables, after }, signal, partial))[field])
       let reached = false
       const dates = page.nodes.map(node => Date.parse(String((node as { createdAt?: unknown }).createdAt ?? '')))
       const ascending = dates.length > 1 && dates[0]! < dates.at(-1)!

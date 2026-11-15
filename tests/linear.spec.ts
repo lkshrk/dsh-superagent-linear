@@ -163,6 +163,14 @@ describe('token', () => {
     const nulled = { data: { agentSessions: { nodes: [{ ...session('s1', '2026-11-12T10:01:00.000Z'), issue: null }], pageInfo: { hasNextPage: false, endCursor: null } } },
       errors: [{ message: 'Forbidden', path: ['agentSessions', 'nodes', 0, 'issue'] }] }
     await expect(answer(nulled).sessions('2026-11-12T10:00:00.000Z')).rejects.toThrow('Forbidden')
+    for (const path of [['agentSessions', 'nodes', 0, 'comment'], ['agentSessions', 'nodes', 0, 'comment', 'user']]) {
+      const comment = path.length === 4 ? null : { id: 'c0', body: 'This thread is for an agent session with dsh.', user: null, botActor: null }
+      const noAuthor = { data: { agentSessions: { nodes: [session('s1', '2026-11-12T10:01:00.000Z', { comment })], pageInfo: { hasNextPage: false, endCursor: null } } },
+        errors: [{ message: 'Forbidden: comment author', path }] }
+      const read = await answer(noAuthor).sessions('2026-11-12T10:00:00.000Z')
+      expect(read.items.map(item => sessionTrigger(item, VIEWER)!.text)).toEqual(['WEB-1: Fix the footer\n\nIt overlaps.'])
+      expect(log).toHaveBeenCalledWith('dsh-superagent-linear: Linear answered in part: Forbidden: comment author')
+    }
     const chain = (path: unknown[]) => ({ data: { issue: { id: 'e', identifier: 'WEB-10', state: { type: 'started' }, delegate: { id: VIEWER },
       children: { nodes: [{ id: 'k', identifier: 'WEB-2', title: 'Part', state: { type: 'started' }, assignee: null, subIssueSortOrder: 1,
         inverseRelations: { nodes: [{ type: 'blocks', issue: null }], pageInfo: { hasNextPage: false } } }], pageInfo: { hasNextPage: false } } } },
@@ -200,6 +208,7 @@ describe('translation', () => {
     expect(sessionTrigger(session('s1', at, { comment: PLACEHOLDER }), VIEWER)!.text).toBe('WEB-1: Fix the footer\n\nIt overlaps.')
     expect(sessionTrigger(session('s1', at, { comment: { ...said('c1', 'Posted by an app'), user: { id: 'bot-1', app: true } } }), VIEWER)!.text).toBe('WEB-1: Fix the footer\n\nIt overlaps.')
     expect(sessionTrigger(session('s1', at, { comment: { ...said('c1', 'Echo'), user: { id: VIEWER, app: false } } }), VIEWER)!.text).toBe('WEB-1: Fix the footer\n\nIt overlaps.')
+    expect(sessionTrigger(session('s1', at, { comment: { ...said('c1', 'Synced from an integration'), botActor: { type: 'integration', name: 'Slack' } } }), VIEWER)!.text).toBe('WEB-1: Fix the footer\n\nIt overlaps.')
     expect(sessionTrigger(session('s1', at, { comment: said('c1', ' It overlaps. ') }), VIEWER)!.text).toBe('It overlaps.\n\n(WEB-1: Fix the footer)')
     expect(sessionTrigger(session('s1', at, { comment: said('c1', '@agent go'), issue: { ...issue(), description: null } }), VIEWER)!.text).toBe('@agent go\n\n(WEB-1: Fix the footer)')
   })
