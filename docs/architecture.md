@@ -198,6 +198,7 @@ All keys live in the Source context's state store.
 | `linear-chain-held:<id>` | When a session or prompt with unreadable sub-issues was first held. |
 | `linear-watched` | Issues the Source saw a session or ticket on, kept 14 days. |
 | `linear-delegated-checked` | The last re-delegation check. |
+| `linear-redelegations` | Re-delegations of Issues without sub-issues waiting to start, with the session opened for each. |
 
 Once an hour, the round drops `linear-seen:`, `linear-chain-run:`, `linear-completed:`, `linear-chain-held:`, `linear-follow-failed:` and `linear-linked:` markers older than 14 days. Markers of tickets still followed are kept. A marker stored without a time gets the current time and ages from then. Pruning needs a host whose state store lists keys (`state.keys`).
 

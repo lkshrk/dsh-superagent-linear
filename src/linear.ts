@@ -414,7 +414,7 @@ export async function pollLinear(ctx: SourceContext, client: LinearClient, confi
   if (!failed) moveCursor(ctx, KEYS.prompts, KEYS.promptsBacklog, promptsSince, prompts, promptsBacklog)
 
   await followTickets(ctx, client, config, round, signal)
-  await followIssues(ctx, client, config, viewer, round, signal)
+  await followIssues(ctx, client, config, viewer, round, signal, !sessionsFailed && !ctx.state.get(KEYS.sessionsBacklog))
   await advanceChains(ctx, client, config, viewer, round, signal)
   prune(ctx)
   if (failed || sessionsFailed) throw new RoundFailed('A Linear session or prompt was not taken in; the next round reads it again', round)
@@ -545,9 +545,10 @@ interface Delegation { delegated: boolean; observed?: string }
 /**
  * Reads, at most every 30 seconds and in one batch, the Issues of open tickets that started on Linear, of those tickets whose
  * Issue is not yet known to be closed, and the watched Issues: stops each open ticket whose Issue was delegated to the app and
- * no longer is, reports each Issue that moved to a completed or canceled state, and starts chains on re-delegated Issues.
+ * no longer is, reports each Issue that moved to a completed or canceled state, and starts work on re-delegated Issues.
  */
-async function followIssues(ctx: SourceContext, client: LinearClient, config: LinearConfig, viewer: string, round: Round, signal: AbortSignal): Promise<void> {
+async function followIssues(ctx: SourceContext, client: LinearClient, config: LinearConfig, viewer: string, round: Round, signal: AbortSignal,
+  sessionsTaken: boolean): Promise<void> {
   const running = ctx.tickets.open().flatMap(ticket => {
     const origin = ctx.triggers.get(ticket.origin.triggerId)
     return origin?.source === SOURCE && typeof origin.meta.issue === 'string' ? [{ ticket, origin, issue: origin.meta.issue }] : []
@@ -560,7 +561,7 @@ async function followIssues(ctx: SourceContext, client: LinearClient, config: Li
   if (!running.length && Object.keys(known).length) ctx.state.set(KEYS.delegation, {})
   const now = new Date().toISOString()
   ctx.state.set(KEYS.delegationChecked, now)
-  await followDelegations(ctx, client, viewer, config.chainParallel, round, signal)
+  await followDelegations(ctx, client, config, viewer, round, signal, sessionsTaken)
   if (!running.length && !closing.length) return
   const issues = await client.issues([...new Set([...running, ...closing].map(item => item.issue))], signal)
   reportClosed(ctx, closing, issues)

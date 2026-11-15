@@ -93,7 +93,9 @@ A session's `creator` decides whose Trigger it is. A session the app created, or
 | --- | --- |
 | Started with a person's comment (a mention, or a delegation made with a comment) | The comment body, then `(ENG-12: Title)`, then the Issue description unless the comment is the description. |
 | Started without a person's comment | `ENG-12: Title`, then the Issue description. |
-| Prompt | The prompt body. A stop prompt starts with "Stop requested in Linear." |
+| Prompt on an Issue with an open ticket | The prompt body. A stop prompt starts with "Stop requested in Linear." |
+| Prompt on an Issue without an open ticket | The prompt body, then `(ENG-12: Title)`, then the Issue description. A stop prompt is as above. |
+| Re-delegation of an Issue without sub-issues | `ENG-12: Title`, then the Issue description. |
 | Chain sub-issue | `ENG-12: Title`, then the sub-issue's description. |
 
 Only a comment a person wrote counts. Linear opens a delegated session's thread with a comment of its own ("This thread is for an agent session with …"). That comment, and any comment with a `botActor`, without a `user`, or from an app user (`user.app`) or the app itself, is ignored.
@@ -131,7 +133,8 @@ Only `meta.issueUrl` and `DSH_SUPERAGENT_LINEAR_ISSUE_URL` are always the Issue'
 ## Delegation
 
 - Delegating an Issue to the app opens a session. Linear opens a new session only on the first delegation and reuses it afterwards. The Source therefore finds later delegations through `DelegatedIssues` and the Issue's history.
-- A re-delegation starts a chain only when the newest delegation since the last check came from a person: not an app, not an automation (`botActor`), and not the app itself. That person must also be on the Linear Source's allowed list; anyone else gets the refusal in the epic's known session.
+- A re-delegation starts work only when the newest delegation since the last check came from a person: not an app, not an automation (`botActor`), and not the app itself. That person must also be on the Linear Source's allowed list; anyone else gets the refusal in the epic's known session.
+- A re-delegated Issue without sub-issues waits 60 seconds (`linear-redelegations`), then gets a new app session (`agentSessionCreateOnIssue`) and a `linear:delegation:<history id>` Trigger, unless a session the Source saw on the Issue arrived since the delegation, a ticket of the Issue is open, or the Issue routes to no served repository or is no longer delegated to the app. A person not on the allowed list starts nothing, without a reply.
 - The undelegation check compares the `delegate` of each Issue with an open ticket that started on Linear with the app user. The stop is attributed to the person in the history entry whose `fromDelegate` is the app, when one exists since the ticket started.
 
 ## Webhook
