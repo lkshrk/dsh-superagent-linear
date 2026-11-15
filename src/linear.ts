@@ -117,30 +117,33 @@ export function personComment(session: Session, viewer: string): string | undefi
   if (!comment?.body?.trim() || comment.botActor || !comment.user || comment.user.app || comment.user.id === viewer) return undefined
   return comment.body.trim()
 }
+/** A Trigger's text for work on `issue`: what the person said first, as a worker sees only the start of it, then the subject and description. */
+export function issueText(issue: Issue, said?: string): string {
+  const subject = `${issue.identifier}: ${issue.title}`
+  const description = issue.description?.trim() ?? ''
+  return said
+    ? [said, `(${subject})`, said === description ? '' : description].filter(Boolean).join('\n\n')
+    : `${subject}\n\n${description}`.trim()
+}
 /** The Trigger of a session a person started by delegating an issue to the app or mentioning it; the app's own sessions produce none. */
 export function sessionTrigger(session: Session, viewer: string): Trigger | undefined {
   const issue = session.issue
   if (!issue || session.creator?.id === viewer) return undefined
   const url = session.url ?? issue.url
-  const subject = `${issue.identifier}: ${issue.title}`
-  const said = personComment(session, viewer)
-  const description = issue.description?.trim() ?? ''
-  const text = said
-    ? [said, `(${subject})`, said === description ? '' : description].filter(Boolean).join('\n\n')
-    : `${subject}\n\n${description}`.trim()
+  const text = issueText(issue, personComment(session, viewer))
   return { id: `linear:session:${session.id}`, source: SOURCE, threads: [{ source: SOURCE, id: threadOf(issue.id) }],
     actor: { source: SOURCE, id: session.creator?.id ?? '' }, human: !!session.creator, addressed: 'direct', at: session.createdAt, text,
     channel: channel(issue, session.id, url), url, meta: meta(issue, session.id, 'session') }
 }
-/** The Trigger of a person's prompt in a session; a stop signal says so in its text. */
-export function promptTrigger(prompt: Prompt, viewer: string): Trigger | undefined {
+/** The Trigger of a person's prompt in a session; a stop signal says so in its text, and one that `starts` a ticket carries the Issue text too. */
+export function promptTrigger(prompt: Prompt, viewer: string, starts = false): Trigger | undefined {
   const issue = prompt.agentSession.issue
   if (!issue || !prompt.user || prompt.user.id === viewer) return undefined
   const body = prompt.content.body ?? ''
   const stop = prompt.signal === 'stop'
   return { id: `linear:prompt:${prompt.id}`, source: SOURCE, threads: [{ source: SOURCE, id: threadOf(issue.id) }],
     actor: { source: SOURCE, id: prompt.user.id }, human: true, addressed: 'direct', at: prompt.createdAt,
-    text: stop ? `Stop requested in Linear.${body ? `\n\n${body}` : ''}` : body,
+    text: stop ? `Stop requested in Linear.${body ? `\n\n${body}` : ''}` : starts ? issueText(issue, body.trim()) : body,
     channel: channel(issue, prompt.agentSession.id, issue.url), url: issue.url,
     meta: { ...meta(issue, prompt.agentSession.id, 'prompt'), activity: prompt.id, ...stop ? { signal: 'stop' } : {} } }
 }
@@ -381,9 +384,10 @@ export async function pollLinear(ctx: SourceContext, client: LinearClient, confi
   failed = false
   for (const prompt of prompts.items) {
     if (signal.aborted) throw new Error('The Linear Source stopped during the read')
-    const found = promptTrigger(prompt, viewer)
+    const issueId = prompt.agentSession.issue?.id
+    const open = issueId ? openTicketOf(issueId) : undefined
+    const found = promptTrigger(prompt, viewer, !open)
     if (!found) continue
-    const open = openTicketOf(String(found.meta.issue))
     try {
       let trigger: Trigger
       let served = false

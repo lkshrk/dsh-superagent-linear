@@ -242,6 +242,14 @@ describe('translation', () => {
     expect(promptTrigger(prompt('a3', '2026-11-12T10:00:00.000Z', { user: { id: VIEWER } }), VIEWER)).toBeUndefined()
     expect(sessionTrigger(session('s3', '2026-11-12T10:00:00.000Z', { issue: null }), VIEWER)).toBeUndefined()
   })
+  it('puts the Issue text after the person\'s words in a prompt that starts a ticket, keeps a follow-up bare, and a stop unchanged', () => {
+    const at = '2026-11-12T10:01:00.000Z'
+    expect(promptTrigger(prompt('a1', at), VIEWER, true)).toMatchObject({ id: 'linear:prompt:a1', text: 'Also the header\n\n(WEB-1: Fix the footer)\n\nIt overlaps.' })
+    expect(promptTrigger(prompt('a1', at), VIEWER, false)!.text).toBe('Also the header')
+    expect(promptTrigger(prompt('a1', at, { content: { body: '' } }), VIEWER, true)!.text).toBe('WEB-1: Fix the footer\n\nIt overlaps.')
+    expect(promptTrigger(prompt('a2', at, { signal: 'stop', content: { body: 'enough' } }), VIEWER, true))
+      .toMatchObject({ id: 'linear:prompt:a2', text: 'Stop requested in Linear.\n\nenough', meta: { signal: 'stop' } })
+  })
   it('listens to the configured teams by key or id, leaves switched-off ones out, and offers a sessions-only admission row per team', () => {
     const kind = linearKind(linear().client)
     expect(kind.scope!({ meta: { team: TEAM, teamKey: 'web' } }, config())).toEqual({ listened: true, observed: false, row: 'WEB' })
@@ -296,6 +304,18 @@ describe('polling', () => {
     expect(h.state.get(KEYS.prompts)).toBe('2026-11-12T10:03:55.000Z')
     await pollLinear(h.ctx, stub.client, config(), signal())
     expect(stub.activities).toHaveLength(2)
+  })
+  it('gives a prompt that starts a ticket the Issue text, and passes a prompt to an open ticket as written', async () => {
+    const stub = sources([], [prompt('a1', '2026-11-12T10:01:00.000Z', { content: { body: 'start please' } })])
+    const h = context()
+    h.state.set(KEYS.sessions, T0); h.state.set(KEYS.prompts, T0)
+    await pollLinear(h.ctx, stub.client, config(), signal())
+    expect(h.received.map(trigger => [trigger.id, trigger.text])).toEqual([['linear:prompt:a1', 'start please\n\n(WEB-1: Fix the footer)\n\nIt overlaps.']])
+    const origin = sessionTrigger(session('s1', T0), VIEWER)!
+    const open = context({ tickets: [{ id: 't1', origin: { triggerId: origin.id, triggerIds: [origin.id] } }], triggers: [origin] })
+    open.state.set(KEYS.sessions, T0); open.state.set(KEYS.prompts, T0)
+    await pollLinear(open.ctx, sources([], [prompt('a1', '2026-11-12T10:01:00.000Z', { content: { body: 'start please' } })]).client, config(), signal())
+    expect(open.received.map(trigger => [trigger.id, trigger.text])).toEqual([['linear:prompt:a1', 'start please']])
   })
   it('takes in a team on an additional repository with that repository\'s canonical name, and leaves the primary\'s Triggers unchanged', async () => {
     const stub = sources([session('s1', '2026-11-12T10:01:00.000Z'), session('s2', '2026-11-12T10:02:00.000Z', { issue: issue(OTHER_TEAM, 2) })],
@@ -1123,7 +1143,7 @@ describe('issue context', () => {
     expect(round.contextFailed).toBe(0)
     expect(h.received[0]!.text).toBe(`${PARENT_LINE}\n\n${base().text}\n${TITLE_BLOCK}`)
     expect(h.received[0]!.meta).toMatchObject({ parent: 'issue-0', children: 0 })
-    expect(h.received[1]!.text).toBe('Also the header')
+    expect(h.received[1]!.text).toBe('Also the header\n\n(WEB-1: Fix the footer)\n\nIt overlaps.')
     await pollLinear(h.ctx, stub.client, config(), signal())
     expect(h.received.map(trigger => trigger.id)).toContain('linear:session:s1')
     expect(stub.reads).toHaveLength(1)
