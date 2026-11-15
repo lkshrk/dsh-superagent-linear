@@ -1346,7 +1346,7 @@ describe('chain', () => {
       ChainChild: variables => {
         const epic = epics.get(String(variables.id))
         if (gone.has(String(variables.id))) throw Object.assign(new Error('Entity not found'), { code: 'NOT_FOUND' })
-        if (epic) return { issue: { ...chainSession('x', epic, T0).issue!, labels: { nodes: (epic.labels ?? []).map(name => ({ name })) } } }
+        if (epic) return { issue: { ...chainSession('x', epic, T0).issue!, state: { type: epic.state }, labels: { nodes: (epic.labels ?? []).map(name => ({ name })) } } }
         const kid = kids.get(String(variables.id))!
         return { issue: { id: kid.id, identifier: kid.identifier, title: `Part ${kid.identifier}`, description: 'Make the part.', url: `https://linear.app/x/issue/${kid.identifier}`,
           team: { id: kid.team, key: KEYS_OF[kid.team] }, delegate: null, project: null, labels: { nodes: kid.labels.map(name => ({ name })) } } }
@@ -2451,6 +2451,27 @@ describe('chain', () => {
         expect(w.state.get(CHAIN_KEYS.redelegations)).toBeUndefined()
       })
 
+      it('drops a queued re-delegation quietly when the Issue was completed or canceled by the time its earlier ticket ended', async () => {
+        for (const state of ['completed', 'canceled']) {
+          const w = leafWorld(false)
+          w.delegate('ls1', 'leaf-1')
+          await w.round()
+          w.tickets.push({ id: 'leaf-ticket', origin: { triggerId: 'linear:session:ls1', triggerIds: ['linear:session:ls1'] } })
+          w.redelegate('h1', undefined, 'leaf-1')
+          await w.round()
+          ripen(w); settle(w)
+          await w.round()
+          w.tickets[0]!.ended = { at: new Date().toISOString() }
+          w.epics.get('leaf-1')!.state = state
+          const before = w.activities.length
+          await w.round(); await w.round()
+          expect(w.created).toEqual([])
+          expect(delegations(w)).toEqual([])
+          expect(w.activities.slice(before)).toEqual([])
+          expect(w.state.get(CHAIN_KEYS.redelegations)).toBeUndefined()
+        }
+      })
+
       it('gives up a queued re-delegation whose earlier ticket is still open after a day', async () => {
         const w = leafWorld(false)
         w.delegate('ls1', 'leaf-1')
@@ -2572,7 +2593,7 @@ describe('chain', () => {
         await w.round()
         expect(delegations(w)).toEqual([])
         expect(w.activities.filter(activity => activity.session === 'cs-1')).toEqual([{ session: 'cs-1', type: 'thought', body: 'Received.' },
-          { session: 'cs-1', type: 'error', body: 'Not started: WEB-30 no longer works in a repository this deployment serves.' }])
+          { session: 'cs-1', type: 'error', body: 'Not started: WEB-30 is no longer in a repository this deployment serves.' }])
         expect(w.state.get(CHAIN_KEYS.redelegations)).toBeUndefined()
       })
 

@@ -531,6 +531,7 @@ async function startRedelegation(env: Env, issue: string, entry: Redelegation, o
     return settle(ctx, issue, entry.change)
   }
   const details = await client.issue(issue, signal)
+  if (closed(details.state)) return settle(ctx, issue, entry.change)
   if (entry.identifier !== details.identifier) {
     entry.identifier = details.identifier
     ctx.state.set(CHAIN_KEYS.redelegations, { ...redelegations(ctx), [issue]: entry })
@@ -538,7 +539,7 @@ async function startRedelegation(env: Env, issue: string, entry: Redelegation, o
   const where = routeOf(ctx, config, redelegationTrigger(details, '', details.url, entry.change, entry.person.id, entry.at))
   if (where.kind !== 'served' || (!entry.session && (details.delegate?.id !== viewer || !mayControl(ctx, entry.person.id)))) {
     if (entry.session) await tell(client, entry.session, `delegation-unserved:${entry.change}`,
-      { type: 'error', body: `Not started: ${details.identifier} no longer works in a repository this deployment serves.` }, signal)
+      { type: 'error', body: `Not started: ${details.identifier} is no longer in a repository this deployment serves.` }, signal)
     return settle(ctx, issue, entry.change)
   }
   if (!entry.session) {

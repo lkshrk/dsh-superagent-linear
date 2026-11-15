@@ -40,7 +40,7 @@ const User = z.looseObject({ id: z.string(), name: z.string().nullish() })
 const Team = z.looseObject({ id: z.string(), key: z.string() })
 const Issue = z.looseObject({ id: z.string(), identifier: z.string(), title: z.string(), description: z.string().nullish(), url: z.string(), team: Team,
   delegate: z.looseObject({ id: z.string() }).nullish(), project: z.looseObject({ id: z.string(), name: z.string().nullish() }).nullish(),
-  labels: z.looseObject({ nodes: z.array(z.looseObject({ name: z.string() })) }).nullish() })
+  labels: z.looseObject({ nodes: z.array(z.looseObject({ name: z.string() })) }).nullish(), state: z.looseObject({ type: z.string() }).nullish() })
 export const SessionSchema = z.looseObject({
   id: z.string(), createdAt: z.string(), url: z.string().nullish(), creator: User.nullish(), appUser: User.nullish(),
   comment: z.looseObject({ id: z.string(), body: z.string().nullish(), user: User.extend({ app: z.boolean().nullish() }).nullish(),
@@ -90,7 +90,7 @@ const CHAIN_READ = `query ChainRead($id: String!) { issue(id: $id) { id identifi
   children(first: 30) { nodes { id identifier title state { type } assignee { id } subIssueSortOrder
     inverseRelations(first: 20) { nodes { type issue { id identifier state { type } parent { id } } } pageInfo { hasNextPage } } }
   pageInfo { hasNextPage } } } }`
-const CHAIN_CHILD = `query ChainChild($id: String!) { issue(id: $id) { ${ISSUE_FIELDS} } }`
+const CHAIN_CHILD = `query ChainChild($id: String!) { issue(id: $id) { ${ISSUE_FIELDS} state { type } } }`
 const CHAIN_SESSION = `mutation ChainSession($issueId: String!) { agentSessionCreateOnIssue(input: { issueId: $issueId }) {
   success agentSession { id url createdAt } } }`
 const State = z.looseObject({ type: z.string() }).nullish()

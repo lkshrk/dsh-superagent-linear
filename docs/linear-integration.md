@@ -50,7 +50,7 @@ The credential files are read on every token request.
 | `DelegatedIssues` filtered by `delegate`, `updatedAt` | `id`, 50 per page | Re-delegated Issues. | At most every 30 seconds. |
 | `DelegationHistory` | last 50 entries, actor `app`, `botActor` | Who delegated the Issue again, and whether a person did. | Per re-delegation candidate. |
 | `ChainRead` | epic state and delegate, first 30 sub-issues with state, assignee, `subIssueSortOrder`, first 20 inverse relations | Advancing a chain. | Per running chain, at most every 30 seconds. |
-| `ChainChild` | Issue fields | A sub-issue or re-delegated epic's details. | Per started sub-issue. |
+| `ChainChild` | Issue fields and state | A sub-issue, re-delegated epic or re-delegated Issue's details. | Per started sub-issue. |
 | `issue.state`, `team.states` | state types and positions | Finding the first completed state. | Before completing an Issue. |
 
 `agentSessions` takes no filter. The client reads pages until one reaches the cursor. A page that comes oldest first is read to its end. Either way it finds every session after the cursor.
