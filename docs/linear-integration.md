@@ -93,10 +93,10 @@ A session's `creator` decides whose Trigger it is. A session the app created, or
 | --- | --- |
 | Started with a person's comment (a mention, or a delegation made with a comment) | The comment body, then `(ENG-12: Title)`, then the Issue description unless the comment is the description. |
 | Started without a person's comment | `ENG-12: Title`, then the Issue description. |
-
-Only a comment a person wrote counts. Linear opens a delegated session's thread with a comment of its own ("This thread is for an agent session with …"). That comment, and any comment with a `botActor`, without a `user`, or from an app user (`user.app`) or the app itself, is ignored.
 | Prompt | The prompt body. A stop prompt starts with "Stop requested in Linear." |
 | Chain sub-issue | `ENG-12: Title`, then the sub-issue's description. |
+
+Only a comment a person wrote counts. Linear opens a delegated session's thread with a comment of its own ("This thread is for an agent session with …"). That comment, and any comment with a `botActor`, without a `user`, or from an app user (`user.app`) or the app itself, is ignored.
 
 With the Issue context read, the text gets a header:
 
