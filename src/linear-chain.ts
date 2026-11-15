@@ -479,7 +479,7 @@ async function redelegated(ctx: SourceContext, client: LinearClient, issue: stri
 }
 
 /** A delegation of an Issue without sub-issues waiting to start a run, with the session made for it once there is one. */
-interface Redelegation { change: string; at: string; person: { id: string; name?: string | null }; session?: string; url?: string; identifier?: string }
+interface Redelegation { change: string; at: string; person: { id: string; name?: string | null }; session?: string; url?: string; identifier?: string; waited?: boolean }
 const redelegations = (ctx: SourceContext) => ctx.state.get<Record<string, Redelegation>>(CHAIN_KEYS.redelegations) ?? {}
 function pend(ctx: SourceContext, issue: string, entry: Redelegation): void {
   const all = redelegations(ctx)
@@ -500,6 +500,7 @@ async function startRedelegations(env: Env, open: Map<string, Ticket[]>): Promis
     if (env.signal.aborted) throw new Error('The Linear Source stopped during the delegations')
     if (Date.now() - Date.parse(entry.at) < DELEGATION_GRACE_MS) continue
     if (!entry.session && open.has(issue) && !fresh(env.ctx, issue, entry)) {
+      if (!entry.waited) env.ctx.state.set(CHAIN_KEYS.redelegations, { ...redelegations(env.ctx), [issue]: { ...entry, waited: true } })
       if (Date.now() - Date.parse(entry.at) < REDELEGATION_GIVE_UP_MS) continue
       console.log(`dsh-superagent-linear: gave up starting ${entry.identifier ?? issue} after ${REDELEGATION_GIVE_UP_MS / 3600_000} hours: its earlier ticket is still open`)
       env.round.chainFailed++
@@ -531,7 +532,12 @@ async function startRedelegation(env: Env, issue: string, entry: Redelegation, o
     return settle(ctx, issue, entry.change)
   }
   const details = await client.issue(issue, signal)
-  if (closed(details.state)) return settle(ctx, issue, entry.change)
+  // A delegation that waited behind a ticket which closed the Issue must not start a second run on it.
+  if (entry.waited && closed(details.state)) {
+    if (entry.session) await tell(client, entry.session, `delegation-closed:${entry.change}`,
+      { type: 'thought', body: `Not started: ${details.identifier} is ${details.state!.type}.` }, signal)
+    return settle(ctx, issue, entry.change)
+  }
   if (entry.identifier !== details.identifier) {
     entry.identifier = details.identifier
     ctx.state.set(CHAIN_KEYS.redelegations, { ...redelegations(ctx), [issue]: entry })

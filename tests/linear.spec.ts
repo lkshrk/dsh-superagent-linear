@@ -2472,6 +2472,38 @@ describe('chain', () => {
         }
       })
 
+      it('tells the session it opened when a queued re-delegation\'s Issue closed before its Trigger', async () => {
+        const w = leafWorld(false)
+        w.delegate('ls1', 'leaf-1')
+        await w.round()
+        w.tickets.push({ id: 'leaf-ticket', origin: { triggerId: 'linear:session:ls1', triggerIds: ['linear:session:ls1'] } })
+        w.redelegate('h1', undefined, 'leaf-1')
+        await w.round()
+        ripen(w); settle(w)
+        await w.round()
+        w.tickets[0]!.ended = { at: new Date().toISOString() }
+        w.failures.IssueContext = 1
+        await w.round()
+        expect(w.created).toEqual([{ issue: 'leaf-1', id: 'cs-1' }])
+        w.epics.get('leaf-1')!.state = 'canceled'
+        await w.round(); await w.round()
+        expect(delegations(w)).toEqual([])
+        expect(w.activities.filter(activity => activity.session === 'cs-1')).toEqual([{ session: 'cs-1', type: 'thought', body: 'Received.' },
+          { session: 'cs-1', type: 'thought', body: 'Not started: WEB-30 is canceled.' }])
+        expect(w.state.get(CHAIN_KEYS.redelegations)).toBeUndefined()
+      })
+
+      it('starts a run on a completed Issue re-delegated without an earlier ticket, as a first delegation would', async () => {
+        const w = leafWorld()
+        w.epics.get('leaf-1')!.state = 'completed'
+        w.redelegate('h1', undefined, 'leaf-1')
+        await w.round()
+        ripen(w)
+        await w.round(); await w.round()
+        expect(w.created).toEqual([{ issue: 'leaf-1', id: 'cs-1' }])
+        expect(delegations(w).map(trigger => trigger.id)).toEqual(['linear:delegation:h1'])
+      })
+
       it('gives up a queued re-delegation whose earlier ticket is still open after a day', async () => {
         const w = leafWorld(false)
         w.delegate('ls1', 'leaf-1')
