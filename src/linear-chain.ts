@@ -437,8 +437,8 @@ export async function followDelegations(ctx: SourceContext, client: LinearClient
   for (const issue of ids) {
     if (signal.aborted) throw new Error('The Linear Source stopped during the delegations')
     const record = chainOf(ctx, issue)
-    if (record?.status === 'running' || open.has(issue)) continue
-    try { await redelegated(ctx, client, issue, viewer, since, config.chainParallel, !!record || !!watches(ctx)[issue], signal) }
+    if (record?.status === 'running') continue
+    try { await redelegated(ctx, client, issue, viewer, since, config.chainParallel, !open.has(issue) && (!!record || !!watches(ctx)[issue]), signal) }
     catch (error) { if (signal.aborted) throw error; round.chainFailed++; failed = true }
   }
   if (!failed) ctx.state.set(CHAIN_KEYS.delegated, now)
@@ -447,7 +447,7 @@ export async function followDelegations(ctx: SourceContext, client: LinearClient
 }
 async function redelegated(ctx: SourceContext, client: LinearClient, issue: string, viewer: string, since: string, parallel: number, known: boolean,
   signal: AbortSignal): Promise<void> {
-  // An Issue the Source never knew can only start a run without sub-issues, so its history is read only then.
+  // An Issue the Source never knew, or one with an open ticket, can only start a run without sub-issues, so its history is read only then.
   let context = known ? undefined : await client.issueContext(issue, signal)
   if (context?.children.nodes.length) return
   const change = await client.delegation(issue, viewer, since, signal)
@@ -490,10 +490,22 @@ function settle(ctx: SourceContext, issue: string, change: string): void {
   const { [issue]: _, ...rest } = redelegations(ctx)
   ctx.state.set(CHAIN_KEYS.redelegations, Object.keys(rest).length ? rest : undefined)
 }
+/** Whether Linear opened a session for the delegation itself; both times are Linear's, so the local clock cannot skew it. */
+function fresh(ctx: SourceContext, issue: string, entry: Redelegation): boolean {
+  const at = watches(ctx)[issue]?.sessionAt
+  return !!at && Date.parse(at) >= Date.parse(entry.at) - DELEGATION_OVERLAP_MS
+}
 async function startRedelegations(env: Env, open: Map<string, Ticket[]>): Promise<void> {
   for (const [issue, entry] of Object.entries(redelegations(env.ctx))) {
     if (env.signal.aborted) throw new Error('The Linear Source stopped during the delegations')
     if (Date.now() - Date.parse(entry.at) < DELEGATION_GRACE_MS) continue
+    if (!entry.session && open.has(issue) && !fresh(env.ctx, issue, entry)) {
+      if (Date.now() - Date.parse(entry.at) < REDELEGATION_GIVE_UP_MS) continue
+      console.log(`dsh-superagent-linear: gave up starting ${entry.identifier ?? issue} after ${REDELEGATION_GIVE_UP_MS / 3600_000} hours: its earlier ticket is still open`)
+      env.round.chainFailed++
+      settle(env.ctx, issue, entry.change)
+      continue
+    }
     try { await startRedelegation(env, issue, entry, open) }
     catch (error) {
       if (env.signal.aborted) throw error
@@ -515,10 +527,7 @@ export function redelegationTrigger(issue: Issue, session: string, url: string, 
 /** Starts a re-delegated Issue without sub-issues as a first delegation would, in a session of its own recorded before its Trigger. */
 async function startRedelegation(env: Env, issue: string, entry: Redelegation, open: Map<string, Ticket[]>): Promise<void> {
   const { ctx, client, config, viewer, signal } = env
-  const fresh = watches(ctx)[issue]?.sessionAt
-  // Both times are Linear's, so the local clock cannot make the delegation's own session look older.
-  if (!entry.session && (open.has(issue) || chainOf(ctx, issue)?.status === 'running'
-    || (fresh && Date.parse(fresh) >= Date.parse(entry.at) - DELEGATION_OVERLAP_MS))) {
+  if (!entry.session && (open.has(issue) || chainOf(ctx, issue)?.status === 'running' || fresh(ctx, issue, entry))) {
     return settle(ctx, issue, entry.change)
   }
   const details = await client.issue(issue, signal)

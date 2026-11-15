@@ -2432,6 +2432,62 @@ describe('chain', () => {
         expect(w.created).toEqual([])
       })
 
+      it('queues a re-delegation made while the Issue\'s earlier ticket is still open, and starts one run once it ended', async () => {
+        const w = leafWorld(false)
+        w.delegate('ls1', 'leaf-1')
+        await w.round()
+        w.tickets.push({ id: 'leaf-ticket', origin: { triggerId: 'linear:session:ls1', triggerIds: ['linear:session:ls1'] } })
+        w.redelegate('h1', undefined, 'leaf-1')
+        await w.round()
+        ripen(w); settle(w)
+        await w.round(); await w.round()
+        expect(delegations(w)).toEqual([])
+        expect(w.created).toEqual([])
+        expect(Object.keys(w.state.get(CHAIN_KEYS.redelegations) as object)).toEqual(['leaf-1'])
+        w.tickets[0]!.ended = { at: new Date().toISOString() }
+        await w.round(); await w.round(); await w.round()
+        expect(w.created).toEqual([{ issue: 'leaf-1', id: 'cs-1' }])
+        expect(delegations(w).map(trigger => trigger.id)).toEqual(['linear:delegation:h1'])
+        expect(w.state.get(CHAIN_KEYS.redelegations)).toBeUndefined()
+      })
+
+      it('gives up a queued re-delegation whose earlier ticket is still open after a day', async () => {
+        const w = leafWorld(false)
+        w.delegate('ls1', 'leaf-1')
+        await w.round()
+        w.tickets.push({ id: 'leaf-ticket', origin: { triggerId: 'linear:session:ls1', triggerIds: ['linear:session:ls1'] } })
+        w.redelegate('h1', undefined, 'leaf-1')
+        await w.round()
+        settle(w)
+        const pending = w.state.get(CHAIN_KEYS.redelegations) as Record<string, { at: string }>
+        w.state.set(CHAIN_KEYS.redelegations, { 'leaf-1': { ...pending['leaf-1'], at: new Date(Date.now() - REDELEGATION_GIVE_UP_MS).toISOString() } })
+        const log = vi.spyOn(console, 'log').mockImplementation(() => {})
+        let logged = '', failed = 0
+        try { failed = (await w.round()).chainFailed; logged = log.mock.calls.flat().join('\n') } finally { log.mockRestore() }
+        expect(logged).toContain('gave up starting leaf-1 after 24 hours: its earlier ticket is still open')
+        expect(failed).toBe(1)
+        expect(w.state.get(CHAIN_KEYS.redelegations)).toBeUndefined()
+        w.tickets[0]!.ended = { at: new Date().toISOString() }
+        await w.round(); await w.round()
+        expect(delegations(w)).toEqual([])
+        expect(w.created).toEqual([])
+      })
+
+      it('does not queue behind a ticket that the delegation\'s own session started', async () => {
+        const w = leafWorld(false)
+        w.redelegate('h1', undefined, 'leaf-1')
+        w.delegate('ls1', 'leaf-1', undefined, { createdAt: new Date(Date.now() + 1000).toISOString() })
+        await w.round()
+        w.tickets.push({ id: 'leaf-ticket', origin: { triggerId: 'linear:session:ls1', triggerIds: ['linear:session:ls1'] } })
+        ripen(w); settle(w)
+        await w.round()
+        expect(w.state.get(CHAIN_KEYS.redelegations)).toBeUndefined()
+        w.tickets[0]!.ended = { at: new Date().toISOString() }
+        await w.round(); await w.round()
+        expect(delegations(w)).toEqual([])
+        expect(w.created).toEqual([])
+      })
+
       it('starts nothing on a team routed to no served repository, for a delegator the policy does not admit, or once the Issue was undelegated again', async () => {
         const routed = leafWorld()
         routed.epics.get('leaf-1')!.team = OTHER_TEAM
