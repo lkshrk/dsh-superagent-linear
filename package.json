@@ -35,7 +35,7 @@
     "node": "^22.19.0 || >=24.0.0",
     "dsh": "^0.2.1-alpha.2 || ^0.2.2-0"
   },
-  "packageManager": "pnpm@11.7.0",
+  "packageManager": "pnpm@11.28.12",
   "dependencies": {
     "zod": "4.4.3"
   },
