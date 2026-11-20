@@ -101,14 +101,34 @@ function moveCursor(ctx: SourceContext, cursor: string, backlogKey: string, sinc
 }
 
 type Issue = NonNullable<Session['issue']>
+/** How many linked documents a Trigger names at most. */
+export const DOCUMENTS_LIMIT = 20
+const LINK = /https?:\/\/[^\s<>()[\]"'`|]+/g
+const DOCUMENT_SLUG = /^(?:[a-z0-9-]*-)?([0-9a-f]{12})$/i
+const UUID = /^[0-9a-f]{8}(?:-[0-9a-f]{4}){3}-[0-9a-f]{12}$/i
+/** The ids of the Linear documents a description links: the 12 hex characters ending `https://linear.app/<workspace>/document/<slug>`, lower-cased, each once. */
+export function linkedDocuments(description: string | null | undefined): string[] {
+  const ids = new Set<string>()
+  for (const [link] of (description ?? '').matchAll(LINK)) {
+    const target = link.replace(/[.,;:!?*_~]+$/, '')
+    if (!URL.canParse(target)) continue
+    const url = new URL(target)
+    const [, kind, slug = '', ...deeper] = url.pathname.split('/').filter(Boolean)
+    if (url.protocol !== 'https:' || url.hostname !== 'linear.app' || kind !== 'document' || deeper.length || UUID.test(slug)) continue
+    const id = DOCUMENT_SLUG.exec(slug)?.[1]
+    if (id) ids.add(id.toLowerCase())
+  }
+  return [...ids].slice(0, DOCUMENTS_LIMIT)
+}
 export function channel(issue: Issue, session: string, url: string) {
   return { source: SOURCE, thread: `${SOURCE}:${threadOf(issue.id)}`,
     address: { session, issue: issue.id, team: issue.team.id, teamKey: issue.team.key, identifier: issue.identifier, url } }
 }
 export function meta(issue: Issue, session: string, kind: string) {
+  const documents = linkedDocuments(issue.description)
   return { team: issue.team.id, teamKey: issue.team.key, issue: issue.id, identifier: issue.identifier, issueUrl: issue.url, session, kind,
     ...issue.project ? { project: issue.project.id, ...issue.project.name ? { projectName: issue.project.name } : {} } : {},
-    ...issue.delegate ? { delegate: issue.delegate.id } : {}, ...issue.labels?.nodes.length ? { labels: issue.labels.nodes.map(label => label.name) } : {} }
+    ...issue.delegate ? { delegate: issue.delegate.id } : {}, ...issue.labels?.nodes.length ? { labels: issue.labels.nodes.map(label => label.name) } : {}, ...documents.length ? { documents } : {} }
 }
 
 /** The session's thread comment when a person wrote it; Linear opens a delegated session's thread with a comment of its own. */

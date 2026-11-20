@@ -5,10 +5,10 @@ import { join } from 'node:path'
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import type { z } from 'zod'
 import { LinearClient, MINT_INTERVAL_MS, SCOPE, stableUuid, type IssueContext, type Prompt, type Session } from '../src/linear-api.ts'
-import { CLOSE_HORIZON_MS, DELEGATION_INTERVAL_MS, FOLLOW_RETRY_MS, KEYS, PARENT_DESCRIPTION_LIMIT, LinearConfigSchema, pullOf, undelegationTrigger, linearKind, pollLinear, promptTrigger, sendLinear, sessionTrigger, SPLIT_LINE, watchLinear, withContext, withMode, type LinearConfig } from '../src/linear.ts'
+import { CLOSE_HORIZON_MS, DELEGATION_INTERVAL_MS, DOCUMENTS_LIMIT, FOLLOW_RETRY_MS, KEYS, PARENT_DESCRIPTION_LIMIT, LinearConfigSchema, linkedDocuments, pullOf, undelegationTrigger, linearKind, pollLinear, promptTrigger, sendLinear, sessionTrigger, SPLIT_LINE, watchLinear, withContext, withMode, type LinearConfig } from '../src/linear.ts'
 import { apply } from '../src/index.ts'
 import type { Waker } from '../src/webhook.ts'
-import { ADOPT_MS, CHAIN_KEYS, DELEGATION_GRACE_MS, HOLD_MS, REDELEGATION_GIVE_UP_MS, ownSession, type ChainRecord } from '../src/linear-chain.ts'
+import { ADOPT_MS, CHAIN_KEYS, DELEGATION_GRACE_MS, HOLD_MS, REDELEGATION_GIVE_UP_MS, chainTrigger, ownSession, redelegationTrigger, type ChainRecord } from '../src/linear-chain.ts'
 import type { OutboundMessage, SourceContext, Ticket, Trigger } from '../src/types.ts'
 
 const VIEWER = 'app-user', OWNER = 'owner-1', TEAM = 'team-web', OTHER_TEAM = 'team-ops'
@@ -218,6 +218,43 @@ describe('translation', () => {
     expect(promptTrigger(prompt('a1', '2026-11-12T10:00:00.000Z', { agentSession: { id: 's1', issue: labelled } }), VIEWER)!.meta.labels).toEqual(['hard', 'Bug'])
     expect(sessionTrigger(session('s2', '2026-11-12T10:00:00.000Z', { issue: { ...issue(), labels: { nodes: [] } } }), VIEWER)!.meta).not.toHaveProperty('labels')
     expect(promptTrigger(prompt('a2', '2026-11-12T10:00:00.000Z'), VIEWER)!.meta).not.toHaveProperty('labels')
+  })
+  describe('linked documents', () => {
+    const DOC = 'https://linear.app/x/document/footer-design-3f682b79ba44'
+    it('reads the ids of the Linear documents a description links, each once and in lower case', () => {
+      expect(linkedDocuments(`Design: ${DOC}\nand [the plan](<https://linear.app/x/document/plan-v2-0A1B2C3D4E5F>), see ${DOC}.\n`
+        + '* [bare](https://linear.app/other-space/document/aabbccddeeff#heading), **https://linear.app/x/document/q3-notes-001122334455?x=1**'))
+        .toEqual(['3f682b79ba44', '0a1b2c3d4e5f', 'aabbccddeeff', '001122334455'])
+      expect(linkedDocuments(`<${DOC}>`)).toEqual(['3f682b79ba44'])
+    })
+    it('takes no id from other Linear links, other hosts or malformed document links', () => {
+      const none = ['https://linear.app/x/issue/WEB-2/footer-design-3f682b79ba44', 'https://linear.app/x/project/footer-3f682b79ba44', 'https://linear.app/document/footer-3f682b79ba44',
+        'https://linear.app/x/document/footer-3f682b79ba44/edit', 'https://linear.app/x/document/footer-3f682b79ba4', 'https://linear.app/x/document/footer-3f682b79ba44a',
+        'https://linear.app/x/document/e82ea5e9-ac38-4270-92be-3f682b79ba44', 'https://linear.app/x/document/footer-3g682b79ba44', 'http://linear.app/x/document/footer-3f682b79ba44',
+        'https://linear.app.example.com/x/document/footer-3f682b79ba44', 'https://example.com/x/document/footer-3f682b79ba44', 'https://linear.app@example.com/x/document/footer-3f682b79ba44',
+        `https://example.com/?next=${DOC}`, 'linear.app/x/document/footer-3f682b79ba44', 'footer-3f682b79ba44', '3f682b79ba44', 'https://']
+      for (const text of none) expect(linkedDocuments(text)).toEqual([])
+      expect(linkedDocuments(none.join(' and '))).toEqual([])
+      for (const empty of [undefined, null, '', 'It overlaps.']) expect(linkedDocuments(empty)).toEqual([])
+    })
+    it('keeps the first documents up to the limit', () => {
+      const ids = Array.from({ length: DOCUMENTS_LIMIT + 5 }, (_, n) => n.toString(16).padStart(12, '0'))
+      expect(linkedDocuments(ids.map(id => `https://linear.app/x/document/d-${id}`).join('\n'))).toEqual(ids.slice(0, DOCUMENTS_LIMIT))
+    })
+    it('carries them on every Trigger that starts work on an Issue, from its description only, and none when it links none', () => {
+      const at = '2026-11-12T10:00:00.000Z'
+      const linking = { ...issue(), description: `It overlaps. Design: [Footer](<${DOC}>)` }
+      const record = { run: 'es1', delegator: { id: OWNER } } as ChainRecord
+      expect(sessionTrigger(session('s1', at, { issue: linking }), VIEWER)!.meta.documents).toEqual(['3f682b79ba44'])
+      expect(promptTrigger(prompt('a1', at, { agentSession: { id: 's1', issue: linking } }), VIEWER, true)!.meta.documents).toEqual(['3f682b79ba44'])
+      expect(chainTrigger(linking, 'cs-1', 'https://linear.app/x/session/cs-1', 'epic-1', record, at).meta).toMatchObject({ kind: 'chain', chain: 'epic-1', documents: ['3f682b79ba44'] })
+      expect(redelegationTrigger(linking, 'ds-1', 'https://linear.app/x/session/ds-1', 'h1', OWNER, at).meta.documents).toEqual(['3f682b79ba44'])
+      const commented = session('s2', at, { comment: said('c1', `@agent read https://linear.app/x/document/other-aabbccddeeff`) })
+      expect(sessionTrigger(commented, VIEWER)!.meta).not.toHaveProperty('documents')
+      expect(promptTrigger(prompt('a2', at, { content: { body: 'See https://linear.app/x/document/other-aabbccddeeff' } }), VIEWER, true)!.meta).not.toHaveProperty('documents')
+      expect(chainTrigger(issue(), 'cs-2', 'https://linear.app/x/session/cs-2', 'epic-1', record, at).meta).not.toHaveProperty('documents')
+      expect(sessionTrigger(session('s3', at, { issue: { ...issue(), description: null } }), VIEWER)!.meta).not.toHaveProperty('documents')
+    })
   })
   it('gives workers the Issue url, not the session url, while replies still go to the session', () => {
     const env = (trigger: Trigger) => linearKind(linear().client).environment!.values({ config: config(), trigger }).DSH_SUPERAGENT_LINEAR_ISSUE_URL
