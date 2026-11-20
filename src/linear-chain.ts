@@ -1,6 +1,6 @@
 /** Chains: a person's session on an Issue with sub-issues works through them, each in a session of its own, in the order their `blocks` relations allow. */
 import { LinearError, stableUuid, type ActivityContent, type Chain, type Issue, type IssueContext, type IssueStatus, type LinearClient, type Prompt, type Session } from './linear-api.ts'
-import { CLOSE_HORIZON_MS, KEYS, SOURCE, channel, issueText, meta, placed, routeOf, threadOf, withContext, withMode, type LinearConfig, type Round } from './linear.ts'
+import { CLOSE_HORIZON_MS, KEYS, SOURCE, channel, issueText, meta, placed, routeOf, threadOf, withContext, withMode, withParentDocuments, type LinearConfig, type Round } from './linear.ts'
 import type { SourceContext, Ticket, Trigger } from './types.ts'
 
 export const CHAIN_KEYS = {
@@ -343,7 +343,8 @@ async function launch(env: Env, epic: string, record: ChainRecord, child: string
     ctx.state.set(KEYS.seen(session), true)
   }
   const context = await client.issueContext(child, signal).catch((error: unknown) => { if (signal.aborted) throw error; env.round.contextFailed++; return undefined })
-  const trigger = placed(ctx, withContext(chainTrigger(issue, session, started.url ?? issue.url, epic, record, started.at), context), where.repository)
+  const built = withParentDocuments(chainTrigger(issue, session, started.url ?? issue.url, epic, record, started.at), issue, context)
+  const trigger = placed(ctx, withContext(built, context), where.repository)
   if (await ctx.receive(trigger) === 'filtered') {
     await stopChain(ctx, client, epic, record, `${issue.identifier} was filtered by the admission table`, undefined, signal)
     return 'stopped'
@@ -566,7 +567,7 @@ async function startRedelegation(env: Env, issue: string, entry: Redelegation, o
       { type: 'thought', body: `Not started: ${details.identifier} has sub-issues now. Delegate it to the app again to work through them.` }, signal)
     return settle(ctx, issue, entry.change)
   }
-  const trigger = redelegationTrigger(details, session, entry.url ?? details.url, entry.change, entry.person.id, entry.at)
+  const trigger = withParentDocuments(redelegationTrigger(details, session, entry.url ?? details.url, entry.change, entry.person.id, entry.at), details, context)
   await ctx.receive(placed(ctx, withMode(withContext(trigger, context), context), where.repository))
   watch(ctx, issue, session)
   settle(ctx, issue, entry.change)

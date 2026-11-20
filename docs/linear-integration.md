@@ -40,10 +40,10 @@ The credential files are read on every token request.
 | --- | --- | --- | --- |
 | `viewer` | `id` | The app user's id, to ignore its own sessions and activities. | Once per process. |
 | `teams` | `id key`, 100 per page | Resolving configured teams. | Every 10 minutes. |
-| `agentSessions` | session, creator, `appUser`, comment, Issue | New sessions. 25 per page, up to 10 pages. | Every round. |
+| `agentSessions` | session, creator, `appUser`, comment, Issue with its creator | New sessions. 25 per page, up to 10 pages. | Every round. |
 | `agentActivities` filtered by `type: prompt`, `createdAt > cursor` | body, `signal`, user, session and Issue | New prompts. 25 per page, up to 10 pages. | Every round. |
 | `agentActivity(id)` | `id` | Checking whether a failed create was stored. | After a failed activity create. |
-| `IssueContext` | parent, first 30 sub-issues with state; partial answers accepted | The context header and epic detection. | Once per new session Trigger, per started sub-issue, per re-delegation candidate, and per non-stop prompt on a delegated Issue without a running chain or open ticket. |
+| `IssueContext` | parent with its creator, first 30 sub-issues with state; partial answers accepted | The context header and epic detection. | Once per new session Trigger, per started sub-issue, per re-delegation candidate, and per non-stop prompt on a delegated Issue without a running chain or open ticket. |
 | `EpicCheck` | first sub-issue | Whether a prompt's Issue has sub-issues. | Per prompt that may be on an epic. |
 | `issues` filtered by `id in` | delegate, state, `completedAt`, `canceledAt` | Undelegation and closed Issues. 50 Issues per request. | At most every 30 seconds, while tickets that started on Linear are open or their Issues are watched for a close. |
 | `issue.history` (`fromDelegate`, `toDelegate`) | last 50 entries | Who removed the delegation. | Per detected undelegation. |
@@ -138,6 +138,10 @@ Only `meta.issueUrl` and `DSH_SUPERAGENT_LINEAR_ISSUE_URL` are always the Issue'
 - The id is those 12 hex characters in lower case. Linear's `get_document` resolves a document by them, whatever title precedes them.
 - A link to an issue, project or any other Linear page, a document link on another host, a longer path such as `/edit` and a slug that is a UUID give no id.
 - Each id is listed once, in the order of the description, and at most 20.
+- A link longer than 2,048 characters is skipped, and trailing punctuation is cut in one pass, so a long description costs time in proportion to its length.
+- The description counts only when a person created the Issue: its `creator` is a user whose `app` is `false`. The gateway lets the app change the description of Issues it created and of no other, and dsh-superagent lets a worker create sub-issues but update none, so the creator tells whether the app could have written the text. An Issue with no creator, or one an app or integration created, is treated as not a person's.
+- For an Issue no person created, `withParentDocuments` keeps the ids its description links that its parent's description links too, when the `IssueContext` read succeeded and a person created the parent. This covers a chain's sub-issue, a delegated session and a re-delegation. Otherwise it lists none.
+- What remains: a person, or a service acting with a person's token, who edits a person-created Issue's description grants its links, as does whoever may edit a person-created parent. That is the intended grant. A sub-issue the app created can never name a document its person-created parent does not link.
 - Session comments and prompts are not read: a person who may comment is not always one who may edit the Issue, and the description is what `get_issue` shows the worker as the Issue's own text.
 
 ## Delegation

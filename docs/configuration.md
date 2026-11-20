@@ -170,7 +170,7 @@ Triggers carry these `meta` fields. Undelegation and chain-stop Triggers carry o
 | `project`, `projectName` | when the Issue has a project | The project's id and name. |
 | `delegate` | session and prompt, when the Issue has a delegate | The delegate's user id. |
 | `labels` | when the Issue has labels | Label names. |
-| `documents` | when the Issue's description links Linear documents | The linked documents' ids: the 12 hex characters that end a document link, in lower case, at most 20. |
+| `documents` | when a description a person wrote links Linear documents | The linked documents' ids: the 12 hex characters that end a document link, in lower case, at most 20. For an Issue no person created, only those its person-created parent links too. |
 | `repository` | when not the primary | The repository the ticket works in. |
 | `parent` | when context was read and the Issue has a parent | The parent's id. |
 | `children` | when context was read and the Issue has a parent or sub-issues | The number of sub-issues read. |

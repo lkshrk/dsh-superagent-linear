@@ -38,7 +38,9 @@ export function stableUuid(seed: string): string {
 
 const User = z.looseObject({ id: z.string(), name: z.string().nullish() })
 const Team = z.looseObject({ id: z.string(), key: z.string() })
+const Creator = z.looseObject({ id: z.string(), app: z.boolean().nullish() })
 const Issue = z.looseObject({ id: z.string(), identifier: z.string(), title: z.string(), description: z.string().nullish(), url: z.string(), team: Team,
+  creator: Creator.nullish(),
   delegate: z.looseObject({ id: z.string() }).nullish(), project: z.looseObject({ id: z.string(), name: z.string().nullish() }).nullish(),
   labels: z.looseObject({ nodes: z.array(z.looseObject({ name: z.string() })) }).nullish(), state: z.looseObject({ type: z.string() }).nullish() })
 export const SessionSchema = z.looseObject({
@@ -55,7 +57,7 @@ export type Prompt = z.infer<typeof PromptSchema>
 const PageInfo = z.looseObject({ hasNextPage: z.boolean(), endCursor: z.string().nullish() })
 const Page = z.looseObject({ nodes: z.array(z.unknown()), pageInfo: PageInfo })
 
-const ISSUE_FIELDS = 'id identifier title description url team { id key } delegate { id } project { id name } labels { nodes { name } }'
+const ISSUE_FIELDS = 'id identifier title description url creator { id app } team { id key } delegate { id } project { id name } labels { nodes { name } }'
 const SESSIONS = `query($after: String) { agentSessions(first: 25, after: $after, orderBy: createdAt) {
   nodes { id createdAt url creator { id name } appUser { id name } comment { id body user { id name app } botActor { type name } } issue { ${ISSUE_FIELDS} } }
   pageInfo { hasNextPage endCursor } } }`
@@ -77,10 +79,10 @@ const DELEGATION_HISTORY = `query DelegationHistory($id: String!) { issue(id: $i
 const DELEGATED_ISSUES = `query DelegatedIssues($viewer: ID!, $since: DateTimeOrDuration!, $after: String) {
   issues(first: 50, after: $after, filter: { delegate: { id: { eq: $viewer } }, updatedAt: { gt: $since } }) { nodes { id } pageInfo { hasNextPage endCursor } } }`
 const SET_STATE = `mutation($id: String!, $state: String!) { issueUpdate(id: $id, input: { stateId: $state }) { success } }`
-const ISSUE_CONTEXT = `query IssueContext($id: String!) { issue(id: $id) { parent { id identifier title url description }
+const ISSUE_CONTEXT = `query IssueContext($id: String!) { issue(id: $id) { parent { id identifier title url description creator { id app } }
   children(first: 30) { nodes { identifier title state { type } } pageInfo { hasNextPage } } } }`
 const IssueContextSchema = z.looseObject({
-  parent: z.looseObject({ id: z.string(), identifier: z.string(), title: z.string(), url: z.string(), description: z.string().nullish() }).nullish(),
+  parent: z.looseObject({ id: z.string(), identifier: z.string(), title: z.string(), url: z.string(), description: z.string().nullish(), creator: Creator.nullish() }).nullish(),
   children: z.looseObject({ nodes: z.array(z.looseObject({ identifier: z.string(), title: z.string(), state: z.looseObject({ type: z.string() }).nullish() })),
     pageInfo: z.looseObject({ hasNextPage: z.boolean() }) }),
 })

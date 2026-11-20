@@ -159,15 +159,27 @@ An Issue works in its project's repository when the team lists that project, els
 
 ### Prompts
 
-A prompt on an Issue with an open ticket goes to that ticket as written. A prompt on an Issue without one starts a new ticket. Its text is the prompt first, then `(ENG-12: title)` and the Issue's description, because the worker cannot read the Issue itself.
+A prompt on an Issue with an open ticket goes to that ticket as written. A prompt on an Issue without one starts a new ticket. Its text is the prompt first, then `(ENG-12: title)` and the Issue's description, so the worker starts with the Issue's text. dsh-superagent also lets the worker read its own Issue and its comments through the `linear` MCP server.
 
 ### Linked documents
 
 An Issue often links its design as a Linear document. The Source reads the Issue's description for links of the form `https://linear.app/<workspace>/document/<slug>-<id>` and puts each document's id into the Trigger's `meta.documents`: the 12 hex characters that end the link, in lower case, each once, the first 20. Every Trigger built from an Issue carries them: a session, a prompt, a re-delegation and a chain sub-issue.
 
+Only the ticket's origin Trigger counts: the one that started the ticket. A link added to the description after the ticket started takes effect only for a new ticket.
+
 dsh-superagent lets the ticket's worker call the `linear` MCP server's `get_document` for exactly these documents, and for no other (see dsh-superagent's deployment docs). A split worker gets no `get_document`. An older dsh-superagent ignores the field.
 
 Only the description counts. A link in the session's comment, in a prompt or in another comment gives the worker nothing: the description is the Issue's own text, and the list is taken once, when the Trigger is built. To let a worker read a document, link it in the description before delegating.
+
+Only a description a person wrote grants documents. The app can write the description of an Issue it created, such as the sub-issues a split worker makes, so such a description alone grants nothing:
+
+| Issue created by | `meta.documents` |
+| --- | --- |
+| A person | The documents its description links. |
+| The app, another app, an integration or an unknown creator, with a parent a person created | The documents its description links that the parent's description links too. |
+| The same, with no parent, a parent no person created, or a parent that could not be read | None. |
+
+So a chain's sub-issues that a split worker created can name the epic's documents, when the epic is a person's and links them, and no others. A link a worker planted in a sub-issue gives the next worker nothing. A ticket a prompt starts reads no parent, so an Issue the app created gets no documents that way.
 
 ### Re-delegation
 
