@@ -5,7 +5,7 @@ import { join } from 'node:path'
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import type { z } from 'zod'
 import { LinearClient, MINT_INTERVAL_MS, SCOPE, stableUuid, type IssueContext, type Prompt, type Session } from '../src/linear-api.ts'
-import { CLOSE_HORIZON_MS, DELEGATION_INTERVAL_MS, DOCUMENTS_LIMIT, FOLLOW_RETRY_MS, KEYS, PARENT_DESCRIPTION_LIMIT, LinearConfigSchema, linkedDocuments, pullOf, undelegationTrigger, linearKind, pollLinear, promptTrigger, sendLinear, sessionTrigger, SPLIT_LINE, watchLinear, withContext, withMode, type LinearConfig } from '../src/linear.ts'
+import { CLOSE_HORIZON_MS, DELEGATION_INTERVAL_MS, DOCUMENTS_LIMIT, FOLLOW_RETRY_MS, KEYS, PARENT_DESCRIPTION_LIMIT, LinearConfigSchema, linkedDocuments, pullOf, undelegationTrigger, linearKind, pollLinear, promptTrigger, sendLinear, sessionTrigger, SPLIT_LINE, watchLinear, withContext, withMode, withParentDocuments, type LinearConfig } from '../src/linear.ts'
 import { apply } from '../src/index.ts'
 import type { Waker } from '../src/webhook.ts'
 import { ADOPT_MS, CHAIN_KEYS, DELEGATION_GRACE_MS, HOLD_MS, REDELEGATION_GIVE_UP_MS, chainTrigger, ownSession, redelegationTrigger, type ChainRecord } from '../src/linear-chain.ts'
@@ -220,6 +220,7 @@ describe('translation', () => {
     expect(promptTrigger(prompt('a2', '2026-11-12T10:00:00.000Z'), VIEWER)!.meta).not.toHaveProperty('labels')
   })
   describe('linked documents', () => {
+    const BY_PERSON = { creator: { id: OWNER, app: false } }
     const DOC = 'https://linear.app/x/document/footer-design-3f682b79ba44'
     it('reads the ids of the Linear documents a description links, each once and in lower case', () => {
       expect(linkedDocuments(`Design: ${DOC}\nand [the plan](<https://linear.app/x/document/plan-v2-0A1B2C3D4E5F>), see ${DOC}.\n`
@@ -243,17 +244,56 @@ describe('translation', () => {
     })
     it('carries them on every Trigger that starts work on an Issue, from its description only, and none when it links none', () => {
       const at = '2026-11-12T10:00:00.000Z'
-      const linking = { ...issue(), description: `It overlaps. Design: [Footer](<${DOC}>)` }
+      const linking = { ...issue(), ...BY_PERSON, description: `It overlaps. Design: [Footer](<${DOC}>)` }
       const record = { run: 'es1', delegator: { id: OWNER } } as ChainRecord
       expect(sessionTrigger(session('s1', at, { issue: linking }), VIEWER)!.meta.documents).toEqual(['3f682b79ba44'])
       expect(promptTrigger(prompt('a1', at, { agentSession: { id: 's1', issue: linking } }), VIEWER, true)!.meta.documents).toEqual(['3f682b79ba44'])
       expect(chainTrigger(linking, 'cs-1', 'https://linear.app/x/session/cs-1', 'epic-1', record, at).meta).toMatchObject({ kind: 'chain', chain: 'epic-1', documents: ['3f682b79ba44'] })
       expect(redelegationTrigger(linking, 'ds-1', 'https://linear.app/x/session/ds-1', 'h1', OWNER, at).meta.documents).toEqual(['3f682b79ba44'])
-      const commented = session('s2', at, { comment: said('c1', `@agent read https://linear.app/x/document/other-aabbccddeeff`) })
+      const plain = { ...issue(), ...BY_PERSON }
+      const commented = session('s2', at, { issue: plain, comment: said('c1', `@agent read https://linear.app/x/document/other-aabbccddeeff`) })
       expect(sessionTrigger(commented, VIEWER)!.meta).not.toHaveProperty('documents')
-      expect(promptTrigger(prompt('a2', at, { content: { body: 'See https://linear.app/x/document/other-aabbccddeeff' } }), VIEWER, true)!.meta).not.toHaveProperty('documents')
-      expect(chainTrigger(issue(), 'cs-2', 'https://linear.app/x/session/cs-2', 'epic-1', record, at).meta).not.toHaveProperty('documents')
-      expect(sessionTrigger(session('s3', at, { issue: { ...issue(), description: null } }), VIEWER)!.meta).not.toHaveProperty('documents')
+      expect(promptTrigger(prompt('a2', at, { content: { body: 'See https://linear.app/x/document/other-aabbccddeeff' }, agentSession: { id: 's1', issue: plain } }), VIEWER, true)!.meta)
+        .not.toHaveProperty('documents')
+      expect(chainTrigger(plain, 'cs-2', 'https://linear.app/x/session/cs-2', 'epic-1', record, at).meta).not.toHaveProperty('documents')
+      expect(sessionTrigger(session('s3', at, { issue: { ...plain, description: null } }), VIEWER)!.meta).not.toHaveProperty('documents')
+    })
+    it('takes none from the description of an Issue no person created', () => {
+      const at = '2026-11-12T10:00:00.000Z'
+      const record = { run: 'es1', delegator: { id: OWNER } } as ChainRecord
+      for (const creator of [{ id: VIEWER, app: true }, { id: 'other-app', app: true }, { id: VIEWER, app: null }, { id: OWNER }, null, undefined]) {
+        const planted = { ...issue(), creator, description: `Read ${DOC}` }
+        expect(sessionTrigger(session('s1', at, { issue: planted }), VIEWER)!.meta).not.toHaveProperty('documents')
+        expect(promptTrigger(prompt('a1', at, { agentSession: { id: 's1', issue: planted } }), VIEWER, true)!.meta).not.toHaveProperty('documents')
+        expect(chainTrigger(planted, 'cs-1', 'https://linear.app/x/session/cs-1', 'epic-1', record, at).meta).not.toHaveProperty('documents')
+        expect(redelegationTrigger(planted, 'ds-1', 'https://linear.app/x/session/ds-1', 'h1', OWNER, at).meta).not.toHaveProperty('documents')
+      }
+    })
+    it('gives an Issue the app created only the documents its parent, created by a person, links too', () => {
+      const at = '2026-11-12T10:00:00.000Z'
+      const PLANTED = 'https://linear.app/x/document/payroll-aabbccddeeff', OTHER = 'https://linear.app/x/document/plan-001122334455'
+      const record = { run: 'es1', delegator: { id: OWNER } } as ChainRecord
+      const none = { nodes: [], pageInfo: { hasNextPage: false } }
+      const epic = (description: string | null, creator: unknown = BY_PERSON.creator) =>
+        ({ parent: { id: 'epic-1', identifier: 'WEB-10', title: 'The epic', url: 'https://linear.app/x/issue/WEB-10', description, creator }, children: none }) as IssueContext
+      const made = { ...issue(), creator: { id: VIEWER, app: true }, description: `Design: ${DOC}\nAlso read ${PLANTED}` }
+      const documents = (child: ReturnType<typeof issue> & { creator?: unknown }, context: IssueContext | undefined) =>
+        withParentDocuments(chainTrigger(child as never, 'cs-1', 'https://linear.app/x/session/cs-1', 'epic-1', record, at), child as never, context).meta.documents
+      expect(documents(made, epic(`Design ${DOC}, plan ${OTHER}`))).toEqual(['3f682b79ba44'])
+      expect(documents(made, epic(`Plan ${OTHER}`))).toBeUndefined()
+      expect(documents(made, epic(null))).toBeUndefined()
+      expect(documents(made, epic(`Design ${DOC} ${PLANTED}`, { id: VIEWER, app: true }))).toBeUndefined()
+      expect(documents(made, epic(`Design ${DOC} ${PLANTED}`, null))).toBeUndefined()
+      expect(documents(made, { parent: null, children: none })).toBeUndefined()
+      expect(documents(made, undefined)).toBeUndefined()
+      const written = { ...made, ...BY_PERSON }
+      for (const context of [epic(`Plan ${OTHER}`), epic(null, { id: VIEWER, app: true }), undefined]) expect(documents(written, context)).toEqual(['3f682b79ba44', 'aabbccddeeff'])
+    })
+    it('reads a long run of trailing punctuation and an overlong link without stalling', () => {
+      const run = `${DOC}${'.'.repeat(400_000)}x `, overlong = `https://linear.app/x/document/${'a-'.repeat(2000)}3f682b79ba44`
+      const started = performance.now()
+      expect(linkedDocuments(`${run}${run}${overlong} https://linear.app/x/document/plan-001122334455${'!?*'.repeat(500)}`)).toEqual(['001122334455'])
+      expect(performance.now() - started).toBeLessThan(2000)
     })
   })
   it('gives workers the Issue url, not the session url, while replies still go to the session', () => {
@@ -1326,8 +1366,10 @@ describe('split mode', () => {
 
 describe('chain', () => {
   const T0 = '2026-11-12T10:00:00.000Z'
-  type Kid = { id: string; identifier: string; state: string; order: number | null; blockedBy: string[]; labels: string[]; epic: string; team: string; assignee?: string }
-  type Epic = { id: string; identifier: string; state: string; delegate: string | null; more: boolean; updatedAt?: string; team?: string; labels?: string[] }
+  type Kid = { id: string; identifier: string; state: string; order: number | null; blockedBy: string[]; labels: string[]; epic: string; team: string; assignee?: string
+    description?: string; creator?: { id: string; app: boolean } }
+  type Epic = { id: string; identifier: string; state: string; delegate: string | null; more: boolean; updatedAt?: string; team?: string; labels?: string[]
+    description?: string; creator?: { id: string; app: boolean } }
   const chainSession = (id: string, epic: Epic, at: string) => session(id, at, { issue: { id: epic.id, identifier: epic.identifier, title: 'The epic',
     description: 'Do it all.', url: `https://linear.app/x/issue/${epic.identifier}`, team: { id: epic.team ?? TEAM, key: KEYS_OF[epic.team ?? TEAM]! },
     ...epic.delegate ? { delegate: { id: epic.delegate } } : {} } })
@@ -1367,7 +1409,8 @@ describe('chain', () => {
         const id = String(variables.id), epic = epics.get(id), kid = kids.get(id)
         if (epic) return { issue: { parent: null, children: { nodes: kidsOf(id).map(k => ({ identifier: k.identifier, title: 'Part', state: { type: k.state } })), pageInfo: { hasNextPage: false } } } }
         const parent = kid && epics.get(kid.epic)
-        return { issue: { parent: parent ? { id: parent.id, identifier: parent.identifier, title: 'The epic', url: `https://linear.app/x/issue/${parent.identifier}`, description: 'Epic text.' } : null,
+        return { issue: { parent: parent ? { id: parent.id, identifier: parent.identifier, title: 'The epic', url: `https://linear.app/x/issue/${parent.identifier}`, description: parent.description ?? 'Epic text.',
+          ...parent.creator ? { creator: parent.creator } : {} } : null,
           children: { nodes: [], pageInfo: { hasNextPage: false } } } }
       },
       EpicCheck: variables => ({ issue: { children: { nodes: kidsOf(String(variables.id)).map(kid => ({ id: kid.id })) } } }),
@@ -1385,7 +1428,7 @@ describe('chain', () => {
         if (gone.has(String(variables.id))) throw Object.assign(new Error('Entity not found'), { code: 'NOT_FOUND' })
         if (epic) return { issue: { ...chainSession('x', epic, T0).issue!, state: { type: epic.state }, labels: { nodes: (epic.labels ?? []).map(name => ({ name })) } } }
         const kid = kids.get(String(variables.id))!
-        return { issue: { id: kid.id, identifier: kid.identifier, title: `Part ${kid.identifier}`, description: 'Make the part.', url: `https://linear.app/x/issue/${kid.identifier}`,
+        return { issue: { id: kid.id, identifier: kid.identifier, title: `Part ${kid.identifier}`, description: kid.description ?? 'Make the part.', ...kid.creator ? { creator: kid.creator } : {}, url: `https://linear.app/x/issue/${kid.identifier}`,
           team: { id: kid.team, key: KEYS_OF[kid.team] }, delegate: null, project: null, labels: { nodes: kid.labels.map(name => ({ name })) } } }
       },
       ChainSession: variables => {
@@ -1488,6 +1531,25 @@ describe('chain', () => {
     await w.round()
     expect(w.received.map(trigger => trigger.id)).toEqual(['linear:chain:es1:kid-2', 'linear:chain:es1:kid-3'])
     expect(w.activities.filter(activity => activity.session === 'es1')).toHaveLength(2)
+  })
+
+  it('lets a sub-issue the app created name only documents the person\'s epic links, and a person\'s sub-issue its own', async () => {
+    const DESIGN = 'https://linear.app/x/document/design-3f682b79ba44', PLANTED = 'https://linear.app/x/document/payroll-aabbccddeeff'
+    const person = { id: OWNER, app: false }, app = { id: VIEWER, app: true }
+    const w = world(3)
+    Object.assign(w.epic(), { description: `Do it all. Design: ${DESIGN}`, creator: person })
+    w.kid(2, { creator: app, description: `Part one. ${DESIGN} and ${PLANTED}` })
+    w.kid(3, { creator: app, description: `Part two. ${PLANTED}` })
+    w.kid(4, { creator: person, description: `Part three. ${PLANTED}` })
+    w.delegate('es1')
+    await w.round()
+    expect(w.chainTriggers().map(trigger => [trigger.meta.issue, trigger.meta.documents])).toEqual([['kid-2', ['3f682b79ba44']], ['kid-3', undefined], ['kid-4', ['aabbccddeeff']]])
+    const planted = world()
+    Object.assign(planted.epic(), { description: `Do it all. ${DESIGN} ${PLANTED}`, creator: app })
+    planted.kid(2, { creator: app, description: `Part one. ${DESIGN} and ${PLANTED}` })
+    planted.delegate('es1')
+    await planted.round()
+    expect(planted.chainTriggers().map(trigger => trigger.meta.documents)).toEqual([undefined])
   })
 
   it('makes a chain Trigger with the epic\'s delegator, the parent header, the child\'s new session as channel, and no delegate or mode', async () => {
