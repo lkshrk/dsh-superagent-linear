@@ -161,6 +161,14 @@ An Issue works in its project's repository when the team lists that project, els
 
 A prompt on an Issue with an open ticket goes to that ticket as written. A prompt on an Issue without one starts a new ticket. Its text is the prompt first, then `(ENG-12: title)` and the Issue's description, because the worker cannot read the Issue itself.
 
+### Linked documents
+
+An Issue often links its design as a Linear document. The Source reads the Issue's description for links of the form `https://linear.app/<workspace>/document/<slug>-<id>` and puts each document's id into the Trigger's `meta.documents`: the 12 hex characters that end the link, in lower case, each once, the first 20. Every Trigger built from an Issue carries them: a session, a prompt, a re-delegation and a chain sub-issue.
+
+dsh-superagent lets the ticket's worker call the `linear` MCP server's `get_document` for exactly these documents, and for no other (see dsh-superagent's deployment docs). A split worker gets no `get_document`. An older dsh-superagent ignores the field.
+
+Only the description counts. A link in the session's comment, in a prompt or in another comment gives the worker nothing: the description is the Issue's own text, and the list is taken once, when the Trigger is built. To let a worker read a document, link it in the description before delegating.
+
 ### Re-delegation
 
 Linear opens a session only on an Issue's first delegation and reuses it afterwards. When a person delegates an Issue without sub-issues to the app again, the Source finds the delegation in the Issue's history and starts a run like a first delegation: a new app session on the Issue, "Received.", and a Trigger with the Issue's subject and description. It waits 60 seconds first, and starts nothing when a session for that delegation arrived meanwhile; both times are Linear's. A re-delegation made while an earlier ticket of the Issue is still open, such as undelegating and delegating again to restart, waits until that ticket ended and then starts one run, unless the Issue was completed or canceled by then; a session already opened for it then says so. Like a first delegation, a re-delegation that did not wait still starts on a completed or canceled Issue. It starts nothing when the Issue routes to no served repository, or when it is no longer delegated to the app. A person not on the Linear Source's allowed list gets the refusal in the Issue's known session, if the Source knows one. A delegation by an automation, an integration or an app starts nothing, and neither does one made before the Source's first check.

@@ -130,6 +130,16 @@ The Trigger's `url`, which is also the Channel's link, depends on the Trigger:
 
 Only `meta.issueUrl` and `DSH_SUPERAGENT_LINEAR_ISSUE_URL` are always the Issue's page. Replies go to the session through the Channel.
 
+### Linked documents
+
+`meta.documents` lists the Linear documents the Issue's description links, for dsh-superagent to admit `get_document` on them. `linkedDocuments` reads them from the description text the Issue queries already return, so it costs no request.
+
+- A link counts when its scheme is `https`, its host is exactly `linear.app` and its path is `/<workspace>/document/<slug>`, where the slug ends with 12 hex characters, alone or after a `-`. Linear writes a link as a bare URL, as `[text](url)` or as `[text](<url>)`; all three are read. A query or fragment after the slug is ignored.
+- The id is those 12 hex characters in lower case. Linear's `get_document` resolves a document by them, whatever title precedes them.
+- A link to an issue, project or any other Linear page, a document link on another host, a longer path such as `/edit` and a slug that is a UUID give no id.
+- Each id is listed once, in the order of the description, and at most 20.
+- Session comments and prompts are not read: a person who may comment is not always one who may edit the Issue, and the description is what `get_issue` shows the worker as the Issue's own text.
+
 ## Delegation
 
 - Delegating an Issue to the app opens a session. Linear opens a new session only on the first delegation and reuses it afterwards. The Source therefore finds later delegations through `DelegatedIssues` and the Issue's history.
